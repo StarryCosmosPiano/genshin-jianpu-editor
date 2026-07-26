@@ -49,11 +49,11 @@ An open-source jianpu editor, MIDI converter, and score typesetter for Genshin m
 
 ### 音源说明
 
-仓库和发行包**不分发任何原神游戏音频或第三方 SF2 文件**，但程序完整支持 SF2 播放：
+仓库和发行包**不分发 SF2 文件**，但程序完整支持 SF2 播放：
 
 1. 桌面版打开「选项 → 播放音源（SF2）」。
 2. 点击「打开音源文件夹」。
-3. 放入你有权使用的 `.sf2` 文件。
+3. 放入 `.sf2` 文件。
 4. 返回程序点击「刷新音源」，然后选择音色。
 
 从源码构建网页端时，也可以把自备的 `.sf2` 文件放入
@@ -148,13 +148,12 @@ sync. Notes can also be selected and edited directly on the rendered score.
 
 ### SoundFonts
 
-The repository and release packages **do not distribute Genshin Impact audio
-or third-party SF2 files**. SF2 playback is supported through user-provided
+The repository and release packages **do not distribute SF2 files**. SF2 playback is supported through user-provided
 files:
 
 1. In the desktop app, open **Options → Playback source (SF2)**.
 2. Select **Open SoundFont folder**.
-3. Add an `.sf2` file you are permitted to use.
+3. Add an `.sf2` file.
 4. Refresh the catalog and select the instrument.
 
 For a local web build, authorized `.sf2` files may be placed in
