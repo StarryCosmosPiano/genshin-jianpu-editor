@@ -42,9 +42,8 @@ await page.evaluate(async (xml) => {
     await mp.load(xml);
     svg = mp.renderPage(0);
   } else {
-    // First page after the title-only page (has actual notation rows).
-    const svgs = [...document.querySelectorAll("#score-pane svg")];
-    svg = svgs[1] ?? svgs[0];
+    // The built-in Avid MIDI import puts the title and opening systems on page 1.
+    svg = document.querySelector("#score-pane svg");
   }
   const svgHtml = svg ? svg.outerHTML : "";
 
