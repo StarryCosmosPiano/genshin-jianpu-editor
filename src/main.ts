@@ -9,19 +9,53 @@ import { showHelpDialog } from "./editor/help";
 import { isTauriRuntime } from "./editor/fileio";
 import { MixedPainter } from "./mixed/painter";
 import { showCreateScoreDialog } from "./editor/slash-dialog";
+import { analyzeMidi, midiToScore, parseMidi } from "./midi";
+import { scoreToJpwabc } from "./score/jpscore";
+import avidMidiUrl from "../examples/Avid - 86 -不存在的战区.mid?url";
 
-const BUILT_IN_SAMPLE = `// ************** JPW-ABC File Ver 1.0 (for JP-Word v5.50m) **************
+const AVID_FALLBACK = `// ************** JPW-ABC File Ver 1.0 (for JP-Word v5.50m) **************
 .Title
-Title = {原琴练习曲}
-SubTitle = {Genshin Jianpu Editor}
-Composer = {StarryCosmosPiano}
-Instrument = {风物琴}
+Title = {Avid - 86 -不存在的战区}
+Composer = {Hiroyuki Sawano}
+Instrument = {钢琴}
 KeyAndMeters = {1=C,4/4}
-Tempo = {96}
-.Voice
-1 2 3 5 |6 5 3 2 |1 - 3 - |5 --- |$(true)
-3 3 5 6 |5 3 2 1 |2 - 7, - |1 --- |]$(true,0,0,true)
+Tempo = {73}
+.Voice.RH
+[1'3'5']_ 6'_ 3'_ 1'_ 6_ 1'_ 5_ 1'_ |[1'3'5']_ 6'_ 3'_ 1'_ 6_ 1'_ 5_ 1'_ |$(true)
+[2'4'6']_ 7'_ 4'_ 2'_ 7_ 2'_ 6_ 2'_ |[1'3'5']- 5- |]$(true,0,0,true)
+.Voice.LH
+[1,3,5,]--- |[6,,1,3,]--- |$(true)
+[4,6,1]--- |[1,3,5,]--- |]$(true,0,0,true)
 `;
+
+async function loadBuiltInSample(): Promise<string> {
+  try {
+    const response = await fetch(avidMidiUrl);
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const parsed = parseMidi(new Uint8Array(await response.arrayBuffer()));
+    const analysis = analyzeMidi(parsed);
+    const imported = midiToScore(parsed, {
+      quantize: analysis.recommendedQuantize,
+      detectTriplets: true,
+      handMode: "auto",
+      splitPitch: analysis.splitPitch,
+      fifths: analysis.fifths,
+      beats: analysis.beats,
+      beatType: analysis.beatType,
+      tempoBpm: analysis.tempoBpm,
+      tempoBeatUnit: "quarter",
+      title: "Avid - 86 -不存在的战区",
+      composer: "Hiroyuki Sawano",
+      instrumentName: "钢琴",
+      scoreMode: "hands",
+      outputFormat: "jpw",
+    });
+    return scoreToJpwabc(imported.score);
+  } catch (error) {
+    console.warn("默认 Avid MIDI 导入失败，改用内置简谱片段", error);
+    return AVID_FALLBACK;
+  }
+}
 
 // 注册 Bravura @font-face（替代 styles.css 里的静态声明），按 Vite base 解析字体 URL。
 async function registerBravura() {
@@ -49,7 +83,7 @@ async function boot() {
   } catch (error) {
     console.warn("启动时读取 SF2 音源失败", error);
   }
-  app.mountEditor(codePane, BUILT_IN_SAMPLE);
+  app.mountEditor(codePane, await loadBuiltInSample());
   const win = window as unknown as { __app: App; __mixedPainter: MixedPainter; __omr: unknown; __abc2musicxml: unknown };
   win.__app = app;
   win.__mixedPainter = new MixedPainter();
