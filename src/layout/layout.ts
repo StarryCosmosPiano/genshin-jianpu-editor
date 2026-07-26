@@ -644,14 +644,21 @@ export class NoteEntry extends Entry {
     return numberTop - gap - nt.jpOctave * diameter - (nt.jpOctave - 1) * gap;
   }
 
-  private static noteBottom(nt: S.Note, ch: S.Chord, opt: LayoutOptions): number {
+  private static noteBottom(
+    nt: S.Note,
+    ch: S.Chord,
+    opt: LayoutOptions,
+    includeBeams = true,
+  ): number {
     const numberBottom = opt.numberBound(nt.number || "1").bottom;
-    if (nt.jpOctave >= 0) return Math.max(numberBottom, ch.beams * opt.jpBeamDist);
+    const rhythmicBottom = includeBeams
+      ? Math.max(numberBottom, ch.beams * opt.jpBeamDist)
+      : numberBottom;
+    if (nt.jpOctave >= 0) return rhythmicBottom;
     const diameter = opt.octaveDotDiameter();
     const gap = opt.octaveDotGap();
     const count = -nt.jpOctave;
-    const anchor = Math.max(numberBottom, ch.beams * opt.jpBeamDist);
-    return anchor + gap + count * diameter + (count - 1) * gap;
+    return rhythmicBottom + gap + count * diameter + (count - 1) * gap;
   }
 
   /** Bottom chord tone stays on the rhythmic baseline; upper tones grow upward. */
@@ -664,7 +671,10 @@ export class NoteEntry extends Entry {
     // this band makes it visually unambiguous which row owns the dot.
     const clearance = opt.numberSize * 0.12 * opt.engravingStyle.octaveDotClearance;
     for (let i = 1; i < notes.length; i++) {
-      const occupied = NoteEntry.noteBottom(notes[i - 1], ch, opt)
+      // Reduction beams belong to the bottom rhythmic baseline, not to every
+      // upper chord row. Including them here made a tied chord change height
+      // when its duration was split differently on the other side of a barline.
+      const occupied = NoteEntry.noteBottom(notes[i - 1], ch, opt, false)
         - NoteEntry.noteTop(notes[i], opt)
         + clearance;
       rows.push(rows[i - 1] + Math.max(baseGap, occupied));
@@ -692,7 +702,12 @@ export class NoteEntry extends Entry {
     let y = this.chord.beams * options.jpBeamDist;
     for (let i = 0; i < this.chord.notes.length; i++) {
       const nt = this.chord.notes[i];
-      const bottom = (this.rowYs[i] ?? 0) + NoteEntry.noteBottom(nt, this.chord, options);
+      const bottom = (this.rowYs[i] ?? 0) + NoteEntry.noteBottom(
+        nt,
+        this.chord,
+        options,
+        i === this.chord.notes.length - 1,
+      );
       y = Math.max(y, bottom);
     }
     return y;
@@ -741,6 +756,7 @@ export class NoteEntry extends Entry {
     ent: NoteEntry,
     owner: JpNumber,
     rowY = 0,
+    includeBeams = true,
   ): void {
     const oct = nt.jpOctave;
     // Digits do not all share exactly the same tight top/bottom bounds.  Use
@@ -758,7 +774,9 @@ export class NoteEntry extends Entry {
       if (oct > 0) {
         tf.y = rowY + numBound.top - gap - diameter - d * (diameter + gap);
       } else {
-        const anchor = Math.max(numBound.bottom, ch.beams * options.jpBeamDist);
+        const anchor = includeBeams
+          ? Math.max(numBound.bottom, ch.beams * options.jpBeamDist)
+          : numBound.bottom;
         tf.y = rowY + anchor + gap + d * (diameter + gap);
       }
       ent.group.add(tf);
@@ -1038,7 +1056,15 @@ export class NoteEntry extends Entry {
       num.y = rowY;
       ent.add(num);
       NoteEntry.addAccidental(num, options, nt, ent, rowY);
-      NoteEntry.octaveDot(nt, ch, options, ent, num, rowY);
+      NoteEntry.octaveDot(
+        nt,
+        ch,
+        options,
+        ent,
+        num,
+        rowY,
+        i === notes.length - 1,
+      );
       if (i === 0) it = num;
     }
     if (!it) throw new Error("chord without notes");
