@@ -610,6 +610,52 @@ A../S../D../F../
     await page.evaluate(() => window.__app.setZoom(1));
   }
 
+  // A tied chord may be split into different written durations at a barline.
+  // Its stacked-note geometry must depend on pitches/octave dots, not on the
+  // number of reduction beams attached only to the bottom rhythmic baseline.
+  const crossMeasureChordFixture = `.Title
+Title = {跨小节和弦高度}
+KeyAndMeters = {1=C,4/4}
+Tempo = {90}
+.Voice
+([6'6]__ |[6'6]-) |]
+`;
+  const crossMeasureChordHeight = await page.evaluate((text) => {
+    const app = window.__app;
+    app.documentFormat = "jpw";
+    app.slashOptions = null;
+    app.setText(text);
+    const chords = app.painter.score.parts[0]?.measures
+      .flatMap((measure) => measure.entries)
+      .filter((entry) => Array.isArray(entry.notes) && entry.notes.length === 2)
+      .slice(0, 2) ?? [];
+    const gaps = chords.map((chord) => {
+      const centers = chord.notes.map((note) => {
+        const element = app.painter.noteGroupEl(chord, note);
+        const rect = element?.getBoundingClientRect();
+        return rect ? rect.top + rect.height / 2 : Number.NaN;
+      });
+      return Math.abs(centers[0] - centers[1]);
+    });
+    return {
+      chordCount: chords.length,
+      beams: chords.map((chord) => chord.beams),
+      gaps,
+      tied: chords[1]?.notes.every((note) => note.tieEnd) ?? false,
+    };
+  }, crossMeasureChordFixture);
+  if (crossMeasureChordHeight.chordCount !== 2
+    || crossMeasureChordHeight.beams.join(",") !== "2,0"
+    || !crossMeasureChordHeight.tied
+    || crossMeasureChordHeight.gaps.some((gap) => !Number.isFinite(gap))
+    || Math.abs(crossMeasureChordHeight.gaps[0] - crossMeasureChordHeight.gaps[1]) > 0.75) {
+    throw new Error(
+      `cross-measure tied chord height changed with its written duration: ${
+        JSON.stringify(crossMeasureChordHeight)
+      }`,
+    );
+  }
+
   if (errors.filter((error) => !/favicon/.test(error)).length > 0) {
     throw new Error(`browser errors: ${errors.join("\n")}`);
   }
@@ -625,6 +671,7 @@ A../S../D../F../
     optionalMetadataExport: true,
     textVoiceColorToggle: true,
     arpeggioHighlighting: true,
+    crossMeasureChordHeight: true,
     selectedPlayback,
     slashPlayback,
     clearedPlayback,
