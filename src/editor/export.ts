@@ -85,7 +85,12 @@ export async function exportPptx(app: App): Promise<void> {
   );
 }
 
-function chooseVoiceMarkerExport(): Promise<boolean | null> {
+interface SlashTextExportOptions {
+  includeVoiceMarkers: boolean;
+  includeMetadata: boolean;
+}
+
+function chooseSlashTextExportOptions(): Promise<SlashTextExportOptions | null> {
   return new Promise((resolve) => {
     const overlay = document.createElement("div");
     overlay.className = "modal-overlay";
@@ -93,29 +98,65 @@ function chooseVoiceMarkerExport(): Promise<boolean | null> {
     box.className = "modal-box";
     const title = document.createElement("div");
     title.className = "modal-title";
-    title.textContent = "TXT 声部标记";
-    const hint = document.createElement("div");
-    hint.className = "modal-hint";
-    hint.textContent = "保留时会写入不可见的 U+2063 与 vc:N，可无损恢复多声部；不带标记时会合并为单谱行。";
+    title.textContent = "键盘谱 / 数字谱导出设置";
+
+    const includeVoiceMarkers = document.createElement("input");
+    includeVoiceMarkers.type = "checkbox";
+    includeVoiceMarkers.checked = true;
+    const voiceRow = document.createElement("label");
+    voiceRow.className = "modal-row";
+    const voiceLabel = document.createElement("span");
+    voiceLabel.textContent = "保留多声部隐形标记";
+    voiceRow.append(voiceLabel, includeVoiceMarkers);
+    const voiceHint = document.createElement("div");
+    voiceHint.className = "modal-hint";
+    voiceHint.textContent = "开启时保留不可见的 U+2063 声部归属；关闭时会合并为单谱行。";
+
+    const includeMetadata = document.createElement("input");
+    includeMetadata.type = "checkbox";
+    includeMetadata.checked = true;
+    const metadataRow = document.createElement("label");
+    metadataRow.className = "modal-row";
+    const metadataLabel = document.createElement("span");
+    metadataLabel.textContent = "包含 // @jpeditor 元数据";
+    metadataRow.append(metadataLabel, includeMetadata);
+    const metadataHint = document.createElement("div");
+    metadataHint.className = "modal-hint";
+    const updateMetadataHint = () => {
+      metadataHint.textContent = includeMetadata.checked
+        ? "推荐保留：下次打开时会自动恢复谱型、声部、拍号、速度、符号时值及花括号/方括号设置。"
+        : "⚠ 不包含元数据时，下次打开无法自动读取这些导入设置，需要重新手动设置。";
+      metadataHint.classList.toggle("midi-import-warning", !includeMetadata.checked);
+    };
+    includeMetadata.addEventListener("change", updateMetadataHint);
+    updateMetadataHint();
+
     const footer = document.createElement("div");
     footer.className = "modal-footer";
     const cancel = document.createElement("button");
     cancel.textContent = "取消";
-    const plain = document.createElement("button");
-    plain.textContent = "不带声部标记";
-    const marked = document.createElement("button");
-    marked.textContent = "保留声部标记";
-    footer.append(cancel, plain, marked);
-    box.append(title, hint, footer);
+    const confirm = document.createElement("button");
+    confirm.textContent = "导出";
+    footer.append(cancel, confirm);
+    box.append(
+      title,
+      voiceRow,
+      voiceHint,
+      metadataRow,
+      metadataHint,
+      footer,
+    );
     overlay.append(box);
     document.body.append(overlay);
-    const close = (value: boolean | null) => {
+    const close = (value: SlashTextExportOptions | null) => {
       overlay.remove();
       resolve(value);
     };
     cancel.onclick = () => close(null);
-    plain.onclick = () => close(false);
-    marked.onclick = () => close(true);
+    confirm.onclick = () => close({
+      includeVoiceMarkers: includeVoiceMarkers.checked,
+      includeMetadata: includeMetadata.checked,
+    });
     overlay.onclick = (event) => {
       if (event.target === overlay) close(null);
     };
@@ -126,9 +167,15 @@ async function exportTextScore(
   app: App,
   format: "jpw" | "keyboard" | "number",
 ): Promise<void> {
-  const includeMarkers = format === "jpw" ? true : await chooseVoiceMarkerExport();
-  if (includeMarkers === null) return;
-  const result = app.exportTextDocument(format, includeMarkers);
+  const options = format === "jpw"
+    ? { includeVoiceMarkers: true, includeMetadata: true }
+    : await chooseSlashTextExportOptions();
+  if (!options) return;
+  const result = app.exportTextDocument(
+    format,
+    options.includeVoiceMarkers,
+    options.includeMetadata,
+  );
   await saveBytes(result.bytes, result.name, result.mime);
 }
 

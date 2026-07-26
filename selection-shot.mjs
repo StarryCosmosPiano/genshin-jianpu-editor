@@ -359,6 +359,178 @@ KeyAndMeters = {1=C,4/4}
   await page.keyboard.press("ArrowUp");
   await page.waitForFunction(() => /\{D\}E\.\/S\./.test(window.__app.getText()));
 
+  const mixedRecognitionText = `键盘谱
+4/4拍：
+点=八分音符
+Q../W../E../R../
+A../S../D../F../
+数字谱
+1../2../3../4../
+5../6../7../1../
+`;
+  const mixedRecognitionSwitch = await page.evaluate(async (text) => {
+    const app = window.__app;
+    const body = (value) => value.replace(
+      /^\s*\/\/\s*@jpeditor\s+\{[^\n]*\}\s*\r?\n?/gm,
+      "",
+    );
+    app.documentFormat = "keyboard";
+    app.slashOptions = {
+      kind: "keyboard", voiceCount: 1, title: "", subtitle: "", composer: "",
+      arranger: "", lyricist: "", tempoBpm: 90, fifths: 0, beats: 4, beatType: 4,
+      symbolDurations: { ".": 8 }, spaceDivision: null, noteDivision: null,
+      braceMode: "none", bracketMode: "none",
+    };
+    app.setText(text);
+    const originalBody = body(app.getText());
+    await app.changeDocumentFormat("number");
+    const numberBody = body(app.getText());
+    const numberSources = app._sourceNotes.map((source) =>
+      app.view.state.doc.sliceString(source.from, source.to));
+    const numberMeasures = app.painter.score.parts[0]?.measures.length ?? 0;
+    await app.changeDocumentFormat("keyboard");
+    const keyboardBody = body(app.getText());
+    const keyboardSources = app._sourceNotes.map((source) =>
+      app.view.state.doc.sliceString(source.from, source.to));
+    const keyboardMeasures = app.painter.score.parts[0]?.measures.length ?? 0;
+    return {
+      originalBody,
+      numberBody,
+      keyboardBody,
+      numberSources,
+      keyboardSources,
+      numberMeasures,
+      keyboardMeasures,
+      format: app.documentFormat,
+    };
+  }, mixedRecognitionText);
+  if (mixedRecognitionSwitch.originalBody !== mixedRecognitionSwitch.numberBody
+    || mixedRecognitionSwitch.originalBody !== mixedRecognitionSwitch.keyboardBody
+    || mixedRecognitionSwitch.numberMeasures !== 2
+    || mixedRecognitionSwitch.keyboardMeasures !== 2
+    || mixedRecognitionSwitch.numberSources.join("|") !== "1|2|3|4|5|6|7|1"
+    || mixedRecognitionSwitch.keyboardSources.join("|") !== "Q|W|E|R|A|S|D|F"
+    || mixedRecognitionSwitch.format !== "keyboard") {
+    throw new Error(
+      `keyboard/number recognition switch rewrote or cross-parsed mixed TXT: ${JSON.stringify(mixedRecognitionSwitch)}`,
+    );
+  }
+
+  await page.locator("#btn-score-settings").click();
+  const scoreSettingsBox = page.locator(".slash-import-box");
+  await scoreSettingsBox.waitFor();
+  const settingsTitle = await scoreSettingsBox.locator(".modal-title").textContent();
+  if (settingsTitle !== "乐谱设置") {
+    throw new Error(`top score settings did not open the current-score editor: ${settingsTitle}`);
+  }
+  const tempoInput = scoreSettingsBox.locator("label.modal-row")
+    .filter({ hasText: "速度（BPM）" }).locator("input");
+  await tempoInput.fill("123");
+  await scoreSettingsBox.getByRole("button", { name: "应用到当前乐谱" }).click();
+  await page.waitForFunction(() =>
+    !document.querySelector(".slash-import-box")
+    && window.__app.slashOptions?.tempoBpm === 123
+    && window.__app.painter.score.tempoBpm === 123);
+  const appliedScoreSettings = await page.evaluate(() => ({
+    format: window.__app.documentFormat,
+    tempo: window.__app.slashOptions?.tempoBpm,
+    scoreTempo: window.__app.painter.score.tempoBpm,
+    metadata: /\/\/\s*@jpeditor\s+\{[^\n]*"bpm":123/.test(window.__app.getText()),
+    keyboardBody: /Q\.\.\/W\.\.\/E\.\.\/R\.\.\//.test(window.__app.getText()),
+    numberBody: /1\.\.\/2\.\.\/3\.\.\/4\.\.\//.test(window.__app.getText()),
+  }));
+  if (appliedScoreSettings.format !== "keyboard"
+    || appliedScoreSettings.tempo !== 123
+    || appliedScoreSettings.scoreTempo !== 123
+    || !appliedScoreSettings.metadata
+    || !appliedScoreSettings.keyboardBody
+    || !appliedScoreSettings.numberBody) {
+    throw new Error(`score settings did not apply non-destructively: ${JSON.stringify(appliedScoreSettings)}`);
+  }
+
+  const metadataExports = await page.evaluate(() => {
+    const decoder = new TextDecoder();
+    const withMetadata = decoder.decode(window.__app.exportTextDocument("keyboard", true, true).bytes);
+    const withoutMetadata = decoder.decode(window.__app.exportTextDocument("keyboard", true, false).bytes);
+    return {
+      withMetadata: /\/\/\s*@jpeditor\s+\{/.test(withMetadata),
+      withoutMetadata: /\/\/\s*@jpeditor\s+\{/.test(withoutMetadata),
+      keptKeyboard: /Q\.\.\/W\.\.\/E\.\.\/R\.\.\//.test(withoutMetadata),
+      keptNumber: /1\.\.\/2\.\.\/3\.\.\/4\.\.\//.test(withoutMetadata),
+    };
+  });
+  if (!metadataExports.withMetadata || metadataExports.withoutMetadata
+    || !metadataExports.keptKeyboard || !metadataExports.keptNumber) {
+    throw new Error(`optional TXT metadata export is incorrect: ${JSON.stringify(metadataExports)}`);
+  }
+
+  await page.locator("#btn-export").click();
+  const exportBox = page.locator(".modal-box").filter({ hasText: "键盘谱 TXT" });
+  await exportBox.getByRole("button", { name: "键盘谱 TXT" }).click();
+  const slashExportBox = page.locator(".modal-box")
+    .filter({ hasText: "键盘谱 / 数字谱导出设置" });
+  await slashExportBox.waitFor();
+  const exportChecks = slashExportBox.locator('input[type="checkbox"]');
+  if (await exportChecks.count() !== 2
+    || !await exportChecks.nth(0).isChecked()
+    || !await exportChecks.nth(1).isChecked()) {
+    throw new Error("slash TXT export options are not both checked by default");
+  }
+  await exportChecks.nth(1).uncheck();
+  if (!/下次打开无法自动读取/.test(await slashExportBox.textContent())) {
+    throw new Error("disabling @jpeditor metadata did not show the manual-settings warning");
+  }
+  await slashExportBox.getByRole("button", { name: "取消" }).click();
+
+  const twoVoiceColorText = `键盘谱
+4/4拍：
+点=八分音符
+(\u2063Q Z)../\u2063W../X../Z../
+`;
+  await page.evaluate((text) => {
+    const app = window.__app;
+    app.documentFormat = "keyboard";
+    app.textVoiceColoring = true;
+    app.slashVoiceColors[0] = "#dc2626";
+    app.slashOptions = {
+      kind: "keyboard", voiceCount: 2, instrumentName: "钢琴",
+      title: "", subtitle: "", composer: "", arranger: "", lyricist: "",
+      tempoBpm: 90, fifths: 0, beats: 4, beatType: 4,
+      symbolDurations: { ".": 8 }, spaceDivision: null, noteDivision: null,
+      braceMode: "none", bracketMode: "none",
+    };
+    app.setText(text);
+  }, twoVoiceColorText);
+  await page.waitForFunction(() => document.querySelectorAll(".cm-slash-voice").length >= 2);
+  await page.locator("#btn-options").click();
+  let optionsBox = page.locator(".options-box");
+  let textColorToggle = optionsBox.locator("label.modal-row")
+    .filter({ hasText: "文本声部着色" }).locator('input[type="checkbox"]');
+  if (!await textColorToggle.isChecked()) {
+    throw new Error("text voice coloring master switch was not enabled initially");
+  }
+  await textColorToggle.uncheck();
+  await optionsBox.getByRole("button", { name: "确定" }).click();
+  await page.waitForFunction(() =>
+    window.__app.textVoiceColoring === false
+    && document.querySelectorAll(".cm-slash-voice").length === 0);
+  const preservedVoiceColor = await page.evaluate(() => window.__app.slashVoiceColors[0]);
+  if (preservedVoiceColor !== "#dc2626") {
+    throw new Error(`disabling text voice colors deleted the saved color: ${preservedVoiceColor}`);
+  }
+  await page.locator("#btn-options").click();
+  optionsBox = page.locator(".options-box");
+  textColorToggle = optionsBox.locator("label.modal-row")
+    .filter({ hasText: "文本声部着色" }).locator('input[type="checkbox"]');
+  if (await textColorToggle.isChecked()) {
+    throw new Error("text voice coloring master switch did not persist its disabled state");
+  }
+  await textColorToggle.check();
+  await optionsBox.getByRole("button", { name: "确定" }).click();
+  await page.waitForFunction(() =>
+    window.__app.textVoiceColoring === true
+    && document.querySelectorAll(".cm-slash-voice").length >= 2);
+
   const prefixedArpeggioSlash = `键盘谱
 4/4拍：
 点=16分音符
@@ -448,6 +620,10 @@ KeyAndMeters = {1=C,4/4}
     keyboardPitchEdit: true,
     numberSlashPitchEdit: true,
     keyboardSlashPitchEdit: true,
+    mixedRecognitionSwitch: true,
+    scoreSettingsApplied: true,
+    optionalMetadataExport: true,
+    textVoiceColorToggle: true,
     arpeggioHighlighting: true,
     selectedPlayback,
     slashPlayback,

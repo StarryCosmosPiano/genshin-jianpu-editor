@@ -49,6 +49,7 @@ function pitchName(pitch: number): string {
 function slashGroupSelect(value: MidiSlashGroupMode): HTMLSelectElement {
   const select = document.createElement("select");
   select.append(
+    option("none", "留空（不使用此括号）", value === "none"),
     option("grace", "倚音（装饰音不占拍长）", value === "grace"),
     option("arpeggio", "琶音（三个及以上音的滚奏和弦）", value === "arpeggio"),
     option("triplet", "三连音（3:2 均分）", value === "triplet"),
@@ -113,7 +114,7 @@ export function showMidiImportDialog(parsed: ParsedMidi, analysis: MidiAnalysis,
     slashGroupSummary.textContent = "键盘谱 / 数字谱括号用途";
     const slashGroupHint = document.createElement("div");
     slashGroupHint.className = "modal-hint";
-    slashGroupHint.textContent = "仅用于文本谱输出。系统先识别倚音、三连音与同一量化格内的上行滚奏和弦，再按这里选择的括号写出；未分配到括号的类型仍作为普通音符保留。";
+    slashGroupHint.textContent = "仅用于文本谱输出。系统先识别倚音、三连音与同一量化格内的上行滚奏和弦，再按这里选择的括号写出；选择“留空”就不为该括号分配功能，未分配的类型仍作为普通音符保留。";
     slashGroups.append(
       slashGroupSummary,
       slashGroupHint,

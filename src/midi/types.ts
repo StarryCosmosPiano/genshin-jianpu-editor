@@ -4,7 +4,7 @@ export type MidiQuantizeDivision = 4 | 8 | 16 | 32 | 64;
 export type MidiHandMode = "auto" | "single" | "double";
 export type MidiOutputFormat = "jpw" | "keyboard" | "number";
 export type MidiScoreMode = "hands" | "ensemble";
-export type MidiSlashGroupMode = "grace" | "arpeggio" | "triplet" | "subdivide";
+export type MidiSlashGroupMode = "none" | "grace" | "arpeggio" | "triplet" | "subdivide";
 
 /** One sounding MIDI track mapped to one ordered numbered-notation voice. */
 export interface MidiTrackAssignment {

@@ -100,6 +100,7 @@ async function boot() {
   on("btn-prev", () => app.prevPage());
   on("btn-next", () => app.nextPage());
   on("btn-options", () => showOptionsDialog(app));
+  on("btn-score-settings", () => void app.showScoreSettings());
   on("btn-layout-style", () => showEngravingStyleDialog(app));
   on("btn-export", () => showExportDialog(app));
   on("btn-help", () => showHelpDialog(app));

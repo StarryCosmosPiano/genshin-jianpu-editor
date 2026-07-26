@@ -44,11 +44,12 @@ import {
   scoreToSlashScore,
   SLASH_VOICE_SEPARATOR,
   slashScoreTemplate,
+  stripSlashScoreOptions,
   stripSlashVoiceMarkers,
   type SlashScoreKind,
   type SlashScoreOptions,
 } from "../slashscore";
-import { showSlashScoreImportDialog } from "./slash-dialog";
+import { showSlashScoreImportDialog, showSlashScoreSettingsDialog } from "./slash-dialog";
 import {
   buildJpwSourceNotes,
   buildSlashSourceNotes,
@@ -150,6 +151,7 @@ export class App {
   documentFormat: "jpw" | SlashScoreKind = "jpw";
   slashOptions: SlashScoreOptions | null = null;
   slashVoiceColors = [...DEFAULT_SLASH_VOICE_COLORS];
+  textVoiceColoring = true;
   scoreVoiceColoring = false;
   showInvisibleVoiceMarkers = false;
   mode: "jp" | "mixed" | "recognize" = "jp";
@@ -271,6 +273,7 @@ export class App {
         engravingStyle: Partial<EngravingStyle>;
         slashVoiceColors: string[];
         slashVoiceColorVersion: number;
+        textVoiceColoring: boolean;
         scoreVoiceColoring: boolean;
         showInvisibleVoiceMarkers: boolean;
         partVolumes: number[];
@@ -298,6 +301,7 @@ export class App {
             : fallback;
         });
       }
+      if (s.textVoiceColoring !== undefined) this.textVoiceColoring = s.textVoiceColoring;
       if (s.scoreVoiceColoring !== undefined) this.scoreVoiceColoring = s.scoreVoiceColoring;
       if (s.showInvisibleVoiceMarkers !== undefined) {
         this.showInvisibleVoiceMarkers = s.showInvisibleVoiceMarkers;
@@ -346,6 +350,7 @@ export class App {
         engravingStyle: this.engravingStyle,
         slashVoiceColors: this.slashVoiceColors,
         slashVoiceColorVersion: 2,
+        textVoiceColoring: this.textVoiceColoring,
         scoreVoiceColoring: this.scoreVoiceColoring,
         showInvisibleVoiceMarkers: this.showInvisibleVoiceMarkers,
         partVolumes: this.partVolumes,
@@ -513,7 +518,8 @@ export class App {
 
   private updateSlashVoiceHighlights(): void {
     if (!this.view) return;
-    if (this.documentFormat === "jpw") {
+    if (this.documentFormat === "jpw"
+      || (!this.textVoiceColoring && !this.showInvisibleVoiceMarkers)) {
       this.view.dispatch({ effects: setSlashVoiceHighlights.of([]) });
       return;
     }
@@ -528,6 +534,7 @@ export class App {
           markerFrom: source.markerFrom,
           voiceIndex: source.voiceIndex,
           color,
+          decorateText: this.textVoiceColoring,
           showMarker: this.showInvisibleVoiceMarkers,
         }];
       })),
@@ -1330,11 +1337,49 @@ export class App {
     return this.documentFormat === "jpw" ? 1 : this.slashOptions?.voiceCount ?? 1;
   }
 
+  async showScoreSettings(): Promise<void> {
+    if (this.mode !== "jp" || this.documentFormat === "jpw" || !this.slashOptions) {
+      this.setStatus("“乐谱设置”用于当前键盘谱或数字谱；JPW 简谱请使用“选项”和“排版”");
+      return;
+    }
+    const current: SlashScoreOptions = {
+      ...this.slashOptions,
+      symbolDurations: { ...this.slashOptions.symbolDurations },
+      tempoMarks: this.slashOptions.tempoMarks?.map((mark) => ({ ...mark })) ?? [],
+    };
+    const next = await showSlashScoreSettingsDialog(this.getText(), current);
+    if (!next) {
+      this.setStatus("未更改当前乐谱设置");
+      return;
+    }
+    let text = this.getText();
+    let voiceMessage = "";
+    if (next.voiceCount !== current.voiceCount) {
+      const migration = migrateSlashVoiceCount(text, current, next.voiceCount);
+      text = migration.text;
+      voiceMessage = migration.mergedVoices.length > 0
+        ? `；V${migration.mergedVoices.join("、V")} 已并入默认 V${next.voiceCount}`
+        : `；声部数量已从 ${migration.from} 调整为 ${migration.to}`;
+    }
+    this.stopPlayback();
+    this.documentFormat = next.kind;
+    this.slashOptions = {
+      ...next,
+      symbolDurations: { ...next.symbolDurations },
+      tempoMarks: next.tempoMarks?.map((mark) => ({ ...mark })) ?? [],
+    };
+    this.setText(embedSlashScoreOptions(text, this.slashOptions));
+    this.setStatus(
+      `乐谱设置已应用：当前按${next.kind === "keyboard" ? "键盘谱" : "数字谱"}识别，${next.beats}/${next.beatType}，${next.tempoBpm} BPM${voiceMessage}`,
+    );
+  }
+
   setSlashVoiceSettings(
     requestedCount: number,
     colors: readonly string[],
     scoreColoring: boolean,
     showMarkers: boolean,
+    textColoring = this.textVoiceColoring,
   ): void {
     this.slashVoiceColors = this.slashVoiceColors.map((fallback, index) => {
       const value = colors[index];
@@ -1342,6 +1387,7 @@ export class App {
         ? value
         : fallback;
     });
+    this.textVoiceColoring = textColoring;
     this.scoreVoiceColoring = scoreColoring;
     this.showInvisibleVoiceMarkers = showMarkers;
     this.saveSettings();
@@ -1366,6 +1412,23 @@ export class App {
   async changeDocumentFormat(target: "jpw" | SlashScoreKind): Promise<void> {
     if (target === this.documentFormat || this.mode !== "jp") return;
     this.stopPlayback();
+    if (target !== "jpw" && this.documentFormat !== "jpw" && this.slashOptions) {
+      // Keyboard/number recognition is a non-destructive view switch for a
+      // mixed TXT document. Keep both representations exactly where the user
+      // wrote them; only the persisted parser choice and live preview change.
+      const options: SlashScoreOptions = {
+        ...this.slashOptions,
+        kind: target,
+        symbolDurations: { ...this.slashOptions.symbolDurations },
+      };
+      this.documentFormat = target;
+      this.slashOptions = options;
+      this.setText(embedSlashScoreOptions(this.getText(), options));
+      this.setStatus(
+        `当前按${target === "keyboard" ? "键盘谱" : "数字谱"}识别；另一种谱文仍保留在 TXT 中，但不参与排版、播放和休止计算`,
+      );
+      return;
+    }
     const score = this.painter.score;
     if (target === "jpw") {
       this.documentFormat = "jpw";
@@ -1414,6 +1477,7 @@ export class App {
   exportTextDocument(
     target: "jpw" | SlashScoreKind,
     includeVoiceMarkers = true,
+    includeMetadata = true,
   ): { bytes: Uint8Array; name: string; mime: string } {
     const title = this.painter.score.title.split("\n")[0].trim() || "未命名";
     if (target === "jpw") {
@@ -1454,6 +1518,7 @@ export class App {
       text = embedSlashScoreOptions(text, options);
     }
     if (!includeVoiceMarkers) text = stripSlashVoiceMarkers(text, options);
+    if (!includeMetadata) text = stripSlashScoreOptions(text);
     return {
       bytes: new TextEncoder().encode(text),
       name: `${title}-${target === "keyboard" ? "键盘谱" : "数字谱"}.txt`,

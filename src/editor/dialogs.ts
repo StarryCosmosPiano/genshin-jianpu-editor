@@ -160,6 +160,9 @@ export function showOptionsDialog(app: App): void {
   voiceCount.value = String(app.getSlashVoiceCount());
   const voiceColorInputs: HTMLInputElement[] = [];
   const voiceColorEnabled: HTMLInputElement[] = [];
+  const textVoiceColoring = document.createElement("input");
+  textVoiceColoring.type = "checkbox";
+  textVoiceColoring.checked = app.textVoiceColoring;
   const scoreVoiceColoring = document.createElement("input");
   scoreVoiceColoring.type = "checkbox";
   scoreVoiceColoring.checked = app.scoreVoiceColoring;
@@ -174,18 +177,21 @@ export function showOptionsDialog(app: App): void {
     multi.append(
       summary,
       labeled("声部数量（V1–V9）", voiceCount),
+      labeled("文本声部着色", textVoiceColoring),
       labeled("谱面声部着色", scoreVoiceColoring),
       labeled("显示隐形标记（调试）", showVoiceMarkers),
     );
     const voiceColorHint = document.createElement("div");
     voiceColorHint.className = "modal-hint";
     voiceColorHint.textContent =
-      "最后一个默认声部始终不着色。其前各声部默认依次为红、黄、绿、紫；为避免与蓝色选择高亮混淆，默认色不使用蓝色，V5 以后可手动启用颜色。";
+      "“文本声部着色”是总开关，关闭不会删除下面各声部的颜色配置，重新开启即可恢复。最后一个默认声部始终不着色；其前各声部默认依次为红、黄、绿、紫，默认色不使用蓝色。";
     multi.append(voiceColorHint);
     const colorList = document.createElement("div");
     const refreshColors = () => {
       const count = Math.max(1, Math.min(9, parseInt(voiceCount.value, 10) || 1));
+      const textColorsEnabled = textVoiceColoring.checked;
       colorList.replaceChildren();
+      colorList.style.opacity = textColorsEnabled ? "1" : "0.55";
       while (voiceColorInputs.length < count) {
         const index = voiceColorInputs.length;
         const configured = app.slashVoiceColors[index] ?? "";
@@ -195,9 +201,7 @@ export function showOptionsDialog(app: App): void {
         const enabled = document.createElement("input");
         enabled.type = "checkbox";
         enabled.checked = /^#[\da-f]{6}$/i.test(configured);
-        enabled.addEventListener("change", () => {
-          input.disabled = !enabled.checked;
-        });
+        enabled.addEventListener("change", refreshColors);
         voiceColorInputs.push(input);
         voiceColorEnabled.push(enabled);
       }
@@ -207,8 +211,9 @@ export function showOptionsDialog(app: App): void {
         control.style.cssText = "display:inline-flex;align-items:center;gap:8px";
         const enabledLabel = document.createElement("span");
         enabledLabel.textContent = "启用";
-        voiceColorEnabled[index].disabled = isDefault;
-        voiceColorInputs[index].disabled = isDefault || !voiceColorEnabled[index].checked;
+        voiceColorEnabled[index].disabled = isDefault || !textColorsEnabled;
+        voiceColorInputs[index].disabled =
+          isDefault || !textColorsEnabled || !voiceColorEnabled[index].checked;
         control.append(voiceColorEnabled[index], enabledLabel, voiceColorInputs[index]);
         colorList.append(labeled(
           `V${index + 1}${isDefault ? "（默认，不着色）" : ""} 文本颜色`,
@@ -217,6 +222,7 @@ export function showOptionsDialog(app: App): void {
       }
     };
     voiceCount.addEventListener("input", refreshColors);
+    textVoiceColoring.addEventListener("change", refreshColors);
     refreshColors();
     multi.append(colorList);
     body.append(multi);
@@ -402,6 +408,7 @@ export function showOptionsDialog(app: App): void {
           voiceColorEnabled[index]?.checked ? input.value : ""),
         scoreVoiceColoring.checked,
         showVoiceMarkers.checked,
+        textVoiceColoring.checked,
       );
     }
     volSliders.forEach((s, i) => app.setPartVolume(i, (parseInt(s.value, 10) || 0) / 100));

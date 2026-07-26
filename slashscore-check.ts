@@ -66,6 +66,50 @@ check(JSON.stringify(sounding(keyboardResult.score)) === JSON.stringify(sounding
 check(sounding(keyboardResult.score).some((item) => item.pitches.length > 1), "parentheses become vertical chords");
 check(keyboardResult.score.tempoBpm === 123, "manual tempo preserved");
 
+const mixedNotation = `4/4拍：
+点=八分音符
+Q../W../E../R../
+1../2../3../4../
+A../S../D../F../
+5../6../7../1../
+`;
+const mixedAnalysis = analyzeSlashScore(mixedNotation);
+const mixedKeyboardOptions: SlashScoreOptions = {
+  ...defaultSlashScoreOptions("keyboard", mixedAnalysis),
+  kind: "keyboard",
+  beats: 4,
+  beatType: 4,
+};
+const mixedNumberOptions: SlashScoreOptions = {
+  ...defaultSlashScoreOptions("number", mixedAnalysis),
+  kind: "number",
+  beats: 4,
+  beatType: 4,
+};
+const mixedKeyboardResult = parseSlashScore(mixedNotation, mixedKeyboardOptions);
+const mixedNumberResult = parseSlashScore(mixedNotation, mixedNumberOptions);
+check(mixedKeyboardResult.summary.measures === 2
+  && mixedNumberResult.summary.measures === 2,
+"mixed keyboard/number TXT did not ignore the unselected notation lines");
+check(sounding(mixedKeyboardResult.score).length === 8
+  && sounding(mixedNumberResult.score).length === 8,
+"unselected mixed-notation lines became rest measures on the shared timeline");
+const mixedKeyboardSources = buildSlashSourceNotes(
+  mixedNotation,
+  mixedKeyboardOptions,
+  mixedKeyboardResult.score,
+);
+const mixedNumberSources = buildSlashSourceNotes(
+  mixedNotation,
+  mixedNumberOptions,
+  mixedNumberResult.score,
+);
+check(mixedKeyboardSources.every((source) =>
+  /^[A-Z]$/.test(mixedNotation.slice(source.from, source.to)))
+  && mixedNumberSources.every((source) =>
+    /^[1-7]$/.test(mixedNotation.slice(source.from, source.to))),
+"mixed-notation text/score selection mapping retained pitches from the ignored notation");
+
 const editableNumber = `数字谱
 4/4拍：
 点=八分音符
@@ -116,6 +160,25 @@ const bracketTripletTimeline = buildTimeline(parseSlashScore(bracketTripletText,
 check(bracketTripletTimeline.notes.slice(0, 3).every((note, index) =>
   Math.abs(note.t0 - index / 6) < 1e-8),
 "three nominal sixteenth values in square brackets were not compressed into one eighth-note triplet");
+
+const blankGroupText = `键盘谱
+4/4拍：
+音符自身时值=8分音符
+{QW}/[AS]/-/-/
+`;
+const blankGroupOptions: SlashScoreOptions = {
+  ...defaultSlashScoreOptions("keyboard", analyzeSlashScore(blankGroupText)),
+  braceMode: "none",
+  bracketMode: "none",
+};
+const blankGroupScore = parseSlashScore(blankGroupText, blankGroupOptions).score;
+const blankGroupTimeline = buildTimeline(blankGroupScore);
+check(blankGroupTimeline.notes.slice(0, 4).every((note, index) =>
+  Math.abs(note.t0 - index / 2) < 1e-8),
+"blank brace/bracket assignment did not read container contents as ordinary notes");
+check(blankGroupScore.parts[0].measures[0].entries.every((entry) =>
+  !(entry instanceof Chord) || (!entry.arpeggio && entry.graceNotes.length === 0)),
+"blank brace/bracket assignment still created an ornament");
 
 const arpeggioText = `数字谱
 4/4拍：
@@ -483,6 +546,17 @@ check(persistedAnalysis.tempoMarks.length === 2 &&
       && restored.tempoBpm === 144;
   })(),
 "stored TXT tempo annotations did not round-trip");
+
+const emptyGroupModes: SlashScoreOptions = {
+  ...defaultSlashScoreOptions("number", customAnalysis),
+  braceMode: "none",
+  bracketMode: "none",
+};
+const embeddedEmptyGroupModes = embedSlashScoreOptions(custom, emptyGroupModes);
+const restoredEmptyGroupModes = analyzeSlashScore(embeddedEmptyGroupModes);
+check(restoredEmptyGroupModes.suggestedBraceMode === "none"
+  && restoredEmptyGroupModes.suggestedBracketMode === "none",
+"blank brace/bracket assignments were not persisted and restored");
 
 const sixFour = `数字谱
 点=16分音符
