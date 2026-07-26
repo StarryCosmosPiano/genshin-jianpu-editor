@@ -9,7 +9,7 @@ import {
   ViewPlugin,
   type ViewUpdate,
 } from "@codemirror/view";
-import { RangeSetBuilder } from "@codemirror/state";
+import { RangeSetBuilder, StateEffect, StateField } from "@codemirror/state";
 import { TokenData, tokenClass } from "../jpword/tokens";
 
 const markCache = new Map<string, Decoration>();
@@ -59,3 +59,97 @@ export const jpwHighlighter = ViewPlugin.fromClass(
   },
   { decorations: (v) => v.decorations },
 );
+
+export interface SourceHighlightRange {
+  from: number;
+  to: number;
+}
+
+/** Score picking owns this persistent source highlight independently of editor focus. */
+export const setScoreSourceHighlights = StateEffect.define<readonly SourceHighlightRange[]>();
+
+const scoreSourceMark = Decoration.mark({ class: "cm-score-source-selection" });
+
+function sourceHighlightDecorations(ranges: readonly SourceHighlightRange[]): DecorationSet {
+  const builder = new RangeSetBuilder<Decoration>();
+  for (const range of [...ranges].sort((a, b) => a.from - b.from || a.to - b.to)) {
+    if (range.to > range.from) builder.add(range.from, range.to, scoreSourceMark);
+  }
+  return builder.finish();
+}
+
+export const scoreSourceHighlighter = StateField.define<DecorationSet>({
+  create: () => Decoration.none,
+  update(value, transaction) {
+    let next = value.map(transaction.changes);
+    for (const effect of transaction.effects) {
+      if (effect.is(setScoreSourceHighlights)) next = sourceHighlightDecorations(effect.value);
+    }
+    return next;
+  },
+  provide: (field) => EditorView.decorations.from(field),
+});
+
+export interface SlashVoiceHighlightRange {
+  from: number;
+  to: number;
+  markerFrom: number;
+  voiceIndex: number;
+  color: string;
+  showMarker: boolean;
+}
+
+/** Dynamic TXT voice colors supplied by App after slash-score parsing. */
+export const setSlashVoiceHighlights =
+  StateEffect.define<readonly SlashVoiceHighlightRange[]>();
+
+function voiceHighlightDecorations(ranges: readonly SlashVoiceHighlightRange[]): DecorationSet {
+  const items: Array<{ from: number; to: number; decoration: Decoration }> = [];
+  for (const range of ranges) {
+    const color = /^#[\da-f]{6}$/i.test(range.color) ? range.color : "#dc2626";
+    if (range.to > range.from) {
+      items.push({
+        from: range.from,
+        to: range.to,
+        decoration: Decoration.mark({
+          class: `cm-slash-voice cm-slash-voice-${range.voiceIndex}`,
+          attributes: {
+            "data-voice": `V${range.voiceIndex}`,
+            style: `background-color:${color}20;border-bottom:2px solid ${color}88`,
+          },
+        }),
+      });
+    }
+    if (range.showMarker && range.from > range.markerFrom) {
+      items.push({
+        from: range.markerFrom,
+        to: range.from,
+        decoration: Decoration.mark({
+          class: "cm-slash-voice-marker",
+          attributes: {
+            "data-voice": `V${range.voiceIndex}`,
+            style: `background-color:${color}35`,
+          },
+        }),
+      });
+    }
+  }
+  const builder = new RangeSetBuilder<Decoration>();
+  for (const item of items.sort((left, right) =>
+    left.from - right.from || left.to - right.to)) {
+    builder.add(item.from, item.to, item.decoration);
+  }
+  return builder.finish();
+}
+
+export const slashVoiceHighlighter = StateField.define<DecorationSet>({
+  create: () => Decoration.none,
+  update(value, transaction) {
+    let next = value.map(transaction.changes);
+    for (const effect of transaction.effects) {
+      if (effect.is(setSlashVoiceHighlights)) next = voiceHighlightDecorations(effect.value);
+    }
+    return next;
+  },
+  provide: (field) => EditorView.decorations.from(field),
+});

@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "jpeditor",
-  "version": "0.5.4",
-  "identifier": "co.endao.jpeditor",
+  "productName": "Genshin Jianpu Editor",
+  "version": "0.1.0",
+  "identifier": "io.github.starrycosmospiano.genshin-jianpu-editor",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
@@ -13,7 +13,7 @@
     "withGlobalTauri": true,
     "windows": [
       {
-        "title": "简谱编辑器",
+        "title": "原琴简谱编辑器 · Genshin Jianpu Editor",
         "width": 1280,
         "height": 800
       }

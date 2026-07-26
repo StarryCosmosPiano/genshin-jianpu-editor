@@ -12,9 +12,24 @@ export abstract class Section {
   }
 
   static create(n: string): Section {
-    const nn = n.toLowerCase().substring(1).trim();
+    const raw = n.substring(1).trim();
+    const nn = raw.toLowerCase();
+    // Piano extension: a document may contain two independently editable
+    // numbered-notation voices.  Plain `.Voice` keeps the original single-line
+    // format; `.Voice.RH` / `.Voice.LH` opt into the paired piano layout.
+    if (nn === "voice.rh" || nn === "voice.right") return new VoiceSection(nn, "right");
+    if (nn === "voice.lh" || nn === "voice.left") return new VoiceSection(nn, "left");
+    const ensembleVoice = /^voice\.(.+)\.v(\d+)$/i.exec(raw);
+    if (ensembleVoice) {
+      const instrumentName = ensembleVoice[1].trim();
+      const voiceIndex = parseInt(ensembleVoice[2], 10);
+      if (!instrumentName || !Number.isFinite(voiceIndex) || voiceIndex < 1) {
+        throw new Error(`bad ensemble voice section: ${n}`);
+      }
+      return new VoiceSection(raw, null, instrumentName, voiceIndex);
+    }
     switch (nn) {
-      case "voice": return new VoiceSection(nn);
+      case "voice": return new VoiceSection(nn, null);
       case "words": return new WordsSection(nn);
       case "attachments": return new GenericSection(nn);
       case "page": return new GenericSection(nn);
@@ -67,6 +82,14 @@ export class RepeatSection extends Section {
 
 export class VoiceSection extends Section {
   voiceData!: VoiceContext;
+  constructor(
+    name: string,
+    public hand: "right" | "left" | null,
+    public instrumentName: string | null = null,
+    public voiceIndex: number | null = null,
+  ) {
+    super(name);
+  }
   override parse(): boolean {
     const text = this.lines.join("\n");
     const voice = parseVoiceText(text);
@@ -222,11 +245,44 @@ export class TitleSection extends Section {
   get title(): string | null {
     return this.getValue("title");
   }
+  get subtitle(): string | null {
+    return this.getValue("SubTitle");
+  }
+  get composer(): string | null {
+    return this.getValue("Composer");
+  }
+  get arranger(): string | null {
+    return this.getValue("Arranger");
+  }
+  get lyricist(): string | null {
+    return this.getValue("Lyricist");
+  }
+  get instrument(): string | null {
+    return this.getValue("Instrument");
+  }
   get keyAndMeters(): string | null {
     return this.getValue("KeyAndMeters");
   }
   get wordsMusicBy(): string | null {
     return this.getValue("WordsByAndMusicBy");
+  }
+  get tempo(): number | null {
+    const value = this.getValue("Tempo");
+    if (value === null) return null;
+    const bpm = parseFloat(value);
+    return Number.isFinite(bpm) && bpm > 0 ? bpm : null;
+  }
+  get tempoUnit(): "quarter" | "dotted-quarter" | "eighth" | null {
+    const value = this.getValue("TempoUnit")?.trim().toLowerCase();
+    return value === "quarter" || value === "dotted-quarter" || value === "eighth"
+      ? value
+      : null;
+  }
+  get tempoMarks(): string | null {
+    return this.getValue("TempoMarks");
+  }
+  get arpeggios(): string | null {
+    return this.getValue("Arpeggios");
   }
   get key(): string | null {
     const km = this.keyAndMeters;
@@ -275,8 +331,13 @@ export class JpwFile {
   getLyric(): WordsSection | null {
     return this.sections.find((s) => s instanceof WordsSection) as WordsSection ?? null;
   }
-  getVoice(): VoiceSection | null {
-    return this.sections.find((s) => s instanceof VoiceSection) as VoiceSection ?? null;
+  getVoice(hand?: "right" | "left"): VoiceSection | null {
+    const voices = this.getVoices();
+    if (hand !== undefined) return voices.find((s) => s.hand === hand) ?? null;
+    return voices.find((s) => s.hand === null) ?? voices[0] ?? null;
+  }
+  getVoices(): VoiceSection[] {
+    return this.sections.filter((s): s is VoiceSection => s instanceof VoiceSection);
   }
   getTitle(): TitleSection | null {
     return this.sections.find((s) => s instanceof TitleSection) as TitleSection ?? null;

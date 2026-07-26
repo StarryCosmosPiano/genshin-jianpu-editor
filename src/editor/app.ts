@@ -3,23 +3,141 @@
 
 import { EditorView, keymap, lineNumbers } from "@codemirror/view";
 import { Compartment, EditorState, EditorSelection } from "@codemirror/state";
-import { defaultKeymap, history, historyKeymap } from "@codemirror/commands";
-import { jpwHighlighter } from "./highlight";
+import { defaultKeymap, history, historyKeymap, undo } from "@codemirror/commands";
+import {
+  jpwHighlighter,
+  scoreSourceHighlighter,
+  setScoreSourceHighlights,
+  setSlashVoiceHighlights,
+  slashVoiceHighlighter,
+} from "./highlight";
 import { JpwFile, LayoutSection } from "../jpword/jpwfile";
 import { fromJpw } from "../score/jpwimport";
-import { PlayItem } from "../score/score";
+import { Note as ScoreNote, PlayItem, TempoMark } from "../score/score";
 import { JinpuPainter } from "../layout/painter";
-import { JpNumber, Lyric as LayoutLyric, TextFrame, type PageItem } from "../layout/layout";
+import { JpNumber, JpOctaveDot, Lyric as LayoutLyric, NoteEntry, TextFrame, type PageItem } from "../layout/layout";
+import { normalizeEngravingStyle, type EngravingStyle } from "../layout/style";
 import { Point } from "../common/geom";
 import { MetaData } from "../smufl/smufl";
-import { loadMusicXml } from "../score/musicxml";
+import { isPianoMusicXml, loadMusicXml } from "../score/musicxml";
 import { abcToMusicXml } from "../abc/abc2xml";
 import { scoreToJpwabc, scoreToJpwabcWithMeta, type JpwMeta, type JpwRange } from "../score/jpscore";
 import { decodeJpwabc, encodeJpwabc, isTauriRuntime } from "./fileio";
 import { MixedPainter } from "../mixed/painter";
-import { ScorePlayer, type PlayState } from "./player";
+import { ScorePlayer, type PlayState, type Sf2PlaybackOptions } from "./player";
+import {
+  openSoundfontDirectory,
+  readSoundfontCatalog,
+  type SoundfontCatalogEntry,
+} from "./soundfonts";
 import { recognizeImage, recognizeMusicppDetailed, agyAvailable, renderRecognitionSvg, renderRowPopup, renderHeaderPopup, type OmrMethod, type RecogView } from "../omr";
 import type { Binary, RecognizedScore } from "../omr";
+import { analyzeMidi, midiToScore, parseMidi } from "../midi";
+import { showMidiImportDialog } from "./midi-dialog";
+import {
+  analyzeSlashScore,
+  defaultSlashScoreOptions,
+  embedSlashScoreOptions,
+  MAX_SLASH_VOICES,
+  migrateSlashVoiceCount,
+  parseSlashScore,
+  scoreToSlashScore,
+  SLASH_VOICE_SEPARATOR,
+  slashScoreTemplate,
+  stripSlashVoiceMarkers,
+  type SlashScoreKind,
+  type SlashScoreOptions,
+} from "../slashscore";
+import { showSlashScoreImportDialog } from "./slash-dialog";
+import {
+  buildJpwSourceNotes,
+  buildSlashSourceNotes,
+  editJpwPitch,
+  editSlashPitch,
+  type JpwSourceNote,
+  type PitchEdit,
+} from "./note-selection";
+
+interface SelectedScoreNote {
+  source: JpwSourceNote;
+  verse: number;
+  element: SVGGElement;
+}
+
+interface SelectedScoreObject {
+  mark: TempoMark;
+  element: SVGGElement;
+}
+
+interface SelectionAnchor {
+  position: number;
+  verse: number;
+}
+
+interface ScoreDeleteAction {
+  notes: JpwRange[];
+  tempoKeys: string[];
+}
+
+interface ScoreDragSelection {
+  page: number;
+  svg: SVGSVGElement;
+  pointerId: number;
+  startX: number;
+  startY: number;
+  currentX: number;
+  currentY: number;
+  additive: boolean;
+  moved: boolean;
+}
+
+interface BrowserWritableFile {
+  write(data: Uint8Array | Blob): Promise<void>;
+  close(): Promise<void>;
+}
+
+interface BrowserFileHandle {
+  readonly name: string;
+  getFile(): Promise<File>;
+  createWritable(): Promise<BrowserWritableFile>;
+}
+
+export type PlaybackSoundSource = "default" | "sf2";
+
+export interface PlaybackInstrumentGroup {
+  key: string;
+  label: string;
+  parts: number[];
+}
+
+const ENGRAVING_STYLE_PREVIEW_JPW = `.Title
+Title = {全功能排版预览}
+SubTitle = {升降号、倚音、和弦、连音与下一谱行}
+Composer = {示例作曲}
+Arranger = {示例编曲}
+Instrument = {钢琴}
+KeyAndMeters = {1=C,4/4}
+Tempo = {90}
+TempoMarks = {2@0=rit;2@3=tempo:72}
+Arpeggios = {1:1@2;2:1@0}
+.Voice.RH
+{2'}3'_ #4'_ b5'_ #b6'_ [1'3'5']- |$(true)
+{(3}1'_ 2'_ 3'_) (5' 5') 0 |]$(true,0,0,true)
+.Voice.LH
+[1,3,5,]--- |$(true)
+[b1,,3,#5,] 0 2, 3, |]$(true,0,0,true)
+`;
+
+// Default TXT voice palette deliberately omits blue because blue is reserved
+// for score/editor selection. The last enabled voice is always the uncoloured
+// default row; V5+ require an explicit user-selected colour.
+const DEFAULT_SLASH_VOICE_COLORS = [
+  "#dc2626", // V1 red
+  "#eab308", // V2 yellow
+  "#16a34a", // V3 green
+  "#9333ea", // V4 purple
+  "", "", "", "", "",
+];
 
 export class App {
   painter: JinpuPainter;
@@ -28,12 +146,16 @@ export class App {
   pageEls: HTMLElement[] = [];
   pageIndex = 0;
   filePath: string | null = null;
+  /** The editor may keep native JPW text or an editable slash-score `.txt` source. */
+  documentFormat: "jpw" | SlashScoreKind = "jpw";
+  slashOptions: SlashScoreOptions | null = null;
+  slashVoiceColors = [...DEFAULT_SLASH_VOICE_COLORS];
+  scoreVoiceColoring = false;
+  showInvisibleVoiceMarkers = false;
   mode: "jp" | "mixed" | "recognize" = "jp";
   mixedXmlText: string | null = null;
   private _mixedPainter: MixedPainter | null = null;
   private _mixedBtnEl: HTMLButtonElement | null = null;
-  private _jpPreviewBtnEl: HTMLButtonElement | null = null;
-  private _staffJianpuToggleEl: HTMLInputElement | null = null;
   // 识别模式：二值图 + 带源图坐标的识别结果（仅 musicpp 本地路产出），供叠加核对。
   private _recogBin: Binary | null = null;
   private _recogScore: RecognizedScore | null = null;
@@ -46,42 +168,67 @@ export class App {
   private _recogMeta: JpwMeta | null = null;
   private _lastImportMeta: JpwMeta | null = null; // 最近一次 xml 导入的序列化映射，供 recognizeBytes 接管
   // 乐句排版：缓存导入时的「原始排版」文本以便无损切回；_phraseOn 记当前是否乐句排版。
-  private _originalLayoutBtnEl: HTMLButtonElement | null = null;
   private _phraseBtnEl: HTMLButtonElement | null = null;
   private _origLayoutText: string | null = null;
   private _phraseOn = false;
   private _readOnlyCompartment = new Compartment();
   // render settings (app-level, not part of the .jpwabc document)
-  pageW = 960;
-  pageH = 540;
+  pageW = 595;
+  pageH = 842;
   fontSize = 28;
   titleSize = 48;
   creditSize = 36;
   color = 0xff000000; // ARGB
+  engravingStyle: EngravingStyle = normalizeEngravingStyle();
   mixedHideBarNumber = false; // 混排：隐藏小节号
-  mixedShowJianpuLayer = true;
   zoom = 1; // 谱面显示缩放（应用到 #score-pane 的 --score-zoom）
   private meta: MetaData;
   private debounceTimer: ReturnType<typeof setTimeout> | undefined;
   private zoomSaveTimer: ReturnType<typeof setTimeout> | undefined;
-  private selectedEl: SVGGElement | null = null;
+  private selectedEls = new Set<SVGGElement>();
+  private _sourceNotes: JpwSourceNote[] = [];
+  private _selectedNotes: SelectedScoreNote[] = [];
+  private _selectedObjects: SelectedScoreObject[] = [];
+  private _pendingSelectionAnchors: SelectionAnchor[] | null = null;
+  private _rangeAnchorPosition: number | null = null;
+  private _softDeletedNotes: JpwRange[] = [];
+  private _softDeletedTempoKeys = new Set<string>();
+  private _scoreUndoStack: ScoreDeleteAction[] = [];
+  private _syncingCodeSelection = false;
+  private _dragSelection: ScoreDragSelection | null = null;
+  private _suppressPageClick = false;
   statusEl: HTMLElement | null = null;
   private _player: ScorePlayer | null = null;
   private _playBtnEl: HTMLButtonElement | null = null;
+  private _stopBtnEl: HTMLButtonElement | null = null;
   /** Per-part linear volume in [0,1]; index = part index. Missing = 1 (full). */
   partVolumes: number[] = [];
-  // Selected note (for "play from here"): its chord + which verse/pass row.
-  private _selectedChord: import("../score/score").Chord | null = null;
-  private _selectedVerse = 0;
-
+  playbackSoundSource: PlaybackSoundSource = "default";
+  selectedSoundfontId = "";
+  soundfontInstrumentByGroup: Record<string, string> = {};
+  soundfontCatalog: SoundfontCatalogEntry[] = [];
+  private _hasSavedCurrent = false;
+  private _suggestedSavePath: string | null = null;
+  private _browserSaveHandle: BrowserFileHandle | null = null;
+  private _browserOpenHandle: BrowserFileHandle | null = null;
   private static readonly SETTINGS_KEY = "jpeditor-render-settings";
   private static readonly LAST_FILE_KEY = "jpeditor-last-file";
 
   constructor(meta: MetaData, scorePane: HTMLElement) {
     this.meta = meta;
     this.painter = new JinpuPainter(this.fontSize);
-    this.painter.layout.options.smuflMeta = meta;
+    this.configurePainter(this.painter);
     this.scorePane = scorePane;
+    this.scorePane.tabIndex = 0;
+    this.scorePane.addEventListener("keydown", (event) => this.onScoreKeyDown(event));
+  }
+
+  private configurePainter(painter: JinpuPainter, color = this.color): void {
+    painter.layout.options.smuflMeta = this.meta;
+    painter.layout.options.color = color;
+    painter.layout.options.titleSize = this.titleSize;
+    painter.layout.options.creditSize = this.creditSize;
+    painter.layout.options.applyEngravingStyle(this.engravingStyle);
   }
 
   /** Apply page-size / font-size / title-size / credit-size / color render settings and re-render. */
@@ -95,14 +242,20 @@ export class App {
       this.fontSize = opts.fontSize;
       const score = this.painter.score;
       this.painter = new JinpuPainter(this.fontSize);
-      this.painter.layout.options.smuflMeta = this.meta;
+      this.configurePainter(this.painter);
       this.painter.score = score;
     }
-    this.painter.layout.options.color = this.color;
-    this.painter.layout.options.titleSize = this.titleSize;
-    this.painter.layout.options.creditSize = this.creditSize;
+    this.configurePainter(this.painter);
     this.saveSettings();
     this.reload(this.getText());
+  }
+
+  /** Apply a numbered-notation engraving style; preview changes need not persist. */
+  setEngravingStyle(style: Partial<EngravingStyle>, persist = true): void {
+    this.engravingStyle = normalizeEngravingStyle(style);
+    this.painter.layout.options.applyEngravingStyle(this.engravingStyle);
+    if (persist) this.saveSettings();
+    if (this.view && this.mode === "jp") this.reload(this.getText());
   }
 
   /** Restore persisted render settings; call before mountEditor() so first render uses them. */
@@ -113,27 +266,68 @@ export class App {
       const s = JSON.parse(raw) as Partial<{
         pageW: number; pageH: number; fontSize: number;
         titleSize: number; creditSize: number; color: number; zoom: number;
-        mixedHideBarNumber: boolean; mixedShowJianpuLayer: boolean;
+        mixedHideBarNumber: boolean;
+        pageOrientationVersion: number;
+        engravingStyle: Partial<EngravingStyle>;
+        slashVoiceColors: string[];
+        slashVoiceColorVersion: number;
+        scoreVoiceColoring: boolean;
+        showInvisibleVoiceMarkers: boolean;
+        partVolumes: number[];
+        playbackSoundSource: PlaybackSoundSource;
+        selectedSoundfontId: string;
+        soundfontInstrumentByGroup: Record<string, string>;
       }>;
       if (s.mixedHideBarNumber !== undefined) this.mixedHideBarNumber = s.mixedHideBarNumber;
-      if (s.mixedShowJianpuLayer !== undefined) this.mixedShowJianpuLayer = s.mixedShowJianpuLayer;
-      if (s.pageW) this.pageW = s.pageW;
-      if (s.pageH) this.pageH = s.pageH;
+      // Older settings always stored the former 16:9 default even when the
+      // user never selected a direction. Migrate those installations to the
+      // new portrait default; subsequent explicit choices carry version 1.
+      if (s.pageOrientationVersion === 1) {
+        if (s.pageW) this.pageW = s.pageW;
+        if (s.pageH) this.pageH = s.pageH;
+      }
       if (s.titleSize !== undefined) this.titleSize = s.titleSize;
       if (s.creditSize !== undefined) this.creditSize = s.creditSize;
       if (s.color !== undefined) this.color = s.color;
+      this.engravingStyle = normalizeEngravingStyle(s.engravingStyle);
+      if (s.slashVoiceColorVersion === 2 && Array.isArray(s.slashVoiceColors)) {
+        this.slashVoiceColors = this.slashVoiceColors.map((fallback, index) => {
+          const value = s.slashVoiceColors?.[index];
+          return value === "" || (typeof value === "string" && /^#[\da-f]{6}$/i.test(value))
+            ? value
+            : fallback;
+        });
+      }
+      if (s.scoreVoiceColoring !== undefined) this.scoreVoiceColoring = s.scoreVoiceColoring;
+      if (s.showInvisibleVoiceMarkers !== undefined) {
+        this.showInvisibleVoiceMarkers = s.showInvisibleVoiceMarkers;
+      }
+      if (Array.isArray(s.partVolumes)) {
+        this.partVolumes = s.partVolumes.map((value) =>
+          Number.isFinite(value) ? Math.max(0, Math.min(1, value)) : 1);
+      }
+      if (s.playbackSoundSource === "default" || s.playbackSoundSource === "sf2") {
+        this.playbackSoundSource = s.playbackSoundSource;
+      }
+      if (typeof s.selectedSoundfontId === "string") {
+        this.selectedSoundfontId = s.selectedSoundfontId;
+      }
+      if (s.soundfontInstrumentByGroup && typeof s.soundfontInstrumentByGroup === "object") {
+        this.soundfontInstrumentByGroup = Object.fromEntries(
+          Object.entries(s.soundfontInstrumentByGroup)
+            .filter((entry): entry is [string, string] => typeof entry[1] === "string"),
+        );
+      }
       if (s.zoom) this.zoom = s.zoom;
       this._applyZoom();
       if (s.fontSize && s.fontSize !== this.fontSize) {
         this.fontSize = s.fontSize;
         const score = this.painter.score;
         this.painter = new JinpuPainter(this.fontSize);
-        this.painter.layout.options.smuflMeta = this.meta;
+        this.configurePainter(this.painter);
         this.painter.score = score;
       }
-      this.painter.layout.options.color = this.color;
-      this.painter.layout.options.titleSize = this.titleSize;
-      this.painter.layout.options.creditSize = this.creditSize;
+      this.configurePainter(this.painter);
     } catch {
       // corrupt storage — ignore
     }
@@ -144,13 +338,22 @@ export class App {
       localStorage.setItem(App.SETTINGS_KEY, JSON.stringify({
         pageW: this.pageW,
         pageH: this.pageH,
+        pageOrientationVersion: 1,
         fontSize: this.fontSize,
         titleSize: this.titleSize,
         creditSize: this.creditSize,
         color: this.color,
+        engravingStyle: this.engravingStyle,
+        slashVoiceColors: this.slashVoiceColors,
+        slashVoiceColorVersion: 2,
+        scoreVoiceColoring: this.scoreVoiceColoring,
+        showInvisibleVoiceMarkers: this.showInvisibleVoiceMarkers,
+        partVolumes: this.partVolumes,
+        playbackSoundSource: this.playbackSoundSource,
+        selectedSoundfontId: this.selectedSoundfontId,
+        soundfontInstrumentByGroup: this.soundfontInstrumentByGroup,
         zoom: this.zoom,
         mixedHideBarNumber: this.mixedHideBarNumber,
-        mixedShowJianpuLayer: this.mixedShowJianpuLayer,
       }));
     } catch {
       // storage unavailable — ignore
@@ -181,7 +384,23 @@ export class App {
       if (u.docChanged) {
         // 识别映射随用户编辑迁移偏移，保持点选仍落在正确 token。
         if (this._recogMeta) this._recogMeta = mapMeta(this._recogMeta, u.changes);
+        if (this._selectedNotes.length > 0) {
+          this._pendingSelectionAnchors = this._selectedNotes.map((selection) => ({
+            position: u.changes.mapPos(selection.source.from, -1),
+            verse: selection.verse,
+          }));
+        }
+        if (this._rangeAnchorPosition !== null) {
+          this._rangeAnchorPosition = u.changes.mapPos(this._rangeAnchorPosition, -1);
+        }
+        this._softDeletedNotes = this._softDeletedNotes.map((range) => ({
+          from: u.changes.mapPos(range.from, -1),
+          to: u.changes.mapPos(range.to, 1),
+        }));
+        this._scoreUndoStack = [];
         this.scheduleReload();
+      } else if (u.selectionSet && !this._syncingCodeSelection) {
+        this.syncScoreSelectionsFromCode();
       }
     });
     this.view = new EditorView({
@@ -192,7 +411,13 @@ export class App {
           lineNumbers(),
           history(),
           keymap.of([...defaultKeymap, ...historyKeymap]),
+          EditorState.allowMultipleSelections.of(true),
           jpwHighlighter,
+          scoreSourceHighlighter,
+          slashVoiceHighlighter,
+          EditorView.domEventHandlers({
+            keydown: (event) => this.onEditorKeyDown(event),
+          }),
           updateListener,
           this._readOnlyCompartment.of(EditorState.readOnly.of(false)),
           EditorView.lineWrapping,
@@ -211,11 +436,19 @@ export class App {
   }
 
   setText(text: string): void {
+    this.deselect(false);
+    this.resetSoftDeletedState();
     this.view.dispatch({
       changes: { from: 0, to: this.view.state.doc.length, insert: text },
     });
     // dispatch triggers updateListener -> scheduleReload, but reload now for snappiness
     this.reload(text);
+  }
+
+  private resetSoftDeletedState(): void {
+    this._softDeletedNotes = [];
+    this._softDeletedTempoKeys.clear();
+    this._scoreUndoStack = [];
   }
 
   private scheduleReload(): void {
@@ -227,24 +460,46 @@ export class App {
   reload(text: string): boolean {
     // 混排/识别模式：谱面区显示各自专属视图，编辑文本不重排冲掉它。
     if (this.mode !== "jp") return true;
-    let f: JpwFile | null;
-    try {
-      f = JpwFile.fromString(text);
-    } catch {
-      return false;
+    if (this._pendingSelectionAnchors === null && this._selectedNotes.length > 0) {
+      this._pendingSelectionAnchors = this._selectedNotes.map((selection) => ({
+        position: selection.source.from,
+        verse: selection.verse,
+      }));
     }
-    if (!f) return false;
     let score;
-    try {
-      score = fromJpw(f);
-    } catch (e) {
-      console.error("import failed", e);
-      return false;
+    let breakDesc: string | null = null;
+    if (this.documentFormat === "jpw") {
+      let f: JpwFile | null;
+      try {
+        f = JpwFile.fromString(text);
+      } catch {
+        return false;
+      }
+      if (!f) return false;
+      try {
+        score = fromJpw(f);
+      } catch (e) {
+        console.error("import failed", e);
+        return false;
+      }
+      if (!score) return false;
+      breakDesc = f.getSection(LayoutSection)?.desc ?? null;
+    } else {
+      if (!this.slashOptions) return false;
+      try {
+        score = parseSlashScore(text, this.slashOptions).score;
+      } catch (e) {
+        console.error("slash-score import failed", e);
+        return false;
+      }
     }
-    if (!score) return false;
 
     this.painter.score = score;
-    const breakDesc = f.getSection(LayoutSection)?.desc ?? null;
+    this._sourceNotes = this.documentFormat === "jpw"
+      ? buildJpwSourceNotes(text, score)
+      : buildSlashSourceNotes(text, this.slashOptions!, score);
+    this.updateSlashVoiceHighlights();
+    this.applySoftDeletedModelState();
     try {
       this.painter.resize(this.pageW, this.pageH, breakDesc);
     } catch (e) {
@@ -252,7 +507,110 @@ export class App {
       return false;
     }
     this.renderPages();
+    this.applyScoreVoiceColors();
     return true;
+  }
+
+  private updateSlashVoiceHighlights(): void {
+    if (!this.view) return;
+    if (this.documentFormat === "jpw") {
+      this.view.dispatch({ effects: setSlashVoiceHighlights.of([]) });
+      return;
+    }
+    this.view.dispatch({
+      effects: setSlashVoiceHighlights.of(this._sourceNotes.flatMap((source) => {
+        if (!source.voiceIndex || source.markerFrom === undefined) return [];
+        const color = this.activeSlashVoiceColor(source.voiceIndex);
+        if (!color) return [];
+        return [{
+          from: source.from,
+          to: source.to,
+          markerFrom: source.markerFrom,
+          voiceIndex: source.voiceIndex,
+          color,
+          showMarker: this.showInvisibleVoiceMarkers,
+        }];
+      })),
+    });
+  }
+
+  /** The last/default TXT voice is intentionally uncoloured. */
+  private activeSlashVoiceColor(voiceIndex: number): string | null {
+    const count = this.slashOptions?.voiceCount ?? 1;
+    if (voiceIndex >= count) return null;
+    const color = this.slashVoiceColors[voiceIndex - 1] ?? "";
+    return /^#[\da-f]{6}$/i.test(color) ? color : null;
+  }
+
+  private applyScoreVoiceColors(): void {
+    if (!this.scoreVoiceColoring || this.documentFormat === "jpw") return;
+    for (const source of this._sourceNotes) {
+      if (!source.voiceIndex) continue;
+      const color = this.activeSlashVoiceColor(source.voiceIndex);
+      if (!color) continue;
+      for (const rendered of this.painter.noteGroupEls(source.chord, source.note)) {
+        rendered.element.classList.add("score-voice-colored");
+        rendered.element.style.setProperty("--score-voice-color", color);
+        rendered.element.querySelectorAll<SVGElement>("[fill]").forEach((element) => {
+          if (element.getAttribute("fill") !== "none") element.setAttribute("fill", color);
+        });
+        rendered.element.querySelectorAll<SVGElement>("[stroke]").forEach((element) => {
+          if (element.getAttribute("stroke") !== "none") element.setAttribute("stroke", color);
+        });
+      }
+    }
+  }
+
+  /**
+   * Render the current score through the production layout path for the
+   * engraving dialog. A fixed two-system feature score keeps every formatting
+   * control visible even when the open document does not contain that symbol.
+   */
+  renderEngravingStylePreview(style: Partial<EngravingStyle>): SVGSVGElement | null {
+    const previewFile = JpwFile.fromString(ENGRAVING_STYLE_PREVIEW_JPW);
+    if (!previewFile) return null;
+    const previewScore = fromJpw(previewFile);
+    if (!previewScore) return null;
+    const previewPainter = new JinpuPainter(this.fontSize);
+    this.configurePainter(previewPainter);
+    previewPainter.layout.options.applyEngravingStyle(style);
+    previewPainter.score = previewScore;
+    const previewPageHeight = Math.max(this.pageH, this.fontSize * 44);
+    try {
+      previewPainter.resize(
+        this.pageW,
+        previewPageHeight,
+        previewFile.getSection(LayoutSection)?.desc ?? null,
+      );
+    } catch {
+      return null;
+    }
+    if (previewPainter.pageCount === 0) return null;
+
+    const page = previewPainter.layout.pages[0];
+    const systems: Array<{ item: PageItem; y: number }> = [];
+    const walk = (item: PageItem): void => {
+      if (item.classes.has("rhythmic-system") || item.classes.has("piano-system") || item.classes.has("ensemble-system")) {
+        systems.push({ item, y: item.pos(page).y });
+      }
+      for (const child of item.children) walk(child);
+    };
+    walk(page);
+    systems.sort((left, right) => left.y - right.y);
+
+    const finalVisibleSystem = systems[Math.min(1, systems.length - 1)];
+    const notationBottom = finalVisibleSystem
+      ? finalVisibleSystem.y + finalVisibleSystem.item.height + previewPainter.layout.options.numberSize * 1.3
+      : previewPageHeight * 0.42;
+    const cropHeight = Math.min(
+      previewPageHeight,
+      Math.max(this.fontSize * 8, notationBottom),
+    );
+    const svg = previewPainter.renderPage(0);
+    svg.setAttribute("viewBox", `0 0 ${this.pageW} ${cropHeight}`);
+    svg.setAttribute("preserveAspectRatio", "xMidYMin meet");
+    svg.dataset.actualLayoutPreview = "true";
+    return svg;
   }
 
   /**
@@ -263,9 +621,9 @@ export class App {
    * The svg keeps the full page viewBox; crop to content via getBBox after it
    * is attached to the DOM.
    *
-   * `titlePage: true` renders the standalone title page (Title/SubTitle/credit/
-   * expression layout); otherwise renders the first content page with its
-   * footer (running title + page number) stripped so only the music remains.
+   * `titlePage: true` renders the real first music page with its publication
+   * header; otherwise the header is disabled and the page footer is stripped
+   * so only the notation example remains.
    */
   renderExampleSvg(jpwabc: string, opts: { width?: number; height?: number; titlePage?: boolean } = {}): SVGSVGElement | null {
     const width = opts.width ?? 1600;
@@ -295,23 +653,21 @@ export class App {
       score.playData.isSimpple = true;
     }
     const p = new JinpuPainter(this.fontSize);
-    p.layout.options.smuflMeta = this.meta;
-    p.layout.options.color = 0xff000000;
+    this.configurePainter(p, 0xff000000);
     p.score = score;
     const breakDesc = f.getSection(LayoutSection)?.desc ?? null;
     try {
       if (opts.titlePage) {
-        // resize() prepends a standalone title page at index 0.
         p.resize(width, height, breakDesc);
         return p.renderPage(0);
       }
       p.pageWidth = width;
       p.pageHeight = height;
-      p.layout.fromScore(score, breakDesc, width, height);
+      p.layout.fromScore(score, breakDesc, width, height, false);
       const pg = p.layout.pages[0];
       if (!pg) return null;
-      // fromScore appends a running-title + page-number footer as the last two
-      // children of each page; drop them so examples show only the music.
+      // fromScore appends the page-number footer as the last two children;
+      // drop both footer frames so examples show only the music.
       if (pg.children.length > 2) pg.children.splice(pg.children.length - 2, 2);
       pg.update();
       return p.renderPage(0);
@@ -324,57 +680,785 @@ export class App {
     this._player?.stop(); // relayout invalidates chord objects / highlight
     this.scorePane.replaceChildren();
     this.pageEls = [];
-    this.selectedEl = null;
+    this.selectedEls.clear();
     for (let i = 0; i < this.painter.pageCount; i++) {
       const svg = this.painter.renderPage(i);
       const wrap = document.createElement("div");
       wrap.className = "score-page-wrap";
+      wrap.style.aspectRatio = `${this.painter.pageWidth} / ${this.painter.pageHeight}`;
+      const maxWidth = this.painter.pageHeight > this.painter.pageWidth ? 720 : 960;
+      wrap.style.width = `calc(min(${maxWidth}px, 100%) * var(--score-zoom, 1))`;
       wrap.appendChild(svg);
       const idx = i;
       svg.addEventListener("click", (e) => this.onPageClick(idx, svg, e));
+      svg.addEventListener("dblclick", (e) => this.onPageDoubleClick(idx, svg, e));
+      svg.addEventListener("pointerdown", (e) => this.onPagePointerDown(idx, svg, e));
+      svg.addEventListener("pointermove", (e) => this.onPagePointerMove(e));
+      svg.addEventListener("pointerup", (e) => this.onPagePointerUp(e));
+      svg.addEventListener("pointercancel", (e) => this.onPagePointerCancel(e));
       this.scorePane.appendChild(wrap);
       this.pageEls.push(wrap);
     }
     this.pageIndex = Math.min(this.pageIndex, Math.max(0, this.pageEls.length - 1));
+    this.applySoftDeletedClasses();
+    this.restoreScoreSelections();
   }
 
   // ---------------- picking / selection ----------------
   private onPageClick(pageIndex: number, svg: SVGSVGElement, ev: MouseEvent): void {
+    if (this._suppressPageClick) {
+      this._suppressPageClick = false;
+      ev.preventDefault();
+      return;
+    }
     const ctm = svg.getScreenCTM();
     if (!ctm) return;
     const pt = new DOMPoint(ev.clientX, ev.clientY).matrixTransform(ctm.inverse());
     const picked = this.painter.pickPage(pageIndex, new Point(pt.x, pt.y));
-    this.deselect();
+    const additive = ev.ctrlKey || ev.metaKey;
     if (!picked) {
+      if (additive) {
+        this.scorePane.focus({ preventScroll: true });
+        return;
+      }
+      this.deselect();
       this.setStatus("");
       return;
     }
-    const target = picked.selectable ? picked : this.painter.entryGroupOf(picked);
-    const el = this.painter.nodeMap.get(target);
-    if (el) {
-      el.classList.add("selected");
-      this.selectedEl = el;
+
+    const hit = this.scoreNoteHit(picked);
+    if (!hit) {
+      const object = this.scoreObjectHit(picked);
+      if (object) {
+        const existing = this._selectedObjects.findIndex((selection) =>
+          selection.mark === object.mark);
+        if (additive) {
+          if (existing >= 0) this.removeScoreObjectSelection(existing);
+          else this.addScoreObjectSelection(object);
+        } else {
+          this.clearSelectedItems();
+          this.addScoreObjectSelection(object);
+        }
+        this._pendingSelectionAnchors = null;
+        this.syncCodeSelections(false);
+        this.setStatus(this.selectionStatus());
+        this.scorePane.focus({ preventScroll: true });
+        return;
+      }
+      if (additive) {
+        this.scorePane.focus({ preventScroll: true });
+        return;
+      }
+      this.deselect();
+      const target = picked.selectable ? picked : this.painter.entryGroupOf(picked);
+      const el = this.painter.nodeMap.get(target);
+      if (el) {
+        el.classList.add("selected");
+        this.selectedEls.add(el);
+      }
+      this.setStatus(describePick(picked));
+      this.scorePane.focus({ preventScroll: true });
+      return;
     }
-    // Remember the note entry so playback can start from here.
-    const d = target.data;
-    if (d && typeof (d as { verse?: unknown }).verse === "number" && (d as { chord?: unknown }).chord) {
-      const ne = d as { chord: import("../score/score").Chord; verse: number };
-      this._selectedChord = ne.chord;
-      this._selectedVerse = ne.verse;
+
+    if (ev.shiftKey && this._rangeAnchorPosition !== null) {
+      const anchorIndex = this._sourceNotes.findIndex((source) =>
+        source.from === this._rangeAnchorPosition
+        || (this._rangeAnchorPosition! >= source.from && this._rangeAnchorPosition! < source.to));
+      const targetIndex = this._sourceNotes.indexOf(hit.source);
+      if (anchorIndex >= 0 && targetIndex >= 0) {
+        const anchorPosition = this._rangeAnchorPosition;
+        this.clearSelectedItems();
+        const from = Math.min(anchorIndex, targetIndex);
+        const to = Math.max(anchorIndex, targetIndex);
+        const range = this._sourceNotes.slice(from, to + 1);
+        for (const source of range) {
+          if (source !== hit.source) this.addScoreSelection(source, hit.verse);
+        }
+        this.addScoreSelection(hit.source, hit.verse, hit.element);
+        this._rangeAnchorPosition = anchorPosition;
+      }
+    } else if (additive) {
+      const existing = this._selectedNotes.findIndex((selection) =>
+        selection.source.from === hit.source.from && selection.source.to === hit.source.to);
+      if (existing >= 0) this.removeScoreSelection(existing);
+      else this.addScoreSelection(hit.source, hit.verse, hit.element);
+      this._rangeAnchorPosition = hit.source.from;
+    } else {
+      this.clearSelectedItems();
+      this.addScoreSelection(hit.source, hit.verse, hit.element);
+      this._rangeAnchorPosition = hit.source.from;
     }
-    this.setStatus(describePick(picked));
+    this._pendingSelectionAnchors = null;
+    this.syncCodeSelections(true);
+    this.setStatus(this.selectionStatus());
+    this.scorePane.focus({ preventScroll: true });
   }
 
-  private deselect(): void {
-    this.selectedEl?.classList.remove("selected");
-    this.selectedEl = null;
-    this._selectedChord = null;
-    this._selectedVerse = 0;
+  private scoreNoteHit(picked: PageItem): SelectedScoreNote | null {
+    if (picked instanceof LayoutLyric) return null;
+    const entryItem = this.painter.entryGroupOf(picked);
+    const entry = entryItem.data;
+    if (!(entry instanceof NoteEntry)) return null;
+    let graceVisual: PageItem | null = null;
+    let graceNote: ScoreNote | null = null;
+    let cursor: PageItem | null = picked;
+    while (cursor && cursor !== entryItem) {
+      if (cursor.data instanceof ScoreNote) {
+        graceNote = cursor.data;
+        graceVisual = entry.graceItems.get(graceNote) ?? cursor;
+        break;
+      }
+      cursor = cursor.parent;
+    }
+    let number: JpNumber | null = null;
+    if (picked instanceof JpNumber) number = picked;
+    else if (picked instanceof JpOctaveDot) number = picked.owner;
+    if (!graceNote && number) {
+      const grace = [...entry.graceItems.entries()].find(([, item]) => {
+        let parent: PageItem | null = number;
+        while (parent && parent !== entryItem) {
+          if (parent === item) return true;
+          parent = parent.parent;
+        }
+        return false;
+      });
+      graceNote = grace?.[0] ?? null;
+      graceVisual = grace?.[1] ?? null;
+    }
+    const noteIndex = number ? Math.max(0, entry.numbers.indexOf(number)) : 0;
+    const note = graceNote ?? entry.chord.notes[noteIndex] ?? entry.chord.notes[0];
+    if (!note) return null;
+    const source = this._sourceNotes.find((candidate) => candidate.note === note);
+    if (!source) return null;
+    const visualItem = graceVisual ?? number ?? entryItem;
+    const element = this.painter.nodeMap.get(visualItem)
+      ?? this.painter.noteGroupEl(entry.chord, note, entry.verse);
+    return element ? { source, verse: entry.verse, element } : null;
+  }
+
+  private scoreObjectHit(picked: PageItem): SelectedScoreObject | null {
+    let item: PageItem | null = picked;
+    while (item) {
+      if (item.data instanceof TempoMark) {
+        const element = this.painter.nodeMap.get(item);
+        return element ? { mark: item.data, element } : null;
+      }
+      item = item.parent;
+    }
+    return null;
+  }
+
+  private addScoreSelection(source: JpwSourceNote, verse: number, element?: SVGGElement): void {
+    if (this._selectedNotes.some((selection) =>
+      selection.source.from === source.from && selection.source.to === source.to)) return;
+    const el = element ?? this.painter.noteGroupEl(source.chord, source.note, verse);
+    if (!el) return;
+    el.classList.add("selected");
+    this.selectedEls.add(el);
+    this._selectedNotes.push({ source, verse, element: el });
+  }
+
+  private removeScoreSelection(index: number): void {
+    const selection = this._selectedNotes[index];
+    if (!selection) return;
+    selection.element.classList.remove("selected");
+    this.selectedEls.delete(selection.element);
+    this._selectedNotes.splice(index, 1);
+  }
+
+  private addScoreObjectSelection(selection: SelectedScoreObject): void {
+    if (this._selectedObjects.some((item) => item.mark === selection.mark)) return;
+    selection.element.classList.add("selected");
+    this.selectedEls.add(selection.element);
+    this._selectedObjects.push(selection);
+  }
+
+  private removeScoreObjectSelection(index: number): void {
+    const selection = this._selectedObjects[index];
+    if (!selection) return;
+    selection.element.classList.remove("selected");
+    this.selectedEls.delete(selection.element);
+    this._selectedObjects.splice(index, 1);
+  }
+
+  private selectionStatus(): string {
+    const noteCount = this._selectedNotes.length;
+    const objectCount = this._selectedObjects.length;
+    if (noteCount + objectCount === 0) {
+      return "已清除谱面选择；播放将从开头开始";
+    }
+    const parts = [
+      noteCount > 0 ? `${noteCount} 个音符` : "",
+      objectCount > 0 ? `${objectCount} 个速度标记` : "",
+    ].filter(Boolean);
+    return `已选择 ${parts.join("、")}；Del/退格软删除，双击半透明项目恢复`;
+  }
+
+  private tempoMarkKey(mark: TempoMark): string {
+    return `${mark.measure}:${mark.offset.toString()}:${mark.kind}:${mark.bpm ?? ""}`;
+  }
+
+  private sameRange(left: JpwRange, right: JpwRange): boolean {
+    return left.from === right.from && left.to === right.to;
+  }
+
+  private applySoftDeletedModelState(): void {
+    for (const source of this._sourceNotes) source.note.softDeleted = false;
+    for (const mark of this.painter.score.tempoMarks) mark.softDeleted = false;
+    for (const source of this._sourceNotes) {
+      if (this._softDeletedNotes.some((range) => this.sameRange(range, source))) {
+        source.note.softDeleted = true;
+      }
+    }
+    for (const mark of this.painter.score.tempoMarks) {
+      mark.softDeleted = this._softDeletedTempoKeys.has(this.tempoMarkKey(mark));
+    }
+  }
+
+  private applySoftDeletedClasses(): void {
+    for (const source of this._sourceNotes) {
+      if (!source.note.softDeleted) continue;
+      for (const rendered of this.painter.noteGroupEls(source.chord, source.note)) {
+        rendered.element.classList.add("soft-deleted");
+      }
+    }
+    for (const mark of this.painter.score.tempoMarks) {
+      if (!mark.softDeleted) continue;
+      for (const rendered of this.painter.itemGroupsForData(mark)) {
+        rendered.element.classList.add("soft-deleted");
+      }
+    }
+  }
+
+  private deleteSelectedScoreItems(): void {
+    const notes = [...new Map(this._selectedNotes.map(({ source }) => [
+      `${source.from}:${source.to}`,
+      { from: source.from, to: source.to },
+    ])).values()].filter((range) =>
+      !this._softDeletedNotes.some((item) => this.sameRange(item, range)));
+    const tempoKeys = [...new Set(this._selectedObjects
+      .map(({ mark }) => this.tempoMarkKey(mark))
+      .filter((key) => !this._softDeletedTempoKeys.has(key)))];
+    if (notes.length === 0 && tempoKeys.length === 0) return;
+
+    this._scoreUndoStack.push({ notes, tempoKeys });
+    this._softDeletedNotes.push(...notes);
+    for (const key of tempoKeys) this._softDeletedTempoKeys.add(key);
+    this.applySoftDeletedModelState();
+    this.applySoftDeletedClasses();
+    this.clearSelectedItems();
+    this.syncCodeSelections(false);
+    this.setStatus(`已软删除 ${notes.length + tempoKeys.length} 项；双击半透明项目恢复，Ctrl+Z 撤回`);
+  }
+
+  private undoScoreDelete(): boolean {
+    const action = this._scoreUndoStack.pop();
+    if (!action) return false;
+    this._softDeletedNotes = this._softDeletedNotes.filter((range) =>
+      !action.notes.some((item) => this.sameRange(item, range)));
+    for (const key of action.tempoKeys) this._softDeletedTempoKeys.delete(key);
+    this.applySoftDeletedModelState();
+    for (const source of this._sourceNotes) {
+      if (source.note.softDeleted) continue;
+      for (const rendered of this.painter.noteGroupEls(source.chord, source.note)) {
+        rendered.element.classList.remove("soft-deleted");
+      }
+    }
+    for (const mark of this.painter.score.tempoMarks) {
+      if (mark.softDeleted) continue;
+      for (const rendered of this.painter.itemGroupsForData(mark)) {
+        rendered.element.classList.remove("soft-deleted");
+      }
+    }
+    this.setStatus(`已撤回谱面删除：恢复 ${action.notes.length + action.tempoKeys.length} 项`);
+    return true;
+  }
+
+  private discardRestoredUndo(
+    restoredRange: JpwRange | null,
+    restoredTempoKey: string | null,
+  ): void {
+    this._scoreUndoStack = this._scoreUndoStack.map((action) => ({
+      notes: restoredRange
+        ? action.notes.filter((range) => !this.sameRange(range, restoredRange))
+        : action.notes,
+      tempoKeys: restoredTempoKey
+        ? action.tempoKeys.filter((key) => key !== restoredTempoKey)
+        : action.tempoKeys,
+    })).filter((action) => action.notes.length > 0 || action.tempoKeys.length > 0);
+  }
+
+  private onPageDoubleClick(pageIndex: number, svg: SVGSVGElement, ev: MouseEvent): void {
+    const ctm = svg.getScreenCTM();
+    if (!ctm) return;
+    const point = new DOMPoint(ev.clientX, ev.clientY).matrixTransform(ctm.inverse());
+    const picked = this.painter.pickPage(pageIndex, new Point(point.x, point.y));
+    if (!picked) return;
+    const hit = this.scoreNoteHit(picked);
+    if (hit && hit.source.note.softDeleted) {
+      const range = { from: hit.source.from, to: hit.source.to };
+      this._softDeletedNotes = this._softDeletedNotes.filter((item) =>
+        !this.sameRange(item, range));
+      hit.source.note.softDeleted = false;
+      for (const rendered of this.painter.noteGroupEls(hit.source.chord, hit.source.note)) {
+        rendered.element.classList.remove("soft-deleted");
+      }
+      this.discardRestoredUndo(range, null);
+      this.setStatus("已恢复音符");
+      ev.preventDefault();
+      return;
+    }
+    const object = this.scoreObjectHit(picked);
+    if (object?.mark.softDeleted) {
+      const key = this.tempoMarkKey(object.mark);
+      this._softDeletedTempoKeys.delete(key);
+      object.mark.softDeleted = false;
+      for (const rendered of this.painter.itemGroupsForData(object.mark)) {
+        rendered.element.classList.remove("soft-deleted");
+      }
+      this.discardRestoredUndo(null, key);
+      this.setStatus("已恢复速度标记");
+      ev.preventDefault();
+    }
+  }
+
+  private onPagePointerDown(
+    page: number,
+    svg: SVGSVGElement,
+    ev: PointerEvent,
+  ): void {
+    if (ev.button !== 0) return;
+    ev.preventDefault();
+    window.getSelection()?.removeAllRanges();
+    this._dragSelection = {
+      page,
+      svg,
+      pointerId: ev.pointerId,
+      startX: ev.clientX,
+      startY: ev.clientY,
+      currentX: ev.clientX,
+      currentY: ev.clientY,
+      additive: ev.ctrlKey || ev.metaKey,
+      moved: false,
+    };
+    svg.setPointerCapture(ev.pointerId);
+  }
+
+  private onPagePointerMove(ev: PointerEvent): void {
+    const drag = this._dragSelection;
+    if (!drag || drag.pointerId !== ev.pointerId) return;
+    drag.currentX = ev.clientX;
+    drag.currentY = ev.clientY;
+    if (Math.hypot(drag.currentX - drag.startX, drag.currentY - drag.startY) >= 4) {
+      drag.moved = true;
+    }
+    if (drag.moved) ev.preventDefault();
+  }
+
+  private onPagePointerUp(ev: PointerEvent): void {
+    const drag = this._dragSelection;
+    if (!drag || drag.pointerId !== ev.pointerId) return;
+    drag.currentX = ev.clientX;
+    drag.currentY = ev.clientY;
+    this._dragSelection = null;
+    if (drag.svg.hasPointerCapture(ev.pointerId)) drag.svg.releasePointerCapture(ev.pointerId);
+    if (!drag.moved) return;
+    ev.preventDefault();
+    this.selectNotesInDragRect(drag);
+    this._suppressPageClick = true;
+    setTimeout(() => {
+      this._suppressPageClick = false;
+    }, 0);
+  }
+
+  private onPagePointerCancel(ev: PointerEvent): void {
+    const drag = this._dragSelection;
+    if (!drag || drag.pointerId !== ev.pointerId) return;
+    this._dragSelection = null;
+    if (drag.svg.hasPointerCapture(ev.pointerId)) drag.svg.releasePointerCapture(ev.pointerId);
+  }
+
+  private selectNotesInDragRect(drag: ScoreDragSelection): void {
+    const left = Math.min(drag.startX, drag.currentX);
+    const right = Math.max(drag.startX, drag.currentX);
+    const top = Math.min(drag.startY, drag.currentY);
+    const bottom = Math.max(drag.startY, drag.currentY);
+    if (!drag.additive) this.clearSelectedItems();
+    for (const source of this._sourceNotes) {
+      const rendered = this.painter.noteGroupEls(source.chord, source.note)
+        .find((item) => item.page === drag.page && (() => {
+          const rect = item.element.getBoundingClientRect();
+          return rect.left <= right && rect.right >= left
+            && rect.top <= bottom && rect.bottom >= top;
+        })());
+      if (rendered) this.addScoreSelection(source, rendered.verse, rendered.element);
+    }
+    const last = this._selectedNotes[this._selectedNotes.length - 1];
+    this._rangeAnchorPosition = last?.source.from ?? this._rangeAnchorPosition;
+    this._pendingSelectionAnchors = null;
+    this.syncCodeSelections(true);
+    this.setStatus(this.selectionStatus());
+    this.scorePane.focus({ preventScroll: true });
+  }
+
+  private clearSelectedItems(): void {
+    for (const element of this.selectedEls) element.classList.remove("selected");
+    this.selectedEls.clear();
+    this._selectedNotes = [];
+    this._selectedObjects = [];
+    this._pendingSelectionAnchors = null;
+  }
+
+  private deselect(syncCode = true): void {
+    this.clearSelectedItems();
+    this._rangeAnchorPosition = null;
+    if (!this.view) return;
+    if (syncCode) this.syncCodeSelections(false);
+    else this.view.dispatch({ effects: setScoreSourceHighlights.of([]) });
+  }
+
+  private syncCodeSelections(scroll: boolean): void {
+    if (!this.view) return;
+    if (this._selectedNotes.length === 0) {
+      const head = this.view.state.selection.main.head;
+      this._syncingCodeSelection = true;
+      try {
+        this.view.dispatch({
+          selection: EditorSelection.single(head),
+          effects: setScoreSourceHighlights.of([]),
+        });
+      } finally {
+        this._syncingCodeSelection = false;
+      }
+      return;
+    }
+    const primary = this._selectedNotes[this._selectedNotes.length - 1].source;
+    const unique = [...new Map(this._selectedNotes.map((selection) => [
+      `${selection.source.from}:${selection.source.to}`,
+      selection.source,
+    ])).values()].sort((a, b) => a.from - b.from || a.to - b.to);
+    const mainIndex = Math.max(0, unique.findIndex((source) => source === primary));
+    this._syncingCodeSelection = true;
+    try {
+      this.view.dispatch({
+        selection: EditorSelection.create(
+          unique.map((source) => EditorSelection.range(source.from, source.to)),
+          mainIndex,
+        ),
+        effects: [
+          setScoreSourceHighlights.of(unique.map((source) => ({ from: source.from, to: source.to }))),
+          ...(scroll ? [EditorView.scrollIntoView(primary.from, { y: "center" })] : []),
+        ],
+      });
+    } finally {
+      this._syncingCodeSelection = false;
+    }
+  }
+
+  /** Mirror a keyboard/number/JPW source selection back onto rendered notes. */
+  private syncScoreSelectionsFromCode(): void {
+    if (!this.view || this.mode !== "jp") return;
+    const ranges = this.view.state.selection.ranges;
+    const sources = this._sourceNotes.filter((source) => ranges.some((range) =>
+      range.empty
+        ? range.head >= source.from && range.head < source.to
+        : range.from < source.to && range.to > source.from));
+    this.clearSelectedItems();
+    for (const source of sources) {
+      const rendered = this.painter.noteGroupEls(source.chord, source.note)[0];
+      if (rendered) this.addScoreSelection(source, rendered.verse, rendered.element);
+    }
+    const last = sources[sources.length - 1];
+    this._rangeAnchorPosition = last?.from ?? null;
+    this.view.dispatch({
+      effects: setScoreSourceHighlights.of(sources.map((source) => ({
+        from: source.from,
+        to: source.to,
+      }))),
+    });
+  }
+
+  private restoreScoreSelections(): void {
+    const anchors = this._pendingSelectionAnchors
+      ?? this._selectedNotes.map((selection) => ({ position: selection.source.from, verse: selection.verse }));
+    this._selectedNotes = [];
+    this._selectedObjects = [];
+    this._pendingSelectionAnchors = null;
+    for (const anchor of anchors) {
+      const source = this._sourceNotes.find((candidate) =>
+        anchor.position === candidate.from
+        || (anchor.position >= candidate.from && anchor.position < candidate.to));
+      if (source) this.addScoreSelection(source, anchor.verse);
+    }
+    if (anchors.length > 0) this.syncCodeSelections(false);
+  }
+
+  private onEditorKeyDown(event: KeyboardEvent): boolean {
+    return this.handleVoiceShortcut(event);
+  }
+
+  private handleVoiceShortcut(event: KeyboardEvent): boolean {
+    if (this.documentFormat === "jpw" || !this.slashOptions || !event.altKey
+      || event.ctrlKey || event.metaKey || event.shiftKey) return false;
+    const match = /^(?:Digit|Numpad)([1-9])$/.exec(event.code);
+    const targetVoice = match ? parseInt(match[1], 10) : /^[1-9]$/.test(event.key)
+      ? parseInt(event.key, 10)
+      : 0;
+    if (targetVoice === 0) return false;
+    event.preventDefault();
+    event.stopPropagation();
+
+    let voiceCount = Math.max(1, Math.min(MAX_SLASH_VOICES, this.slashOptions.voiceCount));
+    const wasSingleAltOne = voiceCount === 1 && targetVoice === 1;
+    if (targetVoice > voiceCount && !wasSingleAltOne) {
+      this.setStatus(`当前启用 ${voiceCount} 个声部；请先在选项中启用 V${targetVoice}`);
+      return true;
+    }
+    const ranges = this.view.state.selection.ranges;
+    const selected = [...new Map(this._sourceNotes.filter((source) =>
+      this._selectedNotes.some((selection) => selection.source === source)
+      || ranges.some((range) => range.empty
+        ? range.head >= source.from && range.head < source.to
+        : range.from < source.to && range.to > source.from))
+      .map((source) => [`${source.from}:${source.to}`, source])).values()];
+    if (selected.length === 0) {
+      this.setStatus("请先在文本或谱面中选择要分配声部的音符");
+      return true;
+    }
+
+    const selectedOrdinals = selected.map((source) => this._sourceNotes.indexOf(source));
+    if (wasSingleAltOne) voiceCount = 2;
+    const text = this.getText();
+    const changes = selected.map((source) => {
+      const markerFrom = source.markerFrom ?? source.from;
+      const currentVoice = wasSingleAltOne ? 2 : source.voiceIndex ?? voiceCount;
+      const insert = targetVoice === voiceCount
+        || (!wasSingleAltOne && currentVoice === targetVoice)
+        ? ""
+        : SLASH_VOICE_SEPARATOR.repeat(targetVoice);
+      return { from: markerFrom, to: source.from, insert };
+    }).sort((left, right) => right.from - left.from || right.to - left.to);
+    let next = text;
+    for (const change of changes) {
+      next = next.slice(0, change.from) + change.insert + next.slice(change.to);
+    }
+    this.slashOptions = { ...this.slashOptions, voiceCount };
+    if (wasSingleAltOne) next = embedSlashScoreOptions(next, this.slashOptions);
+    this.setText(next);
+    clearTimeout(this.debounceTimer);
+    this.reload(this.getText());
+    for (const ordinal of selectedOrdinals) {
+      const source = this._sourceNotes[ordinal];
+      const rendered = source ? this.painter.noteGroupEls(source.chord, source.note)[0] : undefined;
+      if (source && rendered) this.addScoreSelection(source, rendered.verse, rendered.element);
+    }
+    if (this._selectedNotes.length > 0) this.syncCodeSelections(false);
+    this.setStatus(
+      wasSingleAltOne
+        ? `已自动启用双声部，并把 ${selected.length} 个音符设为 V1；其余音符属于默认 V2`
+        : targetVoice === voiceCount
+          ? `已把 ${selected.length} 个音符移回默认声部 V${voiceCount}`
+          : `已切换 ${selected.length} 个音符的 V${targetVoice} 归属`,
+    );
+    return true;
+  }
+
+  private onScoreKeyDown(event: KeyboardEvent): void {
+    if ((event.ctrlKey || event.metaKey)
+      && !event.shiftKey
+      && event.key.toLowerCase() === "z") {
+      event.preventDefault();
+      event.stopPropagation();
+      if (!this.undoScoreDelete()) undo(this.view);
+      return;
+    }
+    if (this.handleVoiceShortcut(event)) return;
+    if ((event.key === "Delete" || event.key === "Backspace")
+      && this._selectedNotes.length + this._selectedObjects.length > 0) {
+      event.preventDefault();
+      event.stopPropagation();
+      this.deleteSelectedScoreItems();
+      return;
+    }
+    if (this._selectedNotes.length === 0) return;
+    if (event.ctrlKey || event.metaKey || event.altKey) return;
+    let edit: PitchEdit | null = null;
+    let label = "";
+    if (/^[1-7]$/.test(event.key)) {
+      edit = { kind: "number", number: event.key };
+      label = `音高改为 ${event.key}`;
+    } else if (event.key === "ArrowUp") {
+      edit = { kind: "octave", delta: 1 };
+      label = "增加一个上加点（或移除一个下加点）";
+    } else if (event.key === "ArrowDown") {
+      edit = { kind: "octave", delta: -1 };
+      label = "增加一个下加点（或移除一个上加点）";
+    }
+    if (!edit) return;
+    event.preventDefault();
+    event.stopPropagation();
+    this.editSelectedPitches(edit, label);
+  }
+
+  private editSelectedPitches(edit: PitchEdit, label: string): void {
+    const text = this.getText();
+    const sources = [...new Map(this._selectedNotes.map((selection) => [
+      `${selection.source.from}:${selection.source.to}`,
+      selection.source,
+    ])).values()].sort((a, b) => a.from - b.from);
+    const changes = sources.map((source) => {
+      const before = text.substring(source.from, source.to);
+      const insert = this.documentFormat === "jpw"
+        ? editJpwPitch(before, edit)
+        : editSlashPitch(before, this.documentFormat, edit);
+      return { from: source.from, to: source.to, insert, before };
+    }).filter((change) => change.insert !== change.before);
+    if (changes.length === 0) return;
+    this.view.dispatch({ changes: changes.map(({ from, to, insert }) => ({ from, to, insert })) });
+    clearTimeout(this.debounceTimer);
+    const ok = this.reload(this.getText());
+    this.setStatus(ok ? `已修改 ${changes.length} 个音符：${label}` : "修改后的谱面暂时无法解析");
   }
 
   private setStatus(s: string): void {
     if (!this.statusEl) this.statusEl = document.getElementById("status");
     if (this.statusEl) this.statusEl.textContent = s;
+  }
+
+  getSlashVoiceCount(): number {
+    return this.documentFormat === "jpw" ? 1 : this.slashOptions?.voiceCount ?? 1;
+  }
+
+  setSlashVoiceSettings(
+    requestedCount: number,
+    colors: readonly string[],
+    scoreColoring: boolean,
+    showMarkers: boolean,
+  ): void {
+    this.slashVoiceColors = this.slashVoiceColors.map((fallback, index) => {
+      const value = colors[index];
+      return value === "" || (typeof value === "string" && /^#[\da-f]{6}$/i.test(value))
+        ? value
+        : fallback;
+    });
+    this.scoreVoiceColoring = scoreColoring;
+    this.showInvisibleVoiceMarkers = showMarkers;
+    this.saveSettings();
+    if (this.documentFormat === "jpw" || !this.slashOptions) {
+      this.reload(this.getText());
+      return;
+    }
+    const nextCount = Math.max(1, Math.min(MAX_SLASH_VOICES, Math.round(requestedCount)));
+    if (nextCount === this.slashOptions.voiceCount) {
+      this.reload(this.getText());
+      this.setStatus(`已更新 V1–V${nextCount} 的显示设置`);
+      return;
+    }
+    const migration = migrateSlashVoiceCount(this.getText(), this.slashOptions, nextCount);
+    this.slashOptions = { ...this.slashOptions, voiceCount: nextCount };
+    this.setText(migration.text);
+    this.setStatus(migration.mergedVoices.length > 0
+      ? `声部数量已改为 ${nextCount}；V${migration.mergedVoices.join("、V")} 已并入默认 V${nextCount}`
+      : `声部数量已从 ${migration.from} 增加到 ${migration.to}；原默认声部内容已移到新的默认 V${nextCount}`);
+  }
+
+  async changeDocumentFormat(target: "jpw" | SlashScoreKind): Promise<void> {
+    if (target === this.documentFormat || this.mode !== "jp") return;
+    this.stopPlayback();
+    const score = this.painter.score;
+    if (target === "jpw") {
+      this.documentFormat = "jpw";
+      this.slashOptions = null;
+      this.setText(scoreToJpwabc(score));
+    } else {
+      const current = this.slashOptions;
+      const voiceCount = current?.voiceCount
+        ?? Math.max(1, Math.min(MAX_SLASH_VOICES, score.parts.length));
+      const division = current
+        ? Math.max(
+          4,
+          current.noteDivision ?? 4,
+          current.spaceDivision ?? 4,
+          ...Object.values(current.symbolDurations),
+        ) as 4 | 8 | 16 | 32 | 64
+        : 16;
+      const raw = scoreToSlashScore(score, target, division, ".", undefined, voiceCount);
+      const analysis = analyzeSlashScore(raw);
+      const options: SlashScoreOptions = {
+        ...(current ?? defaultSlashScoreOptions(target, analysis)),
+        kind: target,
+        voiceCount,
+        instrumentName: current?.instrumentName?.trim()
+          || score.instrumentName.trim()
+          || score.parts[0]?.instrumentName.trim()
+          || "钢琴",
+        title: score.title,
+        subtitle: score.subtitle,
+        composer: score.composer,
+        arranger: score.arranger,
+        lyricist: score.lyricist,
+        tempoBpm: score.tempoBpm,
+        tempoBeatUnit: score.tempoBeatUnit,
+      };
+      this.documentFormat = target;
+      this.slashOptions = options;
+      this.setText(embedSlashScoreOptions(raw, options));
+    }
+    this.filePath = null;
+    this._browserSaveHandle = null;
+    this._hasSavedCurrent = false;
+    this.setStatus(`当前谱子已转换为${target === "jpw" ? " JPW 简谱" : target === "keyboard" ? "键盘谱 TXT" : "数字谱 TXT"}`);
+  }
+
+  exportTextDocument(
+    target: "jpw" | SlashScoreKind,
+    includeVoiceMarkers = true,
+  ): { bytes: Uint8Array; name: string; mime: string } {
+    const title = this.painter.score.title.split("\n")[0].trim() || "未命名";
+    if (target === "jpw") {
+      const text = this.documentFormat === "jpw"
+        ? this.getText()
+        : scoreToJpwabc(this.painter.score);
+      return {
+        bytes: encodeJpwabc(text),
+        name: `${title}.jpwabc`,
+        mime: "application/octet-stream",
+      };
+    }
+    let text: string;
+    let options: SlashScoreOptions;
+    if (this.documentFormat === target && this.slashOptions) {
+      options = { ...this.slashOptions, symbolDurations: { ...this.slashOptions.symbolDurations } };
+      text = embedSlashScoreOptions(this.getText(), options);
+    } else {
+      const voiceCount = includeVoiceMarkers
+        ? Math.max(1, Math.min(MAX_SLASH_VOICES, this.painter.score.parts.length))
+        : 1;
+      text = scoreToSlashScore(this.painter.score, target, 16, ".", undefined, voiceCount);
+      options = defaultSlashScoreOptions(target, analyzeSlashScore(text));
+      options = {
+        ...options,
+        voiceCount,
+        instrumentName: this.painter.score.instrumentName
+          || this.painter.score.parts[0]?.instrumentName
+          || "钢琴",
+        title: this.painter.score.title,
+        subtitle: this.painter.score.subtitle,
+        composer: this.painter.score.composer,
+        arranger: this.painter.score.arranger,
+        lyricist: this.painter.score.lyricist,
+        tempoBpm: this.painter.score.tempoBpm,
+        tempoBeatUnit: this.painter.score.tempoBeatUnit,
+      };
+      text = embedSlashScoreOptions(text, options);
+    }
+    if (!includeVoiceMarkers) text = stripSlashVoiceMarkers(text, options);
+    return {
+      bytes: new TextEncoder().encode(text),
+      name: `${title}-${target === "keyboard" ? "键盘谱" : "数字谱"}.txt`,
+      mime: "text/plain;charset=utf-8",
+    };
   }
 
   // ---------------- paging ----------------
@@ -384,9 +1468,12 @@ export class App {
     this.pageEls[np]?.scrollIntoView({ behavior: "smooth", block: "start" });
   }
   // ---------------- playback ----------------
-  setPlaybackBtn(el: HTMLButtonElement): void {
+  setPlayBtn(el: HTMLButtonElement): void {
     this._playBtnEl = el;
-    this.onPlayState("stopped");
+  }
+  setStopBtn(el: HTMLButtonElement): void {
+    this._stopBtnEl = el;
+    el.disabled = true;
   }
 
   private player(): ScorePlayer {
@@ -399,34 +1486,38 @@ export class App {
     return this._player;
   }
 
-  private onPlayChord(chord: import("../score/score").Chord | null, pass: number): void {
-    const page = this.painter.highlightChord(chord, pass);
-    if (chord && page !== null) {
+  private onPlayChord(chords: import("../score/score").Chord[] | null, pass: number): void {
+    const page = this.painter.highlightChords(chords, pass);
+    if (chords && chords.length > 0 && page !== null) {
       if (page !== this.pageIndex) this.pageIndex = page;
       // keep the sounding note visible (no-op when already in view)
-      this.painter.chordGroupEl(chord, pass)?.scrollIntoView({ block: "nearest", inline: "nearest" });
+      this.painter.chordGroupEl(chords[0], pass)?.scrollIntoView({ block: "nearest", inline: "nearest" });
     }
   }
 
   private onPlayState(state: PlayState): void {
-    if (!this._playBtnEl) return;
-    const label = state === "loading" ? "加载中" : state === "playing" ? "停止" : "播放";
-    const icon = this._playBtnEl.querySelector<HTMLElement>(".playback-icon");
-    const labelEl = this._playBtnEl.querySelector<HTMLElement>(".playback-label");
-    this._playBtnEl.dataset.state = state;
-    this._playBtnEl.disabled = state === "loading";
-    this._playBtnEl.setAttribute("aria-label", label);
-    this._playBtnEl.title = state === "playing" ? "停止试听" : state === "loading" ? "正在加载试听音色" : "播放试听";
-    if (labelEl) labelEl.textContent = label;
-    if (icon) {
-      icon.classList.toggle("is-loading", state === "loading");
-      icon.textContent = state === "playing" ? "■" : state === "loading" ? "" : "▶";
+    const busy = state === "playing" || state === "loading";
+    if (this._playBtnEl) {
+      this._playBtnEl.disabled = busy;
+      this._playBtnEl.textContent = state === "loading" ? "加载中…" : "播放";
     }
+    if (this._stopBtnEl) this._stopBtnEl.disabled = state === "stopped";
   }
 
   /** Number of parts in the current score (for the mixer UI). */
   get partCount(): number {
     return this.painter.score.parts.length;
+  }
+  getPartLabel(i: number): string {
+    const part = this.painter.score.parts[i];
+    if (part?.instrumentName) {
+      const voices = this.painter.score.parts.filter((item) => item.instrumentName === part.instrumentName).length;
+      return voices > 1 ? `${part.instrumentName} · 声部 ${part.voiceIndex}` : part.instrumentName;
+    }
+    const hand = part?.hand;
+    if (hand === "right") return "右手";
+    if (hand === "left") return "左手";
+    return `声部 ${i + 1}`;
   }
   getPartVolume(i: number): number {
     const v = this.partVolumes[i];
@@ -436,27 +1527,93 @@ export class App {
     this.partVolumes[i] = Math.max(0, Math.min(1, v));
   }
 
-  async playScore(): Promise<void> {
-    if (this.mode !== "jp") return; // playback is jianpu-mode only
-    const start =
-      this._selectedChord !== null
-        ? { chord: this._selectedChord, pass: this._selectedVerse }
-        : undefined;
-    try {
-      await this.player().play(this.painter.score, { partVolumes: this.partVolumes }, start);
-    } catch (e) {
-      console.error("playback failed", e);
-      this._player?.stop();
-      this.setStatus("试听加载失败：" + (e instanceof Error ? e.message : String(e)));
+  /** Rescan SF2 files. Called only during startup and by the manual refresh button. */
+  async refreshSoundfonts(): Promise<void> {
+    this.soundfontCatalog = await readSoundfontCatalog();
+    const playable = this.soundfontCatalog.filter((entry) => entry.instruments.length > 0);
+    if (!playable.some((entry) => entry.id === this.selectedSoundfontId)) {
+      this.selectedSoundfontId = playable[0]?.id ?? "";
     }
+    if (playable.length === 0) this.playbackSoundSource = "default";
+    this.saveSettings();
   }
 
-  async togglePlayback(): Promise<void> {
-    if (this._player?.state === "playing" || this._player?.state === "loading") {
-      this.stopPlayback();
-      return;
+  async openSoundfontFolder(): Promise<void> {
+    await openSoundfontDirectory();
+  }
+
+  getPlaybackInstrumentGroups(): PlaybackInstrumentGroup[] {
+    const score = this.painter.score;
+    if (score.parts.length === 0) return [];
+    if (!score.ensemble) {
+      const label =
+        score.instrumentName.trim() ||
+        score.parts[0]?.instrumentName.trim() ||
+        (score.piano ? "钢琴" : "默认乐器");
+      return [{
+        key: `score:${label}`,
+        label,
+        parts: score.parts.map((_, index) => index),
+      }];
     }
-    await this.playScore();
+
+    const groups = new Map<string, PlaybackInstrumentGroup>();
+    score.parts.forEach((part, index) => {
+      const label = part.instrumentName.trim() || `乐器 ${index + 1}`;
+      const key = `ensemble:${label}`;
+      const current = groups.get(key);
+      if (current) current.parts.push(index);
+      else groups.set(key, { key, label, parts: [index] });
+    });
+    return [...groups.values()];
+  }
+
+  getSoundfontInstrument(groupKey: string, soundfontId = this.selectedSoundfontId): string {
+    const entry = this.soundfontCatalog.find((item) => item.id === soundfontId);
+    const saved = this.soundfontInstrumentByGroup[groupKey];
+    return saved && entry?.instruments.includes(saved) ? saved : (entry?.instruments[0] ?? "");
+  }
+
+  setPlaybackSoundSettings(
+    source: PlaybackSoundSource,
+    soundfontId: string,
+    instrumentByGroup: Record<string, string>,
+  ): void {
+    const selected = this.soundfontCatalog.find((entry) =>
+      entry.id === soundfontId && entry.instruments.length > 0);
+    this.playbackSoundSource = source === "sf2" && selected ? "sf2" : "default";
+    this.selectedSoundfontId = selected?.id ?? this.selectedSoundfontId;
+    this.soundfontInstrumentByGroup = { ...instrumentByGroup };
+    this.saveSettings();
+    this.stopPlayback();
+  }
+
+  private sf2PlaybackOptions(): Sf2PlaybackOptions | undefined {
+    if (this.playbackSoundSource !== "sf2") return undefined;
+    const soundfont = this.soundfontCatalog.find((entry) =>
+      entry.id === this.selectedSoundfontId && entry.instruments.length > 0);
+    if (!soundfont) return undefined;
+    const first = soundfont.instruments[0];
+    const instrumentByPart = this.painter.score.parts.map(() => first);
+    for (const group of this.getPlaybackInstrumentGroups()) {
+      const instrument = this.getSoundfontInstrument(group.key, soundfont.id);
+      for (const part of group.parts) instrumentByPart[part] = instrument || first;
+    }
+    return { bytes: soundfont.bytes, instrumentByPart };
+  }
+
+  async playScore(): Promise<void> {
+    if (this.mode !== "jp") return; // playback is jianpu-mode only
+    const selected = this._selectedNotes[this._selectedNotes.length - 1];
+    const start = selected
+      ? { chord: selected.source.chord, pass: selected.verse }
+      : undefined;
+    await this.player().play(
+      this.painter.score,
+      { partVolumes: this.partVolumes },
+      start,
+      this.sf2PlaybackOptions(),
+    );
   }
 
   stopPlayback(): void {
@@ -471,10 +1628,130 @@ export class App {
   }
 
   // ---------------- file I/O ----------------
-  /** Decode bytes by extension: .xml/.musicxml -> import to .jpwabc; else UTF-16 .jpwabc. */
-  importBytes(bytes: Uint8Array, name: string): void {
+  /** Decode/import supported score formats. MIDI pauses for an analyze/quantize dialog. */
+  async importBytes(bytes: Uint8Array, name: string): Promise<void> {
     // 任何新导入都使上一次的识别叠加产物失效（识别结果由 recognizeBytes 在本调用之后重设）。
     this._clearRecognition();
+    if (/\.(mid|midi)$/i.test(name)) {
+      try {
+        const parsed = parseMidi(bytes);
+        if (!parsed.title) parsed.title = importedFileStem(name);
+        const analysis = analyzeMidi(parsed);
+        const options = await showMidiImportDialog(parsed, analysis, name);
+        if (!options) {
+          this.setStatus("已取消 MIDI 导入");
+          return;
+        }
+        const { score, summary } = midiToScore(parsed, options);
+        this.mixedXmlText = null;
+        this._mixedPainter = null;
+        if (this._mixedBtnEl) this._mixedBtnEl.disabled = true;
+        if (this.mode === "mixed") {
+          this.mode = "jp";
+          this._setMixedLayout(false);
+          if (this._mixedBtnEl) this._mixedBtnEl.textContent = "混排";
+        }
+        this.filePath = null;
+        const outputFormat = options.outputFormat ?? "jpw";
+        if (outputFormat === "jpw") {
+          const { text, meta } = scoreToJpwabcWithMeta(score);
+          this._lastImportMeta = meta;
+          this._applyImportedJp(text);
+          this._disablePhrase();
+        } else {
+          const slashBraceMode = options.slashBraceMode ?? (analysis.arpeggioGroupCount > 0 ? "arpeggio" : "grace");
+          const slashBracketMode = options.slashBracketMode ?? "triplet";
+          const slashVoiceCount = Math.max(
+            1,
+            Math.min(MAX_SLASH_VOICES, score.parts.length),
+          );
+          const slashText = scoreToSlashScore(score, outputFormat, options.quantize, ".", {
+            sourceMidi: parsed,
+            braceMode: slashBraceMode,
+            bracketMode: slashBracketMode,
+          }, slashVoiceCount);
+          const slashAnalysis = analyzeSlashScore(slashText);
+          const slashOptions = defaultSlashScoreOptions(outputFormat, slashAnalysis);
+          slashOptions.voiceCount = slashVoiceCount;
+          slashOptions.instrumentName = score.instrumentName.trim()
+            || score.parts[0]?.instrumentName.trim()
+            || "钢琴";
+          slashOptions.title = score.title;
+          slashOptions.subtitle = score.subtitle;
+          slashOptions.composer = score.composer;
+          slashOptions.arranger = score.arranger;
+          slashOptions.lyricist = score.lyricist;
+          slashOptions.tempoBpm = score.tempoBpm;
+          slashOptions.tempoBeatUnit = score.tempoBeatUnit;
+          slashOptions.fifths = options.fifths;
+          slashOptions.beats = options.beats;
+          slashOptions.beatType = options.beatType;
+          slashOptions.braceMode = slashBraceMode;
+          slashOptions.bracketMode = slashBracketMode;
+          slashOptions.tempoMarks = score.tempoMarks.map((mark) => ({
+            measure: mark.measure,
+            offset: mark.offset.toFloat(),
+            kind: mark.kind,
+            bpm: mark.bpm,
+          }));
+          this._applyImportedSlash(slashText, slashOptions);
+        }
+        const details = [
+          summary.layoutMode === "ensemble"
+            ? `总谱 ${summary.instrumentCount} 种乐器 / ${summary.partCount} 个声部`
+            : summary.handCount === 2 ? "双手" : "单手",
+          `${summary.quantize}分量化`,
+          `三连音${summary.tripletGroups}组`,
+          `倚音${summary.graceGroups}组`,
+          `琶音${summary.arpeggioGroups}组`,
+          `疑似倚音${summary.suspectedGraceCount}个`,
+          `化简重叠${summary.simplifiedOverlaps}处`,
+          `忽略事件${summary.ignoredEvents}个`,
+          outputFormat === "jpw"
+            ? "JPW 简谱"
+            : `${score.parts.length > 1 ? `${Math.min(MAX_SLASH_VOICES, score.parts.length)}声部完整排版` : "单谱表"}${outputFormat === "keyboard" ? "键盘谱" : "数字谱"}`,
+        ];
+        if (summary.warnings.length) details.push(summary.warnings.join("；"));
+        this.setStatus(`MIDI 导入完成：${details.join("，")}`);
+      } catch (e) {
+        console.error("MIDI 导入失败", e);
+        this.setStatus("MIDI 导入失败：" + (e instanceof Error ? e.message : String(e)));
+      }
+      return;
+    }
+    if (/\.(txt|keyscore|numscore|kps|nps)$/i.test(name)) {
+      const source = decodeJpwabc(bytes);
+      try {
+        const analysis = analyzeSlashScore(source);
+        if (analysis.measureCount === 0) throw new Error("没有找到可导入的小节；有效谱行需要包含至少两个 /");
+        const hintedKind: SlashScoreKind | undefined = /\.(keyscore|kps)$/i.test(name)
+          ? "keyboard"
+          : /\.(numscore|nps)$/i.test(name) ? "number" : undefined;
+        const options = await showSlashScoreImportDialog(source, analysis, name, hintedKind ? { kind: hintedKind } : undefined);
+        if (!options) {
+          this.setStatus("已取消斜杠谱导入");
+          return;
+        }
+        this._prepareEditableJpMode();
+        this._applyImportedSlash(source, options);
+        const summary = parseSlashScore(source, options).summary;
+        const details = [
+          summary.kind === "keyboard" ? "键盘谱" : "数字谱",
+          `${summary.measures}小节`,
+          options.voiceCount === 1
+            ? "单谱表"
+            : `${options.voiceCount}声部（${options.instrumentName?.trim() || "钢琴"}）`,
+          `保留注释${summary.comments}行`,
+          `忽略标签${summary.ignoredTags}个`,
+        ];
+        if (summary.warnings.length) details.push(summary.warnings.join("；"));
+        this.setStatus(`斜杠谱导入完成：${details.join("，")}`);
+      } catch (e) {
+        console.error("斜杠谱导入失败", e);
+        this.setStatus("斜杠谱导入失败：" + (e instanceof Error ? e.message : String(e)));
+      }
+      return;
+    }
     // ABC 记谱：先用移植版 abc2xml 转成 MusicXML，再复用现有 MusicXML 导入路径。
     if (/\.abc$/i.test(name)) {
       const abcText = new TextDecoder(
@@ -495,16 +1772,17 @@ export class App {
         bytes[0] === 0xff || bytes[0] === 0xfe ? "utf-16" : "utf-8",
       ).decode(bytes);
       this.mixedXmlText = xml;
-      this._mixedPainter = null; // reset so next showStaffPreview re-loads
-      this._setMixedAvailable(true);
+      this._mixedPainter = null; // reset so next toggleMixed re-loads
+      if (this._mixedBtnEl) this._mixedBtnEl.disabled = false;
 
-      // 多声部（SATB 等）歌谱默认进入混排模式
-      const autoMixed = this.mode !== "mixed" && isMultiPartXml(xml);
+      // 多声部（SATB 等）默认进入混排；钢琴双谱表则保留在可编辑的
+      // 双行简谱模式，由 loadMusicXml 拆成 RH/LH 两个 Part。
+      const autoMixed = this.mode !== "mixed" && !isPianoMusicXml(xml) && isMultiPartXml(xml);
       if (this.mode === "mixed" || autoMixed) {
         if (autoMixed) {
           this.mode = "mixed";
           this._setMixedLayout(true);
-          this._setPreviewModeActive("mixed");
+          if (this._mixedBtnEl) this._mixedBtnEl.textContent = "简谱";
         }
         // 仍填充编辑器的简谱转换文本，便于切回「简谱」（best-effort）
         try {
@@ -519,7 +1797,6 @@ export class App {
       }
 
       const score = loadMusicXml(xml);
-      this._setPreviewModeActive("jp");
       this.filePath = null; // imported; save as new .jpwabc
       const { text, meta } = scoreToJpwabcWithMeta(score);
       this._lastImportMeta = meta; // 供 recognizeBytes（OMR）接管为 _recogMeta
@@ -527,139 +1804,101 @@ export class App {
     } else {
       this.mixedXmlText = null;
       this._mixedPainter = null;
-      this._setMixedAvailable(false);
+      if (this._mixedBtnEl) this._mixedBtnEl.disabled = true;
       this._disablePhrase();
       if (this.mode === "mixed") {
         this.mode = "jp";
         this._setMixedLayout(false);
-        this._setPreviewModeActive("jp");
+        if (this._mixedBtnEl) this._mixedBtnEl.textContent = "混排";
       }
+      this.documentFormat = "jpw";
+      this.slashOptions = null;
       this.setText(decodeJpwabc(bytes));
     }
   }
 
   /** 导入 MusicXML/OMR 得到的默认（原始排版）文本：缓存以便乐句排版无损切回，并启用切换按钮。 */
   private _applyImportedJp(text: string): void {
+    this.documentFormat = "jpw";
+    this.slashOptions = null;
     this._origLayoutText = text;
     this._phraseOn = false;
-    this._setPhraseActive(false);
-    this._setPhraseAvailable(true);
+    if (this._phraseBtnEl) { this._phraseBtnEl.disabled = false; this._phraseBtnEl.textContent = "乐句排版"; }
     this.setText(text);
+  }
+
+  private _applyImportedSlash(text: string, options: SlashScoreOptions): void {
+    this.documentFormat = options.kind;
+    this.slashOptions = { ...options, symbolDurations: { ...options.symbolDurations } };
+    this._disablePhrase();
+    this._origLayoutText = null;
+    this._lastImportMeta = null;
+    this.setText(embedSlashScoreOptions(text, options));
+  }
+
+  private _prepareEditableJpMode(): void {
+    this.mixedXmlText = null;
+    this._mixedPainter = null;
+    if (this._mixedBtnEl) this._mixedBtnEl.disabled = true;
+    if (this.mode === "mixed") {
+      this.mode = "jp";
+      this._setMixedLayout(false);
+      if (this._mixedBtnEl) this._mixedBtnEl.textContent = "混排";
+    } else if (this.mode === "recognize") {
+      this.mode = "jp";
+      this._setRecognizeLayout(false);
+      if (this._recognizeBtnEl) this._recognizeBtnEl.textContent = "识别";
+    }
   }
 
   private _disablePhrase(): void {
     this._origLayoutText = null;
     this._phraseOn = false;
-    this._setPhraseActive(false);
-    this._setPhraseAvailable(false);
+    if (this._phraseBtnEl) { this._phraseBtnEl.disabled = true; this._phraseBtnEl.textContent = "乐句排版"; }
   }
 
-  private _setContextControl(el: HTMLElement | null, visible: boolean): void {
-    if (!el) return;
-    el.hidden = !visible;
-    if (el instanceof HTMLButtonElement) el.disabled = !visible;
-    this._syncContextGroup(el);
+  /** Register the #btn-phrase element so App can enable/disable it. */
+  setPhraseBtn(el: HTMLButtonElement): void {
+    this._phraseBtnEl = el;
   }
 
-  private _syncContextGroup(el: HTMLElement | null): void {
-    if (!el) return;
-    const group = el.closest<HTMLElement>(".context-tool-group");
-    if (group) group.hidden = !group.querySelector("[data-context-control]:not([hidden])");
-  }
-
-  setPhraseButtons(original: HTMLButtonElement, phrase: HTMLButtonElement): void {
-    this._originalLayoutBtnEl = original;
-    this._phraseBtnEl = phrase;
-    this._setPhraseActive(false);
-    this._setPhraseAvailable(false);
-  }
-
-  private _setPhraseAvailable(available: boolean): void {
-    const switchEl = this._phraseBtnEl?.closest<HTMLElement>(".layout-mode-switch");
-    if (!switchEl) return;
-    switchEl.hidden = !available;
-    if (this._originalLayoutBtnEl) this._originalLayoutBtnEl.disabled = !available;
-    if (this._phraseBtnEl) this._phraseBtnEl.disabled = !available;
-    this._syncContextGroup(switchEl);
-  }
-
-  private _setPhraseActive(phrase: boolean): void {
-    this._originalLayoutBtnEl?.classList.toggle("active", !phrase);
-    this._phraseBtnEl?.classList.toggle("active", phrase);
-    this._originalLayoutBtnEl?.setAttribute("aria-pressed", String(!phrase));
-    this._phraseBtnEl?.setAttribute("aria-pressed", String(phrase));
-  }
-
-  /** Switch between the imported line layout and phrase-aware relayout. */
-  setPhraseLayout(phrase: boolean): void {
+  /** 在「原始排版」与「乐句排版」间切换（保留原始排版文本，无损切回）。 */
+  togglePhrase(): void {
     if (!this.mixedXmlText || !this._origLayoutText) return;
-    if (this._phraseOn === phrase) return;
     // 乐句排版要看的是排版结果 → 先退出识别/混排叠加视图，回到简谱模式，否则 reload 直接返回不重排。
     if (this.mode === "recognize") {
       this.mode = "jp";
       this._setRecognizeLayout(false);
-      if (this._recognizeBtnEl) this._recognizeBtnEl.textContent = "原图对照";
+      if (this._recognizeBtnEl) this._recognizeBtnEl.textContent = "识别";
     } else if (this.mode === "mixed") {
       this.mode = "jp";
       this._setMixedLayout(false);
-      this._setPreviewModeActive("jp");
+      if (this._mixedBtnEl) this._mixedBtnEl.textContent = "混排";
     }
-    if (!phrase) {
+    if (this._phraseOn) {
       this._phraseOn = false;
-      this._setPhraseActive(false);
+      if (this._phraseBtnEl) this._phraseBtnEl.textContent = "乐句排版";
       this.setText(this._origLayoutText);
     } else {
       try {
         const score = loadMusicXml(this.mixedXmlText);
         this.setText(scoreToJpwabc(score, { phrase: true }));
         this._phraseOn = true;
-        this._setPhraseActive(true);
+        if (this._phraseBtnEl) this._phraseBtnEl.textContent = "原始排版";
       } catch (e) {
         console.error("phrase relayout failed", e);
       }
     }
   }
 
-  /** Register the right-preview segmented control. */
-  setPreviewModeButtons(jp: HTMLButtonElement, mixed: HTMLButtonElement): void {
-    this._jpPreviewBtnEl = jp;
-    this._mixedBtnEl = mixed;
-    this._setMixedAvailable(false);
-    this._setPreviewModeActive("jp");
-  }
-
-  setStaffJianpuToggle(el: HTMLInputElement): void {
-    this._staffJianpuToggleEl = el;
-    el.checked = this.mixedShowJianpuLayer;
-    const label = el.closest<HTMLElement>(".staff-layer-toggle");
-    if (label) label.hidden = this.mode !== "mixed";
-  }
-
-  private _setMixedAvailable(available: boolean): void {
-    const switchEl = this._mixedBtnEl?.closest<HTMLElement>(".preview-mode-switch");
-    if (switchEl) switchEl.hidden = !available;
-    if (this._mixedBtnEl) this._mixedBtnEl.disabled = !available;
-    if (!available) {
-      const label = this._staffJianpuToggleEl?.closest<HTMLElement>(".staff-layer-toggle");
-      if (label) label.hidden = true;
-    }
-    if (!available) this._setPreviewModeActive("jp");
-  }
-
-  private _setPreviewModeActive(mode: "jp" | "mixed"): void {
-    const mixed = mode === "mixed";
-    this._jpPreviewBtnEl?.classList.toggle("active", !mixed);
-    this._mixedBtnEl?.classList.toggle("active", mixed);
-    this._jpPreviewBtnEl?.setAttribute("aria-pressed", String(!mixed));
-    this._mixedBtnEl?.setAttribute("aria-pressed", String(mixed));
-    const label = this._staffJianpuToggleEl?.closest<HTMLElement>(".staff-layer-toggle");
-    if (label) label.hidden = !mixed;
+  /** Register the #btn-mixed element so App can enable/disable it. */
+  setMixedBtn(el: HTMLButtonElement): void {
+    this._mixedBtnEl = el;
   }
 
   /** Register the #btn-recognize element so App can enable/disable it. */
   setRecognizeBtn(el: HTMLButtonElement): void {
     this._recognizeBtnEl = el;
-    this._setContextControl(el, false);
   }
 
   /** Register the #sel-recog-view dropdown (识别视图切换)。 */
@@ -682,17 +1921,14 @@ export class App {
     if (this.mode === "recognize") {
       this.mode = "jp";
       this._setRecognizeLayout(false);
-      if (this._recognizeBtnEl) this._recognizeBtnEl.textContent = "原图对照";
+      if (this._recognizeBtnEl) this._recognizeBtnEl.textContent = "识别";
       this.reload(this.getText());
     } else {
       // 从混排切入识别：先退混排布局
-      if (this.mode === "mixed") {
-        this._setMixedLayout(false);
-        this._setPreviewModeActive("jp");
-      }
+      if (this.mode === "mixed") this._setMixedLayout(false);
       this.mode = "recognize";
       this._setRecognizeLayout(true);
-      if (this._recognizeBtnEl) this._recognizeBtnEl.textContent = "返回排版稿";
+      if (this._recognizeBtnEl) this._recognizeBtnEl.textContent = "排版";
       this._renderRecognizePages();
     }
   }
@@ -700,10 +1936,7 @@ export class App {
   /** 识别模式布局钩子：打 body.recognize 类 + 显示/隐藏视图下拉。 */
   private _setRecognizeLayout(on: boolean): void {
     document.getElementById("body")?.classList.toggle("recognize", on);
-    const field = this._recogViewSelectEl?.closest<HTMLElement>(".toolbar-select-field");
-    if (field) field.hidden = !on;
-    else if (this._recogViewSelectEl) this._recogViewSelectEl.hidden = !on;
-    this._syncContextGroup(this._recognizeBtnEl ?? field ?? this._recogViewSelectEl);
+    if (this._recogViewSelectEl) this._recogViewSelectEl.hidden = !on;
     if (!on) this._hideRecogPopup();
   }
 
@@ -711,7 +1944,7 @@ export class App {
   private _renderRecognizePages(): void {
     this.scorePane.replaceChildren();
     this.pageEls = [];
-    this.selectedEl = null;
+    this.deselect(false);
     this._recogPopupEl = null;
     if (!this._recogBin || !this._recogScore) return;
     const bin = this._recogBin;
@@ -869,34 +2102,30 @@ export class App {
     this._recogMeta = null;
     this._hideRecogPopup();
     if (this._recognizeBtnEl) {
-      this._recognizeBtnEl.textContent = "原图对照";
+      this._recognizeBtnEl.disabled = true;
+      this._recognizeBtnEl.textContent = "识别";
     }
-    this._setContextControl(this._recognizeBtnEl, false);
     if (this.mode === "recognize") {
       this.mode = "jp";
       this._setRecognizeLayout(false);
     }
   }
 
-  async showJpPreview(): Promise<void> {
-    if (this.mode === "jp") return;
-    this.stopPlayback();
-    if (this.mode === "recognize") this._setRecognizeLayout(false);
-    if (this.mode === "mixed") this._setMixedLayout(false);
-    this.mode = "jp";
-    this._setPreviewModeActive("jp");
-    this.reload(this.getText());
-  }
-
-  async showStaffPreview(): Promise<void> {
+  /** Toggle between JP mode and Mixed (五线谱+简谱) mode. */
+  async toggleMixed(): Promise<void> {
     if (!this.mixedXmlText) return;
-    if (this.mode === "mixed") return;
     this.stopPlayback();
-    if (this.mode === "recognize") this._setRecognizeLayout(false);
-    this.mode = "mixed";
-    this._setMixedLayout(true);
-    this._setPreviewModeActive("mixed");
-    await this._renderMixedPages();
+    if (this.mode === "jp") {
+      this.mode = "mixed";
+      this._setMixedLayout(true);
+      if (this._mixedBtnEl) this._mixedBtnEl.textContent = "简谱";
+      await this._renderMixedPages();
+    } else {
+      this.mode = "jp";
+      this._setMixedLayout(false);
+      if (this._mixedBtnEl) this._mixedBtnEl.textContent = "混排";
+      this.reload(this.getText());
+    }
   }
 
   /** 设置混排是否隐藏小节号，持久化；当前处于混排模式时立即重排。 */
@@ -907,29 +2136,17 @@ export class App {
     if (this.mode === "mixed") await this._renderMixedPages();
   }
 
-  async setStaffJianpuLayer(on: boolean): Promise<void> {
-    if (this.mixedShowJianpuLayer === on) return;
-    this.mixedShowJianpuLayer = on;
-    if (this._staffJianpuToggleEl) this._staffJianpuToggleEl.checked = on;
-    this._mixedPainter = null;
-    this.saveSettings();
-    if (this.mode === "mixed") await this._renderMixedPages();
-  }
-
-  /** Staff preview is rendered from MusicXML, so the visible JP source is read-only. */
+  /** Mixed mode: editor read-only + hide the code pane entirely. */
   private _setMixedLayout(on: boolean): void {
     this.view.dispatch({
       effects: this._readOnlyCompartment.reconfigure(EditorState.readOnly.of(on)),
     });
     document.getElementById("body")?.classList.toggle("mixed", on);
-    const meta = document.getElementById("code-pane-meta");
-    if (meta) meta.textContent = on ? "只读" : "JPWABC";
   }
 
   private async _renderMixedPages(): Promise<void> {
     if (!this._mixedPainter) {
       this._mixedPainter = new MixedPainter();
-      this._mixedPainter.showJianpuLayer = this.mixedShowJianpuLayer;
     }
     this._mixedPainter.hideBarNumber = this.mixedHideBarNumber;
     if (this.mixedXmlText) {
@@ -971,6 +2188,15 @@ export class App {
     }
   }
 
+  /** Start a new document/file session; the first Save still asks for a target. */
+  setImportedFileSource(path: string | null, handle: BrowserFileHandle | null = null): void {
+    this.filePath = null;
+    this._suggestedSavePath = path;
+    this._browserOpenHandle = handle;
+    this._browserSaveHandle = null;
+    this._hasSavedCurrent = false;
+  }
+
   /** 启动时尝试复读上次打开的文件（仅 Tauri）。返回 true 表示已加载，false 则保持示例文本。 */
   async tryRestoreLastFile(): Promise<boolean> {
     if (!isTauriRuntime()) return false;
@@ -984,8 +2210,8 @@ export class App {
     try {
       const { readFile } = await import("@tauri-apps/plugin-fs");
       const bytes = await readFile(path);
-      this.importBytes(bytes, path);
-      if (!/\.(xml|musicxml)$/i.test(path)) this.filePath = path;
+      await this.importBytes(bytes, path);
+      this.setImportedFileSource(path);
       return true;
     } catch {
       // 文件已被移动/删除/不可读 — 忘掉它，回退到示例
@@ -994,56 +2220,110 @@ export class App {
     }
   }
 
-  async openFile(): Promise<boolean> {
+  async openFile(): Promise<void> {
     if (isTauriRuntime()) {
       const { open } = await import("@tauri-apps/plugin-dialog");
       const { readFile } = await import("@tauri-apps/plugin-fs");
       const sel = await open({
         multiple: false,
-        filters: [{ name: "简谱 / MusicXML / ABC", extensions: ["jpwabc", "JPWABC", "xml", "musicxml", "abc"] }],
+        filters: [{ name: "简谱 / 斜杠谱 TXT / MIDI / MusicXML / ABC", extensions: ["jpwabc", "JPWABC", "txt", "keyscore", "numscore", "kps", "nps", "mid", "midi", "xml", "musicxml", "abc"] }],
       });
-      if (typeof sel !== "string") return false;
+      if (typeof sel !== "string") return;
       const bytes = await readFile(sel);
-      this.importBytes(bytes, sel);
-      if (!/\.(xml|musicxml|abc)$/i.test(sel)) this.filePath = sel;
-      this.rememberLastFile(sel);
-      return true;
-    }
-
-    return await new Promise<boolean>((resolve) => {
+      await this.importBytes(bytes, sel);
+      this.setImportedFileSource(sel);
+      if (!/\.(mid|midi)$/i.test(sel)) this.rememberLastFile(sel);
+    } else {
+      const picker = (window as unknown as {
+        showOpenFilePicker?: (options: unknown) => Promise<BrowserFileHandle[]>;
+      }).showOpenFilePicker;
+      if (picker) {
+        try {
+          const [handle] = await picker({
+            multiple: false,
+            types: [{
+              description: "简谱 / 斜杠谱 TXT / MIDI / MusicXML / ABC",
+              accept: {
+                "application/octet-stream": [".jpwabc", ".mid", ".midi"],
+                "text/plain": [".txt", ".keyscore", ".numscore", ".kps", ".nps", ".abc"],
+                "application/xml": [".xml", ".musicxml"],
+              },
+            }],
+          });
+          if (!handle) return;
+          const file = await handle.getFile();
+          const buf = new Uint8Array(await file.arrayBuffer());
+          await this.importBytes(buf, file.name);
+          this.setImportedFileSource(file.name, handle);
+          return;
+        } catch (reason) {
+          if (reason instanceof DOMException && reason.name === "AbortError") return;
+          console.warn("File System Access open failed; falling back to input", reason);
+        }
+      }
       const input = document.createElement("input");
-      let settled = false;
-      let changeStarted = false;
-      const finish = (opened: boolean) => {
-        if (settled) return;
-        settled = true;
-        resolve(opened);
-      };
       input.type = "file";
-      input.accept = ".jpwabc,.xml,.musicxml,.abc";
+      input.accept = ".jpwabc,.txt,.keyscore,.numscore,.kps,.nps,.mid,.midi,.xml,.musicxml,.abc";
       input.onchange = async () => {
-        changeStarted = true;
         const file = input.files?.[0];
-        if (!file) { finish(false); return; }
+        if (!file) return;
         const buf = new Uint8Array(await file.arrayBuffer());
-        this.importBytes(buf, file.name);
-        if (!/\.(xml|musicxml|abc)$/i.test(file.name)) this.filePath = file.name;
-        finish(true);
+        await this.importBytes(buf, file.name);
+        this.setImportedFileSource(file.name);
       };
-      window.addEventListener("focus", () => setTimeout(() => {
-        if (!changeStarted) finish(false);
-      }, 500), { once: true });
       input.click();
-    });
+    }
+  }
+
+  async createDocument(kind: "jpw" | SlashScoreKind): Promise<void> {
+    this.stopPlayback();
+    if (kind === "jpw") {
+      this._clearRecognition();
+      this._prepareEditableJpMode();
+      this.setImportedFileSource(null);
+      this.clearLastFile();
+      this.documentFormat = "jpw";
+      this.slashOptions = null;
+      this._disablePhrase();
+      this.setText([
+        ".Title",
+        "Title = {未命名}",
+        "SubTitle = {}",
+        "Composer = {}",
+        "Arranger = {}",
+        "Lyricist = {}",
+        "KeyAndMeters = {1=C,4/4}",
+        "Tempo = {90}",
+        ".Voice",
+        "0--- |]$(true,0,0,true)",
+        ".Words",
+        "",
+      ].join("\n"));
+      this.setStatus("已创建 JPW 简谱");
+      return;
+    }
+    const text = slashScoreTemplate(kind);
+    const analysis = analyzeSlashScore(text);
+    const options = await showSlashScoreImportDialog(text, analysis, `新建${kind === "keyboard" ? "键盘谱" : "数字谱"}.txt`, { kind });
+    if (!options) {
+      this.setStatus("已取消创建");
+      return;
+    }
+    this._clearRecognition();
+    this._prepareEditableJpMode();
+    this.setImportedFileSource(null);
+    this.clearLastFile();
+    this._applyImportedSlash(text, options);
+    this.setStatus(`已创建${kind === "keyboard" ? "键盘谱" : "数字谱"}：每行一小节，实时生成单谱表预览`);
   }
 
   // ---------------- OMR：从图片识别简谱 ----------------
   /** 已取得图片字节后的识别核心（供拖拽识别复用）。
-   *  musicpp 本地路额外保留二值图+识别结果，完成后默认进入叠加核对视图（先核对；「原图对照」可切回排版稿）。 */
-  async recognizeBytes(method: OmrMethod, picked: { bytes: Uint8Array; mime?: string; path?: string | null }): Promise<boolean> {
+   *  musicpp 本地路额外保留二值图+识别结果并自动进入识别模式叠加核对；gemini 路只导入排版。 */
+  async recognizeBytes(method: OmrMethod, picked: { bytes: Uint8Array; mime?: string; path?: string | null }): Promise<void> {
     if (method === "gemini" && !agyAvailable()) {
       this.setStatus("Gemini 识别需要桌面版（Antigravity CLI / agy），浏览器内不可用");
-      return false;
+      return;
     }
     const label = method === "gemini" ? "Gemini" : "musicpp";
     this.setStatus(`识别中（${label}）…可能需要几十秒`);
@@ -1051,76 +2331,212 @@ export class App {
       const t0 = performance.now();
       if (method === "musicpp") {
         const { musicxml, bin, score } = await recognizeMusicppDetailed(picked.bytes, picked.mime);
-        this.importBytes(new TextEncoder().encode(musicxml), "omr.musicxml"); // 先导入（会清旧识别）
+        await this.importBytes(new TextEncoder().encode(musicxml), "omr.musicxml"); // 先导入（会清旧识别）
         this._recogBin = bin; // 再设本次识别产物
         this._recogScore = score;
         this._recogMeta = this._lastImportMeta; // 接管导入时序列化产出的代码区间映射
-        if (this._recognizeBtnEl) this._recognizeBtnEl.textContent = "原图对照";
-        this._setContextControl(this._recognizeBtnEl, true);
-        if (this.mode !== "recognize") await this.toggleRecognize(); // 识别后默认进叠加核对（本仓库「先核对」取向）
+        if (this._recognizeBtnEl) this._recognizeBtnEl.disabled = false;
+        if (this.mode !== "recognize") await this.toggleRecognize(); // 自动进识别模式叠加
         this.setStatus(`识别完成（${label}，${((performance.now() - t0) / 1000).toFixed(1)}s）`);
       } else {
         const { musicxml, ms } = await recognizeImage(method, picked);
-        this.importBytes(new TextEncoder().encode(musicxml), "omr.musicxml");
+        await this.importBytes(new TextEncoder().encode(musicxml), "omr.musicxml");
         this.setStatus(`识别完成（${label}，${(ms / 1000).toFixed(1)}s）`);
       }
-      return true;
     } catch (e) {
       console.error("OMR failed", e);
       this.setStatus("识别失败：" + (e instanceof Error ? e.message : String(e)));
-      return false;
     }
   }
 
   async saveFile(): Promise<void> {
-    if (this.filePath && isTauriRuntime()) {
-      await this.writeTo(this.filePath);
-      return;
+    try {
+      if (this._hasSavedCurrent) {
+        if (isTauriRuntime() && this.filePath) {
+          await this.writeTo(this.filePath);
+          this.setStatus(`保存成功：${this.filePath}`);
+          return;
+        }
+        if (!isTauriRuntime() && this._browserSaveHandle) {
+          await this.writeBrowserHandle(this._browserSaveHandle);
+          this.setStatus(`保存成功：${this._browserSaveHandle.name}`);
+          return;
+        }
+      }
+      await this.chooseSaveDestination(true);
+    } catch (reason) {
+      console.error("save failed", reason);
+      this.setStatus("保存出错：" + (reason instanceof Error ? reason.message : String(reason)));
     }
-    await this.saveFileAs();
   }
 
   async saveFileAs(): Promise<void> {
-    const name = (this.painter.score.title.split("\n")[0] || "未命名") + ".jpwabc";
+    try {
+      await this.chooseSaveDestination(false);
+    } catch (reason) {
+      console.error("save as failed", reason);
+      this.setStatus("另存为出错：" + (reason instanceof Error ? reason.message : String(reason)));
+    }
+  }
+
+  private saveDocumentName(): string {
+    const extension = this.documentFormat === "jpw" ? ".jpwabc" : ".txt";
+    return (this.painter.score.title.split("\n")[0].trim() || "未命名") + extension;
+  }
+
+  private suggestedDesktopSavePath(name: string): string {
+    const source = this._suggestedSavePath;
+    if (!source) return name;
+    const slash = Math.max(source.lastIndexOf("/"), source.lastIndexOf("\\"));
+    return slash >= 0 ? source.slice(0, slash + 1) + name : name;
+  }
+
+  private documentBytes(): Uint8Array {
+    return this.documentFormat === "jpw"
+      ? encodeJpwabc(this.getText())
+      : new TextEncoder().encode(this.getText());
+  }
+
+  private async chooseSaveDestination(establishTarget: boolean): Promise<void> {
+    const name = this.saveDocumentName();
     if (isTauriRuntime()) {
       const { save } = await import("@tauri-apps/plugin-dialog");
-      const dest = await save({ defaultPath: name });
+      const dest = await save({
+        defaultPath: this.suggestedDesktopSavePath(name),
+        filters: [{
+          name: this.documentFormat === "jpw" ? "JPW 简谱" : "TXT 谱",
+          extensions: [this.documentFormat === "jpw" ? "jpwabc" : "txt"],
+        }],
+      });
       if (!dest) return;
       await this.writeTo(dest);
-      this.filePath = dest;
-      this.rememberLastFile(dest);
-    } else {
-      const blob = new Blob([encodeJpwabc(this.getText())], {
-        type: "application/octet-stream",
-      });
-      const a = document.createElement("a");
-      a.href = URL.createObjectURL(blob);
-      a.download = name;
-      a.click();
-      URL.revokeObjectURL(a.href);
+      if (establishTarget) {
+        this.filePath = dest;
+        this._hasSavedCurrent = true;
+        this.rememberLastFile(dest);
+      }
+      this.setStatus(`${establishTarget ? "保存" : "另存为"}成功：${dest}`);
+      return;
     }
+    const picker = (window as unknown as {
+      showSaveFilePicker?: (options: unknown) => Promise<BrowserFileHandle>;
+    }).showSaveFilePicker;
+    if (picker) {
+      let handle: BrowserFileHandle;
+      const pickerOptions = {
+        suggestedName: name,
+        startIn: this._browserOpenHandle ?? undefined,
+        types: [{
+          description: this.documentFormat === "jpw" ? "JPW 简谱" : "TXT 谱",
+          accept: this.documentFormat === "jpw"
+            ? { "application/octet-stream": [".jpwabc"] }
+            : { "text/plain": [".txt"] },
+        }],
+      };
+      try {
+        handle = await picker(pickerOptions);
+      } catch (reason) {
+        if (reason instanceof DOMException && reason.name === "AbortError") return;
+        // Some File System Access implementations accept a directory handle for
+        // startIn but reject a file handle. Preserve the imported-folder hint where
+        // supported, then retry once without it for compatibility.
+        if (!this._browserOpenHandle) throw reason;
+        try {
+          const { startIn: _startIn, ...fallbackOptions } = pickerOptions;
+          void _startIn;
+          handle = await picker(fallbackOptions);
+        } catch (fallbackReason) {
+          if (fallbackReason instanceof DOMException && fallbackReason.name === "AbortError") return;
+          throw fallbackReason;
+        }
+      }
+      await this.writeBrowserHandle(handle);
+      if (establishTarget) {
+        this._browserSaveHandle = handle;
+        this._hasSavedCurrent = true;
+      }
+      this.setStatus(`${establishTarget ? "保存" : "另存为"}成功：${handle.name}`);
+      return;
+    }
+    const data = this.documentBytes();
+    const blob = new Blob([data], {
+      type: this.documentFormat === "jpw" ? "application/octet-stream" : "text/plain;charset=utf-8",
+    });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = name;
+    a.click();
+    URL.revokeObjectURL(a.href);
+    this.setStatus(`${establishTarget ? "保存" : "另存为"}已下载；当前浏览器不支持固定文件句柄，下次保存仍会询问位置`);
   }
 
   private async writeTo(path: string): Promise<void> {
     const { writeFile } = await import("@tauri-apps/plugin-fs");
-    await writeFile(path, encodeJpwabc(this.getText()));
+    await writeFile(path, this.documentBytes());
+  }
+
+  private async writeBrowserHandle(handle: BrowserFileHandle): Promise<void> {
+    const writable = await handle.createWritable();
+    await writable.write(this.documentBytes());
+    await writable.close();
   }
 
   /** Load dropped file content (already decoded). */
   loadText(text: string, path: string | null): void {
-    this.filePath = path;
+    this.setImportedFileSource(path);
+    if (!path || !/\.(txt|keyscore|numscore|kps|nps)$/i.test(path)) {
+      this.documentFormat = "jpw";
+      this.slashOptions = null;
+    }
     this.setText(text);
   }
 
   /** Set LinesPerPage in the document's .Layout section (empty string clears it). */
   setLinesPerPage(value: string): void {
+    if (this.documentFormat !== "jpw") return;
     this.setText(upsertLayoutLines(this.getText(), value));
   }
 
   /** Current LinesPerPage value from the document, if any. */
   getLinesPerPage(): string {
+    if (this.documentFormat !== "jpw") return "";
     const f = JpwFile.fromString(this.getText());
     return f?.getSection(LayoutSection)?.linesPerPage?.trim() ?? "";
+  }
+
+  /** Set the first piano system's editable instrument label. */
+  setInstrumentName(value: string): void {
+    if (this.documentFormat !== "jpw") return;
+    this.setText(upsertTitleField(this.getText(), "Instrument", value.trim()));
+  }
+
+  getInstrumentName(): string {
+    return this.painter.score.instrumentName.trim() || (this.painter.score.piano ? "钢琴" : "");
+  }
+}
+
+function upsertTitleField(doc: string, field: string, value: string): string {
+  const lines = doc.split("\n");
+  const titleAt = lines.findIndex((line) => line.trim().toLowerCase() === ".title");
+  const escaped = value.replace(/\r?\n/g, "\\n");
+  const nextLine = `${field} = {${escaped}}`;
+  if (titleAt < 0) return `.Title\n${nextLine}\n${doc}`;
+  let end = titleAt + 1;
+  while (end < lines.length && !lines[end].trimStart().startsWith(".")) end++;
+  const key = field.toLowerCase();
+  const existing = lines.findIndex((line, index) => index > titleAt && index < end && line.split("=", 1)[0].trim().toLowerCase() === key);
+  if (existing >= 0) lines[existing] = nextLine;
+  else lines.splice(end, 0, nextLine);
+  return lines.join("\n");
+}
+
+function importedFileStem(path: string): string {
+  const leaf = path.replace(/\\/g, "/").split("/").pop() ?? path;
+  const stem = leaf.replace(/\.(?:mid|midi)$/i, "");
+  try {
+    return decodeURIComponent(stem);
+  } catch {
+    return stem;
   }
 }
 

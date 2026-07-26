@@ -62,10 +62,13 @@ export class TokenData {
         for (let i = first; i < end; i++) arr.push(lines[i]);
         lid = end;
 
-        switch (trim.substring(1)) {
-          case "voice":
-            parseVoiceTokens(res, arr.join("\n") + "\n");
-            break;
+        const section = trim.substring(1);
+        if (section === "voice" || section === "voice.rh" || section === "voice.lh" ||
+            section === "voice.right" || section === "voice.left" || /^voice\..+\.v\d+$/.test(section)) {
+          parseVoiceTokens(res, arr.join("\n") + "\n");
+          continue;
+        }
+        switch (section) {
           case "words":
             parseWordsTokens(res, arr.join("\n") + "\n");
             break;

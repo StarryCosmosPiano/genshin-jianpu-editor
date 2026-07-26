@@ -18,6 +18,17 @@ measure-all.csv
 # OMR 测试数据（本地保留，不入库）
 testdata
 
+# 本地回归截图与临时构建文件
+artifacts
+tmp
+PACKAGE-NOTES.txt
+
+# 用户自行准备的曲目与 SF2 音源不随源码分发；仅保留指定的 Avid MIDI 示例
+examples/*.mid
+!examples/Avid - 86 -不存在的战区.mid
+examples/所念皆星河*
+src/assets/soundfonts/*.sf2
+
 # pdf.js 位图解码器 wasm：来自 pdfjs-dist 包，构建时从 node_modules 拷入（见 vite.config.ts），不入库
 public/redist/pdfjs
 

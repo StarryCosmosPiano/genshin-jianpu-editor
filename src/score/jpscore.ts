@@ -4,8 +4,10 @@ import {
   BarlineEntry,
   BarStyle,
   Chord,
+  formatTempoBpm,
   LineBreak,
   Measure,
+  normalizeOpeningPickup,
   Part,
   Score,
 } from "./score";
@@ -13,6 +15,13 @@ import { computePhraseBreaks, type PhraseBreaks } from "./phrase";
 
 function escape(s: string): string {
   return s.replace(/\n/g, "\\n");
+}
+
+function ensembleVoiceSection(part: Part, partIndex: number): string {
+  const instrument = (part.instrumentName.trim() || `乐器 ${partIndex + 1}`)
+    .replace(/[\r\n]+/g, " ")
+    .replace(/^\.+/, "") || `乐器 ${partIndex + 1}`;
+  return `.Voice.${instrument}.V${Math.max(1, Math.round(part.voiceIndex))}`;
 }
 
 /** 编辑器文本里的一段字符区间（点选定位用）。 */
@@ -166,10 +175,18 @@ class JpScore {
   constructor(private phrase = false) {}
 
   fromMusicXml(scr: Score): void {
+    normalizeOpeningPickup(scr);
     this.lines.push("// ************** JPW-ABC File Ver 1.0 (for JP-Word v5.50m) **************");
     this.makeMetaData(scr);
     this._breaks = this.phrase ? computePhraseBreaks(scr.parts[0]) : null;
-    this.makeVoiceData(scr.parts[0]);
+    if (scr.ensemble && scr.parts.length > 0) {
+      scr.parts.forEach((part, index) => this.makeVoiceData(part, ensembleVoiceSection(part, index)));
+    } else if (scr.piano && scr.parts.length >= 2) {
+      this.makeVoiceData(scr.parts[0], ".Voice.RH");
+      this.makeVoiceData(scr.parts[1], ".Voice.LH");
+    } else {
+      this.makeVoiceData(scr.parts[0], ".Voice");
+    }
     this.makeWordData(scr.parts[0]);
     this.makeRepeatData(scr);
   }
@@ -215,10 +232,38 @@ class JpScore {
     const titleVal = escape(scr.title);
     this.titleRec = { line: this.lines.length, colStart: titlePrefix.length, colEnd: titlePrefix.length + titleVal.length };
     this.lines.push(titlePrefix + titleVal);
+    this.lines.push(`SubTitle = {${escape(scr.subtitle)}}`);
+    this.lines.push(`Composer = {${escape(scr.composer)}}`);
+    this.lines.push(`Arranger = {${escape(scr.arranger)}}`);
+    this.lines.push(`Lyricist = {${escape(scr.lyricist)}}`);
+    this.lines.push(`Instrument = {${escape(scr.instrumentName)}}`);
     const firstMea = scr.parts[0].measures[0];
     const tm = firstMea.time;
     const key = firstMea.key.name;
     this.lines.push(`KeyAndMeters = {1=${key},${tm.beats}/${tm.beatType}}`);
+    this.lines.push(`Tempo = {${formatTempoBpm(scr.tempoBpm)}}`);
+    if (scr.tempoBeatUnit !== "quarter") {
+      this.lines.push(`TempoUnit = {${scr.tempoBeatUnit}}`);
+    }
+    if (scr.tempoMarks.length > 0) {
+      const marks = scr.tempoMarks.map((mark) => {
+        const value = mark.kind === "tempo" && mark.bpm !== null
+          ? `${mark.kind}:${Math.max(1, Math.round(mark.bpm))}`
+          : mark.kind;
+        return `${mark.measure + 1}@${mark.offset.toString()}=${value}`;
+      });
+      this.lines.push(`TempoMarks = {${marks.join(";")}}`);
+    }
+    const arpeggios: string[] = [];
+    scr.parts.forEach((part, partIndex) => {
+      for (const measure of part.measures) {
+        for (const entry of measure.entries) {
+          if (!(entry instanceof Chord) || !entry.arpeggio) continue;
+          arpeggios.push(`${partIndex + 1}:${measure.index + 1}@${entry.position.toString()}`);
+        }
+      }
+    });
+    if (arpeggios.length > 0) this.lines.push(`Arpeggios = {${arpeggios.join(";")}}`);
     const authors: string[] = [];
     for (const it of scr.credit) {
       if (it.type === "title") continue;
@@ -251,8 +296,7 @@ class JpScore {
     return ch.fermata ? "{YanYin}" : "";
   }
 
-  private chordVoice(ch: Chord): string {
-    const nt = ch.notes[0];
+  private pitchVoice(nt: Chord["notes"][number]): string {
     let str = "";
     switch (nt.jpAlter) {
       case "n": str += "#b"; break;
@@ -261,9 +305,18 @@ class JpScore {
       default: throw new Error("bad jpAlter");
     }
     str += nt.number;
-    if (!ch.rest) {
+    if (!nt.rest) {
       for (let i = 0; i < nt.jpOctave; i++) str += "'";
       for (let i = 0; i < -nt.jpOctave; i++) str += ",";
+    }
+    return str;
+  }
+
+  private chordVoice(ch: Chord): string {
+    const pitches = ch.notes.map((nt) => this.pitchVoice(nt));
+    let str = pitches.length > 1 ? `[${pitches.join("")}]` : pitches[0];
+    if (ch.graceNotes.length > 0) {
+      str = `{${ch.graceNotes.map((note) => this.pitchVoice(note)).join("")}}${str}`;
     }
     if (ch.dot === 1 && ch.beats <= 1) str += ".";
     for (let i = 0; i < ch.beams; i++) str += "_";
@@ -304,8 +357,8 @@ class JpScore {
     }
   }
 
-  private makeVoiceData(part: Part): void {
-    this.lines.push(".Voice");
+  private makeVoiceData(part: Part, sectionName: string): void {
+    this.lines.push(sectionName);
     const voiceStart = this.lines.length;
     // 乐句排版：忽略源自带换行，按乐句分析结果断行；否则保留原始 newSystem。
     const breaks = this._breaks;
@@ -323,6 +376,7 @@ class JpScore {
       const doBreak = mid > 0 && (breaks ? breaks.measureBreaks.has(mid) : m.newSystem);
       // l 为空说明上一乐句刚在小节内(midBreak)断过，别再补一次空行。
       if (doBreak && l.length > 0) pushBreak(m.newPage);
+      if (mid > 0 && m.timeChange) l += `${m.time.beats}/${m.time.beatType} `;
       if (m.repeatForward) {
         l += "|:";
         if (m.endingLeft) {

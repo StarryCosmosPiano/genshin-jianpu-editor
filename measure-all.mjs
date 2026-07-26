@@ -258,9 +258,7 @@ for (const song of songs) {
   const ly = lyricsAcc(gt, rj);
   const lyNp = lyricsAcc(gt, rj, true);
   const al = alignAcc(gt, rj);
-  // 标题比对忽略开头的诗歌序号（如 "127哦…" / "557.…"）——识别读出编号是对的，不该扣分
-  const stripNum = (s) => s.replace(/^\s*\d+[.．、,，\s]*/, "");
-  const ti = charAcc(stripNum(titleOf(gt)), stripNum(titleOf(rj)));
+  const ti = charAcc(titleOf(gt), titleOf(rj));
   const cr = charAcc(creditsOf(gt), creditsOf(rj));
   sum.a += a; sum.o += o; sum.d += d; sum.dc += dc; sum.s += s; sum.ly += ly.acc; sum.lyNp += lyNp.acc; sum.al += al.acc; sum.ti += ti; sum.cr += cr;
   rows.push({ name: song.name, a, o, d, dc, gdot: dotCount(g), rdot: dotCount(r), s, sg: slurGroups(gB), sr: slurGroups(rB),

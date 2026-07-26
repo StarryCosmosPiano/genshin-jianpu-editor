@@ -1,18 +1,21 @@
 {
-  "name": "jpeditor",
+  "name": "genshin-jianpu-editor",
   "private": true,
-  "version": "0.5.4",
+  "version": "0.1.0",
   "type": "module",
-  "description": "简谱（JP-Word/.jpwabc）在线排版与编辑器，支持简谱·五线谱混排、MusicXML 导入与导出 PDF/PNG/MIDI/PPTX · An open-source jianpu (numbered musical notation) editor & typesetter.",
-  "homepage": "https://lodebar2026.github.io/jpeditor/",
+  "description": "面向原神琴谱制作的开源简谱编辑器、MIDI 转谱与 SVG 排版工具 · An open-source jianpu editor and MIDI converter for Genshin musicians.",
+  "homepage": "https://starrycosmospiano.github.io/genshin-jianpu-editor/",
   "repository": {
     "type": "git",
-    "url": "https://github.com/lodebar2026/jpeditor.git"
+    "url": "https://github.com/StarryCosmosPiano/genshin-jianpu-editor.git"
   },
-  "author": "lodebar2026",
+  "author": "StarryCosmosPiano",
   "license": "MIT",
   "keywords": [
     "jianpu",
+    "genshin",
+    "genshin-music",
+    "midi-to-jianpu",
     "numbered-notation",
     "music-notation",
     "sheet-music",
@@ -23,7 +26,15 @@
   ],
   "scripts": {
     "dev": "vite",
+    "web": "vite --host 127.0.0.1 --open",
     "build": "tsc && vite build",
+    "check:horizontal": "esbuild horizontal-check.ts --bundle --platform=node --format=esm --outfile=dist/horizontal-check.mjs && node dist/horizontal-check.mjs",
+    "check:piano": "esbuild piano-check.ts --bundle --platform=node --format=esm --outfile=dist/piano-check.mjs && node dist/piano-check.mjs",
+    "check:midi": "esbuild midi-check.ts --bundle --platform=node --format=esm --outfile=dist/midi-check.mjs && node dist/midi-check.mjs",
+    "check:selection": "npm run build && node selection-shot.mjs",
+    "check:voice": "npm run build && node voice-selection-shot.mjs",
+    "check:slashscore": "esbuild slashscore-check.ts --bundle --platform=node --format=esm --outfile=dist/slashscore-check.mjs && node dist/slashscore-check.mjs",
+    "check:midi:e2e": "npm run build && npm run check:midi && node midi-shot.mjs",
     "preview": "vite preview",
     "tauri": "tauri",
     "release": "bash scripts/release.sh"
@@ -39,16 +50,17 @@
     "antlr4": "^4.13.2",
     "codemirror": "^6.0.2",
     "fflate": "^0.8.3",
-    "jspdf": "^4.2.1",
     "onnxruntime-web": "^1.27.0",
     "opentype.js": "^2.0.0",
     "pdfjs-dist": "^6.1.200",
+    "soundfont2": "^0.5.0",
     "smplr": "^1.0.0",
     "tesseract.js": "^7.0.0"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2",
     "@types/opentype.js": "^1.3.10",
+    "@xmldom/xmldom": "^0.9.10",
     "playwright": "^1.60.0",
     "typescript": "~5.6.2",
     "vite": "^6.0.3"

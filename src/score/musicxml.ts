@@ -12,6 +12,7 @@ import {
   Lyric,
   Measure,
   Note,
+  normalizeOpeningPickup,
   ParserTemp,
   Part,
   PlayData,
@@ -144,9 +145,28 @@ function parseDuration(ch: Chord, noteEl: Element): void {
 }
 
 // ---------------- Measure ----------------
-function onNote(m: Measure, noteEl: Element, tmp: ParserTemp, div: number, st: MState): void {
+function onNote(
+  m: Measure,
+  noteEl: Element,
+  tmp: ParserTemp,
+  div: number,
+  st: MState,
+  staffFilter: number | null,
+): void {
   if (has(noteEl, "grace")) return;
   const isChord = has(noteEl, "chord");
+  const noteStaff = intOf(noteEl, "staff") ?? 1;
+  // A piano part is parsed twice (staff 1 -> RH, staff 2 -> LH).  Even when a
+  // note belongs to the other staff we must advance the MusicXML cursor so the
+  // selected staff keeps its original rhythmic positions after backup/forward.
+  if (staffFilter !== null && noteStaff !== staffFilter) {
+    if (!isChord) {
+      st.pos = st.noteEnd;
+      if (!has(noteEl, "duration")) throw new Error("note without duration");
+      st.noteEnd = st.pos.plus(noteDuration(noteEl));
+    }
+    return;
+  }
   const newChord = m.entries.length === 0 || !isChord;
   if (newChord) m.add(new Chord(m));
   const last = m.entries[m.entries.length - 1] as Chord;
@@ -233,8 +253,17 @@ function parseSound(snd: Element, pd: PlayData, mid: number, st: MState, div: nu
 }
 
 function loadMeasure(
-  m: Measure, measureEl: Element, prev: Measure | null, div: number, tmp: ParserTemp,
+  m: Measure,
+  measureEl: Element,
+  prev: Measure | null,
+  div: number,
+  tmp: ParserTemp,
+  staffFilter: number | null,
 ): void {
+  if (/^(?:yes|true|1)$/i.test(measureEl.getAttribute("implicit") ?? "")) {
+    m.pickup = true;
+    m.displayNumber = null;
+  }
   if (prev) {
     m.key.fifths = prev.key.fifths;
     m.time.beats = prev.time.beats;
@@ -243,8 +272,9 @@ function loadMeasure(
   const st: MState = { pos: new Fraction(0), noteEnd: new Fraction(0) };
   for (const item of Array.from(measureEl.children)) {
     switch (item.tagName) {
-      case "note": onNote(m, item, tmp, div, st); break;
+      case "note": onNote(m, item, tmp, div, st, staffFilter); break;
       case "backup": st.pos = st.pos.minus(new Fraction(intOf(item, "duration") ?? 0)); st.noteEnd = st.pos; break;
+      case "forward": st.pos = st.pos.plus(new Fraction(intOf(item, "duration") ?? 0)); st.noteEnd = st.pos; break;
       case "attributes": parseAttribute(m, item); break;
       case "print": parsePrint(m, item); break;
       case "barline": st.pos = st.noteEnd; parseBarline(m, item, st); break;
@@ -260,7 +290,7 @@ function loadMeasure(
 }
 
 // ---------------- Part ----------------
-function loadPart(part: Part, partEl: Element, pd: PlayData): void {
+function loadPart(part: Part, partEl: Element, pd: PlayData, staffFilter: number | null = null): void {
   const measureEls = elems(partEl, "measure");
   const firstAttr = measureEls[0] ? elem(measureEls[0], "attributes") : null;
   const div = firstAttr ? intOf(firstAttr, "divisions") ?? 1 : 1;
@@ -270,13 +300,70 @@ function loadPart(part: Part, partEl: Element, pd: PlayData): void {
   measureEls.forEach((mel, mid) => {
     const mea = new Measure(mid);
     mea.position = pos;
-    loadMeasure(mea, mel, cur, div, tmp);
+    loadMeasure(mea, mel, cur, div, tmp, staffFilter);
     part.measures.push(mea);
     tmp.pairTuplet();
     pos = pos.plus(mea.duration);
     cur = mea;
   });
   tmp.pairTie();
+}
+
+function staffCount(partEl: Element): number {
+  let count = 1;
+  for (const staves of Array.from(partEl.getElementsByTagName("staves"))) {
+    count = Math.max(count, parseInt(staves.textContent ?? "1", 10) || 1);
+  }
+  for (const staff of Array.from(partEl.getElementsByTagName("staff"))) {
+    count = Math.max(count, parseInt(staff.textContent ?? "1", 10) || 1);
+  }
+  return count;
+}
+
+function twoPartPiano(root: Element): boolean {
+  const parts = elems(root, "part");
+  if (parts.length !== 2) return false;
+  const names = elems(elem(root, "part-list") ?? root, "score-part")
+    .map((p) => txt(p, "part-name") ?? "")
+    .join(" ");
+  return /(piano|keyboard|right|left|treble|bass|\brh\b|\blh\b|钢琴|右手|左手)/i.test(names);
+}
+
+function pianoRoot(root: Element): boolean {
+  const parts = elems(root, "part");
+  return (parts.length > 0 && staffCount(parts[0]) >= 2) || twoPartPiano(root);
+}
+
+function importedPianoInstrumentName(root: Element): string {
+  const partList = elem(root, "part-list") ?? root;
+  const names = elems(partList, "score-part")
+    .flatMap((part) => [
+      txt(part, "part-name"),
+      ...elems(part, "score-instrument").map((instrument) => txt(instrument, "instrument-name")),
+    ])
+    .map(normText)
+    .filter((name): name is string => name !== null && name.length > 0)
+    .map((name) => name
+      .replace(/\b(?:right|left)\s*(?:hand)?\b/ig, "")
+      .replace(/\b[rl]\.?h\.?\b/ig, "")
+      .replace(/右手|左手/g, "")
+      .replace(/^[\s·:：—–-]+|[\s·:：—–-]+$/g, "")
+      .trim())
+    .filter((name) => name.length > 0);
+  const handOnly = /^(?:right|left|treble|bass|r\.?h\.?|l\.?h\.?|右手|左手)$/i;
+  const genericPart = /^(?:part|staff|voice|music|声部|谱表)\s*\d*$/i;
+  return names.find((name) => !handOnly.test(name) && !genericPart.test(name)) ?? "钢琴";
+}
+
+/** True when MusicXML represents a keyboard score that should become paired jianpu. */
+export function isPianoMusicXml(xmlText: string): boolean {
+  try {
+    const doc = new DOMParser().parseFromString(xmlText, "application/xml");
+    if (doc.getElementsByTagName("parsererror").length > 0) return false;
+    return pianoRoot(doc.documentElement);
+  } catch {
+    return false;
+  }
 }
 
 // ---------------- refrain detection (score.kt findRefrain/updateRefrain) ----------------
@@ -335,12 +422,14 @@ function extractScoreTitle(root: Element): string {
 // ---------------- top-level ----------------
 export function loadMusicXml(xmlText: string): Score {
   const doc = new DOMParser().parseFromString(xmlText, "application/xml");
-  const err = doc.querySelector("parsererror");
+  const err = doc.getElementsByTagName("parsererror")[0] ?? null;
   if (err) throw new Error("MusicXML 解析失败: " + err.textContent);
   const root = doc.documentElement; // score-partwise
   const score = new Score();
 
   score.title = extractScoreTitle(root);
+  const movementTitle = normText(txt(root, "movement-title"));
+  if (movementTitle && movementTitle !== score.title) score.subtitle = movementTitle;
 
   const ident = elem(root, "identification");
   if (ident) {
@@ -348,6 +437,9 @@ export function loadMusicXml(xmlText: string): Score {
       score.creator.set(cr.getAttribute("type") ?? "", cr.textContent ?? "");
     }
   }
+  score.composer = score.creator.get("composer")?.trim() ?? "";
+  score.arranger = score.creator.get("arranger")?.trim() ?? "";
+  score.lyricist = (score.creator.get("lyricist") ?? score.creator.get("poet"))?.trim() ?? "";
   for (const cr of elems(root, "credit")) {
     const cred = new Credit();
     const ct = txt(cr, "credit-type");
@@ -364,12 +456,71 @@ export function loadMusicXml(xmlText: string): Score {
   }
   for (const it of score.credit) {
     if (it.type === null && it.text === score.title) it.type = "title";
+    for (const line of it.text.split("\n")) {
+      const match = /^(作词|词|作曲|曲|编曲|编)\s*[：:]\s*(.+)$/.exec(line.trim());
+      if (!match) continue;
+      if ((match[1] === "作词" || match[1] === "词") && !score.lyricist) score.lyricist = match[2].trim();
+      if ((match[1] === "作曲" || match[1] === "曲") && !score.composer) score.composer = match[2].trim();
+      if ((match[1] === "编曲" || match[1] === "编") && !score.arranger) score.arranger = match[2].trim();
+    }
   }
 
-  const part = new Part();
-  loadPart(part, elems(root, "part")[0], score.playData);
-  score.parts.push(part);
-  for (const m of part.measures) m.init();
+  const partEls = elems(root, "part");
+  if (partEls.length === 0) throw new Error("MusicXML 没有 part");
+  if (staffCount(partEls[0]) >= 2) {
+    const right = new Part();
+    right.hand = "right";
+    loadPart(right, partEls[0], score.playData, 1);
+    const left = new Part();
+    left.hand = "left";
+    // Sound/repeat metadata is score-global; parsing the second staff into a
+    // throwaway PlayData avoids duplicating jump entries.
+    loadPart(left, partEls[0], new PlayData(), 2);
+    score.parts.push(right, left);
+    score.piano = true;
+  } else if (twoPartPiano(root)) {
+    const right = new Part();
+    right.hand = "right";
+    loadPart(right, partEls[0], score.playData);
+    const left = new Part();
+    left.hand = "left";
+    loadPart(left, partEls[1], new PlayData());
+    score.parts.push(right, left);
+    score.piano = true;
+  } else {
+    const part = new Part();
+    loadPart(part, partEls[0], score.playData);
+    score.parts.push(part);
+  }
+  if (score.piano) {
+    score.instrumentName = importedPianoInstrumentName(root);
+    const count = Math.min(...score.parts.map((p) => p.measures.length));
+    for (let i = 0; i < count; i++) {
+      const newSystem = score.parts.some((p) => p.measures[i].newSystem);
+      const newPage = score.parts.some((p) => p.measures[i].newPage);
+      for (const p of score.parts) {
+        p.measures[i].newSystem = newSystem;
+        p.measures[i].newPage = newPage;
+      }
+    }
+  }
+  for (const part of score.parts) {
+    for (const m of part.measures) {
+      m.init(score.piano ? { keepChords: true, primaryVoice: true } : undefined);
+      if (score.piano) {
+        for (const ent of m.entries) {
+          if (!(ent instanceof Chord)) continue;
+          const lyrics = ent.notes.flatMap((n) => n.lyrics);
+          ent.notes.sort((a, b) => b.pitch - a.pitch);
+          if (lyrics.length > 0 && ent.notes.length > 0) {
+            for (const n of ent.notes) n.lyrics = [];
+            ent.notes[0].lyrics = lyrics;
+          }
+        }
+      }
+    }
+  }
+  normalizeOpeningPickup(score);
   findRefrain(score);
   score.parseRepeatInf();
   return score;

@@ -13,7 +13,7 @@ import {
   TextFrame,
   SmuflText,
 } from "./layout";
-import { Chord, Score } from "../score/score";
+import { Chord, type Note, Score } from "../score/score";
 
 const SVG_NS = "http://www.w3.org/2000/svg";
 
@@ -26,7 +26,7 @@ export class JinpuPainter {
   nodeMap = new WeakMap<PageItem, SVGGElement>();
   /** Chord -> its note-entry groups (one per rendered verse/pass), for playback cursor. */
   private chordItem = new Map<Chord, { page: number; item: PageItem; verse: number }[]>();
-  private highlighted: PageItem | null = null;
+  private highlighted: PageItem[] = [];
 
   constructor(fontSize: number) {
     this.layout = new Layout(fontSize);
@@ -36,7 +36,9 @@ export class JinpuPainter {
     this.pageWidth = w;
     this.pageHeight = h;
     this.layout.fromScore(this.score, dur, w, h);
-    this.layout.pages.unshift(this.titlePage(w, h));
+    // Single- and double-staff scores now share the compact publication header
+    // on the first music page. titlePage() remains available for the dedicated
+    // title-layout example in the help panel, but is no longer inserted here.
     for (const p of this.layout.pages) p.update();
     this.buildChordIndex();
   }
@@ -44,7 +46,7 @@ export class JinpuPainter {
   /** Walk each page tree, mapping every Chord to its note-entry group(s). */
   private buildChordIndex(): void {
     this.chordItem.clear();
-    this.highlighted = null;
+    this.highlighted = [];
     const walk = (item: PageItem, page: number): void => {
       if (item.data instanceof NoteEntry) {
         const ch = item.data.chord;
@@ -68,22 +70,78 @@ export class JinpuPainter {
 
   /** Highlight the note of `chord` at `pass` (clearing any previous). Returns page index. */
   highlightChord(chord: Chord | null, pass = 0): number | null {
-    if (this.highlighted) {
-      this.nodeMap.get(this.highlighted)?.classList.remove("playing");
-      this.highlighted = null;
+    return this.highlightChords(chord ? [chord] : null, pass);
+  }
+
+  /** Highlight every hand/part chord sounding at the same playback instant. */
+  highlightChords(chords: Chord[] | null, pass = 0): number | null {
+    for (const item of this.highlighted) this.nodeMap.get(item)?.classList.remove("playing");
+    this.highlighted = [];
+    if (!chords || chords.length === 0) return null;
+    let page: number | null = null;
+    for (const chord of chords) {
+      const hit = this.hitFor(chord, pass);
+      if (!hit) continue;
+      this.nodeMap.get(hit.item)?.classList.add("playing");
+      this.highlighted.push(hit.item);
+      if (page === null) page = hit.page;
     }
-    if (!chord) return null;
-    const hit = this.hitFor(chord, pass);
-    if (!hit) return null;
-    this.nodeMap.get(hit.item)?.classList.add("playing");
-    this.highlighted = hit.item;
-    return hit.page;
+    return page;
   }
 
   /** SVG <g> for a chord's note at `pass` (for scroll-into-view); null if not rendered. */
   chordGroupEl(chord: Chord, pass = 0): SVGGElement | null {
     const hit = this.hitFor(chord, pass);
     return hit ? this.nodeMap.get(hit.item) ?? null : null;
+  }
+
+  /** SVG group for one tone inside a vertical chord, falling back to its entry. */
+  noteGroupEl(chord: Chord, note: Note, pass = 0): SVGGElement | null {
+    const hit = this.hitFor(chord, pass);
+    if (!hit) return null;
+    const entry = hit.item.data;
+    if (entry instanceof NoteEntry) {
+      const index = chord.notes.indexOf(note);
+      const number = index >= 0 ? entry.numbers[index] : null;
+      const item = number ?? entry.graceItems.get(note);
+      if (item) return this.nodeMap.get(item) ?? this.nodeMap.get(hit.item) ?? null;
+    }
+    return this.nodeMap.get(hit.item) ?? null;
+  }
+
+  /** Every rendered occurrence of one tone, including repeated passes/verses. */
+  noteGroupEls(
+    chord: Chord,
+    note: Note,
+  ): Array<{ page: number; verse: number; element: SVGGElement }> {
+    const result: Array<{ page: number; verse: number; element: SVGGElement }> = [];
+    const index = chord.notes.indexOf(note);
+    for (const hit of this.chordItem.get(chord) ?? []) {
+      const entry = hit.item.data;
+      let element = this.nodeMap.get(hit.item) ?? null;
+      if (entry instanceof NoteEntry) {
+        const item = index >= 0 ? entry.numbers[index] : entry.graceItems.get(note);
+        if (item) element = this.nodeMap.get(item) ?? element;
+      }
+      if (element) result.push({ page: hit.page, verse: hit.verse, element });
+    }
+    return result;
+  }
+
+  /** Rendered groups whose layout item carries the given score-model object. */
+  itemGroupsForData(
+    data: unknown,
+  ): Array<{ page: number; item: PageItem; element: SVGGElement }> {
+    const result: Array<{ page: number; item: PageItem; element: SVGGElement }> = [];
+    const walk = (item: PageItem, page: number): void => {
+      if (item.data === data) {
+        const element = this.nodeMap.get(item);
+        if (element) result.push({ page, item, element });
+      }
+      for (const child of item.children) walk(child, page);
+    };
+    this.layout.pages.forEach((page, index) => walk(page, index));
+    return result;
   }
 
   private multipleLineText(str: string, fnt: Font, w: number, clr: number): PageItem {
@@ -246,6 +304,7 @@ export function renderPageItem(
   nodeMap?: WeakMap<PageItem, SVGGElement>,
 ): SVGGElement {
   const g = document.createElementNS(SVG_NS, "g");
+  if (item.classes.size > 0) g.setAttribute("class", [...item.classes].join(" "));
   if (!item.matrix.isIdentity) g.setAttribute("transform", item.matrix.toSvg());
   const self = renderSelf(item);
   if (self) g.appendChild(self);
@@ -286,6 +345,13 @@ function renderSelf(item: PageItem): SVGElement | null {
     t.setAttribute("font-size", String(item.font.size));
     if (item.font.bold) t.setAttribute("font-weight", "bold");
     t.setAttribute("fill", colorToCss(item.color));
+    if (item.strokeWidth > 0) {
+      t.setAttribute("stroke", colorToCss(item.strokeColor));
+      t.setAttribute("stroke-width", String(item.strokeWidth));
+      t.setAttribute("stroke-linejoin", "round");
+      t.setAttribute("paint-order", "stroke fill");
+      if (item.nonScalingStroke) t.setAttribute("vector-effect", "non-scaling-stroke");
+    }
     t.textContent = item.text;
     return t;
   }

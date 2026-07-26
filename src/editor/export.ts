@@ -7,19 +7,6 @@ import { asset } from "../common/asset";
 
 const SVG_NS = "http://www.w3.org/2000/svg";
 
-function svgSize(svg: SVGSVGElement): { width: number; height: number } {
-  const viewBox = svg.getAttribute("viewBox")?.trim().split(/[\s,]+/).map(Number);
-  if (viewBox?.length === 4 && viewBox[2] > 0 && viewBox[3] > 0) {
-    return { width: viewBox[2], height: viewBox[3] };
-  }
-  const width = Number.parseFloat(svg.getAttribute("width") ?? "");
-  const height = Number.parseFloat(svg.getAttribute("height") ?? "");
-  if (width > 0 && height > 0) return { width, height };
-  const rect = svg.getBoundingClientRect();
-  if (rect.width > 0 && rect.height > 0) return { width: rect.width, height: rect.height };
-  throw new Error("无法读取乐谱页面尺寸");
-}
-
 let bravuraDataUrlPromise: Promise<string> | null = null;
 async function bravuraDataUrl(): Promise<string> {
   if (!bravuraDataUrlPromise) {
@@ -37,11 +24,10 @@ async function bravuraDataUrl(): Promise<string> {
 
 /** Serialize a page <svg> with Bravura embedded so it rasterizes faithfully. */
 async function svgToBytes(svg: SVGSVGElement, scale: number): Promise<Uint8Array> {
-  const { width: w, height: h } = svgSize(svg);
+  const w = Number(svg.getAttribute("width"));
+  const h = Number(svg.getAttribute("height"));
   const clone = svg.cloneNode(true) as SVGSVGElement;
   clone.setAttribute("xmlns", SVG_NS);
-  clone.setAttribute("width", String(w));
-  clone.setAttribute("height", String(h));
   clone.removeAttribute("style");
 
   const style = document.createElementNS(SVG_NS, "style");
@@ -78,8 +64,9 @@ function baseName(app: App): string {
 
 export async function exportCurrentPagePng(app: App): Promise<void> {
   const wrap = app.pageEls[app.pageIndex];
-  const svg = wrap?.querySelector("svg") as SVGSVGElement | null;
-  if (!svg) throw new Error("当前页面没有可导出的乐谱");
+  if (!wrap) return;
+  const svg = wrap.querySelector("svg") as SVGSVGElement | null;
+  if (!svg) return;
   const bytes = await svgToBytes(svg, 2);
   await saveBytes(bytes, `${baseName(app)}-第${app.pageIndex + 1}页.png`, "image/png");
 }
@@ -98,7 +85,54 @@ export async function exportPptx(app: App): Promise<void> {
   );
 }
 
-/** Export staff pages to a directly downloadable PDF. */
+function chooseVoiceMarkerExport(): Promise<boolean | null> {
+  return new Promise((resolve) => {
+    const overlay = document.createElement("div");
+    overlay.className = "modal-overlay";
+    const box = document.createElement("div");
+    box.className = "modal-box";
+    const title = document.createElement("div");
+    title.className = "modal-title";
+    title.textContent = "TXT 声部标记";
+    const hint = document.createElement("div");
+    hint.className = "modal-hint";
+    hint.textContent = "保留时会写入不可见的 U+2063 与 vc:N，可无损恢复多声部；不带标记时会合并为单谱行。";
+    const footer = document.createElement("div");
+    footer.className = "modal-footer";
+    const cancel = document.createElement("button");
+    cancel.textContent = "取消";
+    const plain = document.createElement("button");
+    plain.textContent = "不带声部标记";
+    const marked = document.createElement("button");
+    marked.textContent = "保留声部标记";
+    footer.append(cancel, plain, marked);
+    box.append(title, hint, footer);
+    overlay.append(box);
+    document.body.append(overlay);
+    const close = (value: boolean | null) => {
+      overlay.remove();
+      resolve(value);
+    };
+    cancel.onclick = () => close(null);
+    plain.onclick = () => close(false);
+    marked.onclick = () => close(true);
+    overlay.onclick = (event) => {
+      if (event.target === overlay) close(null);
+    };
+  });
+}
+
+async function exportTextScore(
+  app: App,
+  format: "jpw" | "keyboard" | "number",
+): Promise<void> {
+  const includeMarkers = format === "jpw" ? true : await chooseVoiceMarkerExport();
+  if (includeMarkers === null) return;
+  const result = app.exportTextDocument(format, includeMarkers);
+  await saveBytes(result.bytes, result.name, result.mime);
+}
+
+/** Export mixed-mode pages to PDF via Tauri svg2pdf command or browser print dialog. */
 export async function exportMixedPdf(app: App): Promise<void> {
   if (!app["_mixedPainter"] || app.mode !== "mixed") return;
   const painter = app["_mixedPainter"] as import("../mixed/painter").MixedPainter;
@@ -122,17 +156,29 @@ export async function exportMixedPdf(app: App): Promise<void> {
     }
     await invoke("export_pdf_cmd", { pagesSvg: pages, widthPt: wPt, heightPt: hPt, outPath });
   } else {
-    const { jsPDF } = await import("jspdf");
-    const orientation = wPt >= hPt ? "landscape" : "portrait";
-    const pdf = new jsPDF({ unit: "pt", format: [wPt, hPt], orientation, compress: true });
+    // Browser path: open print window with embedded font
+    const bravuraUrl = await bravuraDataUrl();
+    const win = window.open("", "_blank", "width=800,height=900");
+    if (!win) return;
+    const d = win.document;
+    const wMm = (wPt * 25.4 / 72).toFixed(1);
+    const hMm = (hPt * 25.4 / 72).toFixed(1);
+    d.write(`<!DOCTYPE html><html><head><meta charset="UTF-8"><style>
+@font-face{font-family:"Bravura";src:url("${bravuraUrl}") format("woff2");}
+@page{size:${wMm}mm ${hMm}mm;margin:0}
+body{margin:0;padding:0;background:#fff}
+svg{display:block;width:100%;page-break-after:always}
+</style></head><body>`);
     for (let i = 0; i < painter.pageCount; i++) {
       const svg = painter.renderPage(i);
-      const png = await svgToBytes(svg, 2);
-      if (i > 0) pdf.addPage([wPt, hPt], orientation);
-      pdf.addImage(png, "PNG", 0, 0, wPt, hPt, undefined, "FAST");
+      svg.setAttribute("xmlns", SVG_NS);
+      svg.setAttribute("width", `${wPt}pt`);
+      svg.setAttribute("height", `${hPt}pt`);
+      d.write(new XMLSerializer().serializeToString(svg));
     }
-    const bytes = new Uint8Array(pdf.output("arraybuffer"));
-    await saveBytes(bytes, `${painter.title || "五线谱"}.pdf`, "application/pdf");
+    d.write("</body></html>");
+    d.close();
+    setTimeout(() => win.print(), 500);
   }
 }
 
@@ -143,11 +189,9 @@ export function showExportDialog(app: App): void {
   box.className = "modal-box";
   const title = document.createElement("div");
   title.className = "modal-title";
-  title.textContent = app.mode === "mixed" ? "导出 · 五线谱" : "导出 · 简谱";
+  title.textContent = "导出";
   const list = document.createElement("div");
   list.style.cssText = "display:flex;flex-direction:column;gap:8px";
-  const error = document.createElement("div");
-  error.style.cssText = "display:none;color:var(--error,#f3727f);font-size:12px;line-height:1.4";
 
   const close = () => overlay.remove();
   const item = (label: string, fn: () => void | Promise<void>) => {
@@ -155,27 +199,24 @@ export function showExportDialog(app: App): void {
     btn.textContent = label;
     btn.style.cssText = "padding:8px 12px;text-align:left;cursor:pointer";
     btn.onclick = async () => {
-      btn.disabled = true;
-      error.style.display = "none";
+      close();
       try {
         await fn();
-        close();
       } catch (e) {
         console.error(e);
-        error.textContent = "导出失败：" + (e instanceof Error ? e.message : String(e));
-        error.style.display = "block";
-        btn.disabled = false;
       }
     };
     list.append(btn);
   };
   if (app.mode === "mixed") {
-    item("PNG", () => exportCurrentPagePng(app));
-    item("PDF", () => exportMixedPdf(app));
-    item("MIDI", () => exportMidi(app));
+    item("混排 PDF", () => exportMixedPdf(app));
   } else {
-    item("PPTX", () => exportPptx(app));
+    item("PNG（当前页）", () => exportCurrentPagePng(app));
+    item("PPTX（矢量）", () => exportPptx(app));
     item("MIDI", () => exportMidi(app));
+    item("键盘谱 TXT", () => exportTextScore(app, "keyboard"));
+    item("数字谱 TXT", () => exportTextScore(app, "number"));
+    item("JPW 简谱（.jpwabc）", () => exportTextScore(app, "jpw"));
   }
 
   const footer = document.createElement("div");
@@ -185,7 +226,7 @@ export function showExportDialog(app: App): void {
   cancel.onclick = close;
   footer.append(cancel);
 
-  box.append(title, list, error, footer);
+  box.append(title, list, footer);
   overlay.append(box);
   overlay.onclick = (e) => {
     if (e.target === overlay) close();

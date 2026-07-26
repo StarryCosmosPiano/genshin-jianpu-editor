@@ -3,31 +3,24 @@ import { MetaData } from "./smufl/smufl";
 import { ensureFontsReady } from "./common/measure";
 import { asset } from "./common/asset";
 import { App } from "./editor/app";
-import { showOptionsDialog } from "./editor/dialogs";
+import { showEngravingStyleDialog, showOptionsDialog } from "./editor/dialogs";
 import { showExportDialog } from "./editor/export";
 import { showHelpDialog } from "./editor/help";
 import { isTauriRuntime } from "./editor/fileio";
 import { MixedPainter } from "./mixed/painter";
+import { showCreateScoreDialog } from "./editor/slash-dialog";
 
-// Built-in sample (圣哉，圣哉，圣哉) — same content as CodeEditor.kt `scr`.
-const SAMPLE = `// ************** JPW-ABC File Ver 1.0 (for JP-Word v5.50m) **************
+const BUILT_IN_SAMPLE = `// ************** JPW-ABC File Ver 1.0 (for JP-Word v5.50m) **************
 .Title
-Title = {圣哉，圣哉，圣哉}
-KeyAndMeters = {1=D,4/4}
+Title = {原琴练习曲}
+SubTitle = {Genshin Jianpu Editor}
+Composer = {StarryCosmosPiano}
+Instrument = {风物琴}
+KeyAndMeters = {1=C,4/4}
+Tempo = {96}
 .Voice
-1 1 3 3 |5- 5- |6- 6 6 |5- 3- |$(true)
-5. 5_ 5 5 |1'- 7 5 |2 5 6. 5_ |5--- |$(true)
-1 1 3 3 |5- 5- |6. 6_ 6 6 |5- 5- |$(true)
-1'- 5 5 |6- 3- |4 2 2. 1_ |1--- |]$(true,0,0,true)
-.Words
-W1@1,1:
-{1.[圣]}哉，圣哉，圣哉！全能大主宰！清晨欢悦歌咏高声颂主圣恩，圣哉，圣哉，圣哉！恩慈永无更改，荣耀与赞美，归三一真神。
-W2@1,1:
-{2.[圣]}哉，圣哉，圣哉！群圣虔拜俯，各以华丽金冠奉呈宝座之前，千万天军、天使，虔敬崇拜上主，昔在而今在，永在亿万年。
-W3@1,1:
-{3.[圣]}哉，圣哉，圣哉！主藏黑云里，罪人焉得瞻望真主威赫荣光，耶和华惟圣哉，谁与上主堪比，权能至完备，大哉天地王。
-W4@1,1:
-{4.[圣]}哉，圣哉，圣哉！全能大主宰！天上地下海中万物颂主尊称，圣哉，圣哉，圣哉！恩慈永无更改，荣耀与赞美，归三一真神。
+1 2 3 5 |6 5 3 2 |1 - 3 - |5 --- |$(true)
+3 3 5 6 |5 3 2 1 |2 - 7, - |1 --- |]$(true,0,0,true)
 `;
 
 // 注册 Bravura @font-face（替代 styles.css 里的静态声明），按 Vite base 解析字体 URL。
@@ -48,15 +41,15 @@ async function boot() {
 
   const codePane = document.getElementById("code-pane")!;
   const scorePane = document.getElementById("score-pane")!;
-  const appRoot = document.getElementById("app")!;
-  const workspace = document.getElementById("body")!;
-  const startScreen = document.getElementById("start-screen")!;
-  const startFeedback = document.getElementById("start-feedback")!;
-  const recognitionProgress = document.getElementById("recognition-progress")!;
 
   const app = new App(meta, scorePane);
   app.loadSettings();
-  app.mountEditor(codePane, SAMPLE);
+  try {
+    await app.refreshSoundfonts();
+  } catch (error) {
+    console.warn("启动时读取 SF2 音源失败", error);
+  }
+  app.mountEditor(codePane, BUILT_IN_SAMPLE);
   const win = window as unknown as { __app: App; __mixedPainter: MixedPainter; __omr: unknown; __abc2musicxml: unknown };
   win.__app = app;
   win.__mixedPainter = new MixedPainter();
@@ -65,69 +58,32 @@ async function boot() {
   // ABC → MusicXML 移植版暴露（便于 abc-check.mjs 回归，同 __app 约定）。
   win.__abc2musicxml = import("./abc/abc2xml");
 
-  const revealWorkspace = () => {
-    startScreen.hidden = true;
-    appRoot.classList.remove("is-starting");
-  };
-  const showStartScreen = () => {
-    startScreen.hidden = false;
-    appRoot.classList.add("is-starting");
-  };
-  const showSample = () => {
-    app.view.dispatch({
-      changes: { from: 0, to: app.view.state.doc.length, insert: SAMPLE },
-    });
-    app.filePath = null;
-    revealWorkspace();
-  };
-  const setRecognitionBusy = (busy: boolean) => { recognitionProgress.hidden = !busy; };
-  const setStartFeedback = (message: string) => {
-    startFeedback.textContent = message;
-    startFeedback.hidden = !message;
-  };
-  const mobileCodeBtn = document.getElementById("btn-mobile-code") as HTMLButtonElement;
-  const mobileScoreBtn = document.getElementById("btn-mobile-score") as HTMLButtonElement;
-  const setMobileView = (view: "code" | "score") => {
-    const showCode = view === "code";
-    workspace.classList.toggle("mobile-code", showCode);
-    mobileCodeBtn.classList.toggle("active", showCode);
-    mobileScoreBtn.classList.toggle("active", !showCode);
-    mobileCodeBtn.setAttribute("aria-pressed", String(showCode));
-    mobileScoreBtn.setAttribute("aria-pressed", String(!showCode));
-  };
-  const recognizeFromPicker = () => void pickRecognitionFile(app, {
-    onPicked: () => { setStartFeedback(""); setRecognitionBusy(true); },
-    onDone: (success) => {
-      setRecognitionBusy(false);
-      if (success) {
-        setMobileView("score");
-        revealWorkspace();
-      } else if (appRoot.classList.contains("is-starting")) {
-        setStartFeedback(document.getElementById("status")?.textContent || "识别失败，请更换图片后重试");
-      }
-    },
-  });
-
   // toolbar
   const on = (id: string, fn: () => void) =>
     document.getElementById(id)?.addEventListener("click", fn);
   on("btn-save", () => void app.saveFile());
+  on("btn-saveas", () => void app.saveFileAs());
   on("btn-prev", () => app.prevPage());
   on("btn-next", () => app.nextPage());
   on("btn-options", () => showOptionsDialog(app));
+  on("btn-layout-style", () => showEngravingStyleDialog(app));
   on("btn-export", () => showExportDialog(app));
   on("btn-help", () => showHelpDialog(app));
-  const jpPreviewBtn = document.getElementById("btn-preview-jp") as HTMLButtonElement | null;
-  const staffPreviewBtn = document.getElementById("btn-preview-staff") as HTMLButtonElement | null;
-  if (jpPreviewBtn && staffPreviewBtn) {
-    app.setPreviewModeButtons(jpPreviewBtn, staffPreviewBtn);
-    jpPreviewBtn.addEventListener("click", () => void app.showJpPreview());
-    staffPreviewBtn.addEventListener("click", () => void app.showStaffPreview());
+  on("btn-create", () => {
+    void showCreateScoreDialog().then((kind) => {
+      if (kind) void app.createDocument(kind);
+    });
+  });
+  if (!isTauriRuntime()) {
+    for (const id of ["btn-mixed", "btn-recognize", "sel-recog-view", "btn-phrase"]) {
+      const element = document.getElementById(id);
+      if (element) element.hidden = true;
+    }
   }
-  const staffJianpuToggle = document.getElementById("chk-staff-jianpu") as HTMLInputElement | null;
-  if (staffJianpuToggle) {
-    app.setStaffJianpuToggle(staffJianpuToggle);
-    staffJianpuToggle.addEventListener("change", () => void app.setStaffJianpuLayer(staffJianpuToggle.checked));
+  const mixedBtn = document.getElementById("btn-mixed") as HTMLButtonElement | null;
+  if (mixedBtn) {
+    app.setMixedBtn(mixedBtn);
+    mixedBtn.addEventListener("click", () => void app.toggleMixed());
   }
   const recognizeBtn = document.getElementById("btn-recognize") as HTMLButtonElement | null;
   if (recognizeBtn) {
@@ -139,27 +95,23 @@ async function boot() {
     app.setRecogViewSelect(recogViewSel);
     recogViewSel.addEventListener("change", () => app.setRecogView(recogViewSel.value as import("./omr").RecogView));
   }
-  const originalLayoutBtn = document.getElementById("btn-layout-original") as HTMLButtonElement | null;
   const phraseBtn = document.getElementById("btn-phrase") as HTMLButtonElement | null;
-  if (originalLayoutBtn && phraseBtn) {
-    app.setPhraseButtons(originalLayoutBtn, phraseBtn);
-    originalLayoutBtn.addEventListener("click", () => app.setPhraseLayout(false));
-    phraseBtn.addEventListener("click", () => app.setPhraseLayout(true));
+  if (phraseBtn) {
+    app.setPhraseBtn(phraseBtn);
+    phraseBtn.addEventListener("click", () => app.togglePhrase());
   }
   const playBtn = document.getElementById("btn-play") as HTMLButtonElement | null;
   if (playBtn) {
-    app.setPlaybackBtn(playBtn);
-    playBtn.addEventListener("click", () => void app.togglePlayback());
+    app.setPlayBtn(playBtn);
+    playBtn.addEventListener("click", () => void app.playScore());
   }
-  const openScore = async () => { if (await app.openFile()) revealWorkspace(); };
-  document.getElementById("btn-open")?.addEventListener("click", () => void openScore());
-  document.getElementById("btn-start-score")?.addEventListener("click", () => void openScore());
-  document.getElementById("btn-image-open")?.addEventListener("click", recognizeFromPicker);
-  document.getElementById("btn-start-image")?.addEventListener("click", recognizeFromPicker);
-  document.getElementById("btn-start-sample")?.addEventListener("click", showSample);
-  document.getElementById("btn-home")?.addEventListener("click", showStartScreen);
-  mobileCodeBtn.addEventListener("click", () => setMobileView("code"));
-  mobileScoreBtn.addEventListener("click", () => setMobileView("score"));
+  const stopBtn = document.getElementById("btn-stop") as HTMLButtonElement | null;
+  if (stopBtn) {
+    app.setStopBtn(stopBtn);
+    stopBtn.addEventListener("click", () => app.stopPlayback());
+  }
+  const addOpen = document.getElementById("btn-open");
+  addOpen?.addEventListener("click", () => void app.openFile());
 
   // zoom controls
   const zoomLabel = document.getElementById("btn-zoom-reset");
@@ -268,78 +220,15 @@ async function boot() {
     else if (e.key === "End" && e.ctrlKey) app.goToPage(1e9);
   });
 
-  await wireDragDrop(app, workspace, {
-    onOpened: revealWorkspace,
-    onRecognitionStart: () => { setStartFeedback(""); setRecognitionBusy(true); },
-    onRecognitionDone: (success) => {
-      setRecognitionBusy(false);
-      if (success) {
-        setMobileView("score");
-        revealWorkspace();
-      } else if (appRoot.classList.contains("is-starting")) {
-        setStartFeedback(document.getElementById("status")?.textContent || "识别失败，请更换图片后重试");
-      }
-    },
-  });
+  await wireDragDrop(app, scorePane);
 
   // 自动加载上次打开的文件（仅 Tauri；失败则保持示例文本）
-  if (await app.tryRestoreLastFile()) revealWorkspace();
+  await app.tryRestoreLastFile();
 }
 
 const RECOG_EXT_RE = /\.(png|jpe?g|webp|bmp|gif|pdf)$/i;
 
-interface RecognitionPickerHooks {
-  onPicked: () => void;
-  onDone: (success: boolean) => void;
-}
-
-async function pickRecognitionFile(app: App, hooks: RecognitionPickerHooks): Promise<void> {
-  if (isTauriRuntime()) {
-    const { open } = await import("@tauri-apps/plugin-dialog");
-    const { readFile } = await import("@tauri-apps/plugin-fs");
-    const sel = await open({
-      multiple: false,
-      filters: [{ name: "简谱图片 / PDF", extensions: ["png", "jpg", "jpeg", "webp", "bmp", "gif", "pdf"] }],
-    });
-    if (typeof sel !== "string") return;
-    hooks.onPicked();
-    let success = false;
-    try {
-      success = await app.recognizeBytes("musicpp", { bytes: await readFile(sel), path: sel });
-    } finally {
-      hooks.onDone(success);
-    }
-    return;
-  }
-
-  const input = document.createElement("input");
-  input.type = "file";
-  input.accept = "image/png,image/jpeg,image/webp,image/bmp,image/gif,application/pdf,.pdf";
-  input.onchange = async () => {
-    const file = input.files?.[0];
-    if (!file) return;
-    hooks.onPicked();
-    let success = false;
-    try {
-      success = await app.recognizeBytes("musicpp", {
-        bytes: new Uint8Array(await file.arrayBuffer()),
-        mime: file.type,
-        path: null,
-      });
-    } finally {
-      hooks.onDone(success);
-    }
-  };
-  input.click();
-}
-
-interface DropHooks {
-  onOpened: () => void;
-  onRecognitionStart: () => void;
-  onRecognitionDone: (success: boolean) => void;
-}
-
-async function wireDragDrop(app: App, dropTarget: HTMLElement, hooks: DropHooks): Promise<void> {
+async function wireDragDrop(app: App, dropTarget: HTMLElement): Promise<void> {
   if (isTauriRuntime()) {
     const { getCurrentWebview } = await import("@tauri-apps/api/webview");
     const { readFile } = await import("@tauri-apps/plugin-fs");
@@ -348,51 +237,33 @@ async function wireDragDrop(app: App, dropTarget: HTMLElement, hooks: DropHooks)
         const path = event.payload.paths[0];
         if (!path) return;
         if (RECOG_EXT_RE.test(path)) {
-          // 拖入图片 → 本地 OMR 识别，完成后默认显示可编辑的排版结果。
+          // 拖入图片 → 本地 OMR 识别并自动进识别模式叠加核对。
           const bytes = await readFile(path);
-          hooks.onRecognitionStart();
-          let success = false;
-          try {
-            success = await app.recognizeBytes("musicpp", { bytes, path });
-          } finally {
-            hooks.onRecognitionDone(success);
-          }
+          await app.recognizeBytes("musicpp", { bytes, path });
+          app.setImportedFileSource(path);
           return;
         }
-        if (!/\.(jpwabc|xml|musicxml|abc)$/i.test(path)) return;
+        if (!/\.(jpwabc|txt|keyscore|numscore|kps|nps|mid|midi|xml|musicxml|abc)$/i.test(path)) return;
         const bytes = await readFile(path);
-        app.importBytes(bytes, path);
-        if (!/\.(xml|musicxml|abc)$/i.test(path)) app.filePath = path;
-        app.rememberLastFile(path);
-        hooks.onOpened();
+        await app.importBytes(bytes, path);
+        app.setImportedFileSource(path);
+        if (!/\.(mid|midi)$/i.test(path)) app.rememberLastFile(path);
       }
     });
   } else {
-    dropTarget.addEventListener("dragover", (e) => {
-      e.preventDefault();
-      dropTarget.classList.add("drag-active");
-    });
-    dropTarget.addEventListener("dragleave", (e) => {
-      if (!dropTarget.contains(e.relatedTarget as Node | null)) dropTarget.classList.remove("drag-active");
-    });
+    dropTarget.addEventListener("dragover", (e) => e.preventDefault());
     dropTarget.addEventListener("drop", async (e) => {
       e.preventDefault();
-      dropTarget.classList.remove("drag-active");
       const file = e.dataTransfer?.files?.[0];
       if (!file) return;
       const buf = new Uint8Array(await file.arrayBuffer());
       if (RECOG_EXT_RE.test(file.name) || file.type.startsWith("image/")) {
-        hooks.onRecognitionStart();
-        let success = false;
-        try {
-          success = await app.recognizeBytes("musicpp", { bytes: buf, mime: file.type, path: null });
-        } finally {
-          hooks.onRecognitionDone(success);
-        }
+        await app.recognizeBytes("musicpp", { bytes: buf, mime: file.type, path: null });
+        app.setImportedFileSource(file.name);
         return;
       }
-      app.importBytes(buf, file.name);
-      hooks.onOpened();
+      await app.importBytes(buf, file.name);
+      app.setImportedFileSource(file.name);
     });
   }
 }

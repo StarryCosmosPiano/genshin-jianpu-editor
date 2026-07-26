@@ -60,8 +60,8 @@ await page.evaluate(async (xml) => {
             position:relative">1<span style="position:absolute;bottom:13px;width:26px;height:4px;
             border-radius:2px;background:#fff"></span></div>
         <div>
-          <div style="font-size:46px;font-weight:800;color:#1a202c;line-height:1.1">简谱编辑器 jpeditor</div>
-          <div style="font-size:23px;color:#4a5568;margin-top:6px">在线简谱排版与编辑 · 简谱·五线谱混排 · MusicXML 导入 · 导出 PDF/PNG/MIDI/PPTX</div>
+          <div style="font-size:46px;font-weight:800;color:#1a202c;line-height:1.1">原琴简谱编辑器</div>
+          <div style="font-size:23px;color:#4a5568;margin-top:6px">Genshin Jianpu Editor · MIDI 转简谱 · 键盘谱 · SVG 排版与多格式导出</div>
         </div>
       </div>
       <div style="flex:1;margin:20px 56px 44px;background:#fff;border:1px solid #d6e0ef;
@@ -78,10 +78,17 @@ await page.evaluate(async (xml) => {
   const inner = document.querySelector("#og-score svg");
   if (inner) {
     inner.style.flex = "none";
-    const r = inner.getBoundingClientRect();
-    const s = Math.min(1040 / r.width, 386 / r.height); // fit within the clipping holder
-    inner.style.transformOrigin = "center";
-    inner.style.transform = `scale(${s})`;
+    // Social cards need the engraved header and first systems, not the blank
+    // lower half and page number of an A4 sheet.
+    const viewBox = inner.viewBox.baseVal;
+    const cropHeight = Math.min(viewBox.height, viewBox.width * 0.62);
+    inner.setAttribute("viewBox", `${viewBox.x} ${viewBox.y} ${viewBox.width} ${cropHeight}`);
+    inner.setAttribute("preserveAspectRatio", "xMidYMid meet");
+    inner.style.position = "static";
+    inner.style.inset = "auto";
+    inner.style.display = "block";
+    inner.style.width = "100%";
+    inner.style.height = "100%";
   }
 }, xmlText);
 

@@ -1,0 +1,14 @@
+// 钢琴双手与数字和弦（常用示例）
+// .Voice.RH 是右手，.Voice.LH 是左手；相同序号的小节会自动上下配对。
+// 方括号中的音会在同一时刻纵向叠放，例如 [1'3'5'] 和 [1,3,5,]。
+.Title
+Title = {钢琴双手与数字和弦}
+Instrument = {钢琴}
+KeyAndMeters = {1=C,4/4}
+WordsByAndMusicBy = {jpeditor 示例}
+.Voice.RH
+1' 2' 3' 4' |[1'3'5']--- |$(true)
+5' 4' 3' 2' |[1'4'6']--- |]$(true,0,0,true)
+.Voice.LH
+1,- 5,- |[1,3,5,]--- |$(true)
+4,- 5,- |[1,4,6,]--- |]$(true,0,0,true)

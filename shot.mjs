@@ -1,7 +1,8 @@
 // Headless render/interaction check: serve dist/, load in Edge, optionally edit,
 // screenshot, and dump diagnostics.
-// Usage: node shot.mjs [outPng] [--edit] [--xml <path>]
+// Usage: node shot.mjs [outPng] [--edit] [--xml <path>] [--jpw <path>]
 //   --xml <path>   render MusicXML via MixedPainter instead of normal JP score
+//   --jpw <path>   replace the editor text before the normal JP render check
 import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
 import { extname, join, normalize } from "node:path";
@@ -34,17 +35,19 @@ const errors = [];
 page.on("console", (m) => { if (m.type() === "error") errors.push(m.text()); });
 page.on("pageerror", (e) => errors.push("pageerror: " + e.message));
 await page.goto(`http://localhost:${port}/`, { waitUntil: "networkidle" });
-// 新 UI 启动进开始页（#start-screen 覆盖层），揭开工作区以便截到谱面。
-await page.evaluate(() => {
-  document.getElementById("app")?.classList.remove("is-starting");
-  const ss = document.getElementById("start-screen");
-  if (ss) ss.hidden = true;
-});
 await page.waitForTimeout(700);
 
 // --xml mode: render MusicXML via MixedPainter
 const xmlArgIdx = process.argv.indexOf("--xml");
 const xmlPath = xmlArgIdx !== -1 ? process.argv[xmlArgIdx + 1] : null;
+const jpwArgIdx = process.argv.indexOf("--jpw");
+const jpwPath = jpwArgIdx !== -1 ? process.argv[jpwArgIdx + 1] : null;
+
+if (jpwPath && !xmlPath) {
+  const jpwText = await readFile(jpwPath, "utf-8");
+  await page.evaluate((text) => window.__app.setText(text), jpwText);
+  await page.waitForTimeout(500);
+}
 
 if (xmlPath) {
   const xmlText = await readFile(xmlPath, "utf-8");

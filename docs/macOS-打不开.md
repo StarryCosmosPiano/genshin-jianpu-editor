@@ -4,7 +4,7 @@
 **“jpeditor 已损坏，无法打开”** 或 **“无法验证开发者”**。这是正常现象，软件本身没坏，
 按下面任一步骤即可正常使用。
 
-**前提**：先把 `jpeditor.app` 拖进“应用程序”（Applications）文件夹。
+**前提**：先把 `Genshin Jianpu Editor.app` 拖进“应用程序”（Applications）文件夹。
 
 ## 方法一：一条命令（推荐，所有 macOS 版本通用）
 
@@ -16,28 +16,28 @@
 2. 把下面这一整行**原样复制**进终端，按回车：
 
    ```bash
-   xattr -cr /Applications/jpeditor.app
+   xattr -cr "/Applications/Genshin Jianpu Editor.app"
    ```
 
    - 这行命令的作用：清掉 macOS 给从网上下载的文件打的“隔离”标记，让系统不再拦截。
      它只针对这一个应用，安全无副作用。
    - 如果你没有把应用放进“应用程序”文件夹，就把命令末尾的
-     `/Applications/jpeditor.app` 换成它实际所在的位置
+     `/Applications/Genshin Jianpu Editor.app` 换成它实际所在的位置
      （最简单的办法：在终端里先敲 `xattr -cr ` 再加一个空格，
-     然后把 `jpeditor.app` 图标直接拖进终端窗口，路径会自动填好），再按回车。
-3. 回车后没有任何提示就代表成功了。现在双击 `jpeditor.app` 即可正常打开。
+     然后把 `Genshin Jianpu Editor.app` 图标直接拖进终端窗口，路径会自动填好），再按回车。
+3. 回车后没有任何提示就代表成功了。现在双击 `Genshin Jianpu Editor.app` 即可正常打开。
 
 ## 方法二：不用终端（仅较老系统可靠，按版本二选一）
 
 **macOS 14（Sonoma）及更早**——右键打开：
 
-1. 在“应用程序”文件夹里找到 `jpeditor.app`。
+1. 在“应用程序”文件夹里找到 `Genshin Jianpu Editor.app`。
 2. **按住 Control 键并点击**（或用触控板“右键单击”）它，在菜单里选 **“打开”**。
 3. 弹出的警告窗口这次会多出一个 **“打开”** 按钮，点它即可。只需做一次。
 
 **macOS 15（Sequoia）/ 26（Tahoe）**——苹果已移除“右键打开”，改走系统设置：
 
-1. 先正常双击一次 `jpeditor.app`，让它被系统拦下（看到警告点“完成/取消”即可）。
+1. 先正常双击一次 `Genshin Jianpu Editor.app`，让它被系统拦下（看到警告点“完成/取消”即可）。
 2. 打开 **系统设置 → 隐私与安全性**，下拉到底部，若看到一行
    “已阻止 jpeditor 使用……”，点旁边的 **“仍要打开”**，再输入管理员密码确认。
 
@@ -47,4 +47,4 @@
 
 ---
 
-> 不想折腾安装？也可以直接用浏览器在线版：<https://lodebar2026.github.io/jpeditor/>
+> 不想折腾安装？也可以直接用浏览器在线版：<https://starrycosmospiano.github.io/genshin-jianpu-editor/>

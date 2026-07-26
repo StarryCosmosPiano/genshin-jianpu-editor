@@ -6,11 +6,36 @@ import { Fraction } from "../common/fraction";
 import { Point, Rect, Matrix33, newMatrix, Colors } from "../common/geom";
 import { pathTightBounds } from "../common/measure";
 import { Font } from "./font";
+import { normalizeEngravingStyle, type EngravingStyle } from "./style";
+import {
+  buildMeasureLayout,
+  packMeasureSystems,
+  type MeasureLayout as HorizontalMeasureLayout,
+  type RhythmColumnKind,
+  type RhythmItem,
+} from "./horizontal";
 import { MetaData, GlyphCodes } from "../smufl/smufl";
 import * as S from "../score/score";
 
 function getOrNull<T>(arr: T[], i: number): T | null {
   return i >= 0 && i < arr.length ? arr[i] : null;
+}
+
+function continuationColor(color: number, continuation: boolean): number {
+  if (!continuation) return color;
+  const alpha = (color >>> 24) & 0xff;
+  const fade = (channel: number) => Math.round(channel + (255 - channel) * 0.58);
+  const red = fade((color >>> 16) & 0xff);
+  const green = fade((color >>> 8) & 0xff);
+  const blue = fade(color & 0xff);
+  return ((alpha << 24) | (red << 16) | (green << 8) | blue) >>> 0;
+}
+
+function fadeTiedContinuation(chord: S.Chord, options: LayoutOptions, note?: S.Note): boolean {
+  if (!options.engravingStyle.tieContinuationGray) return false;
+  if (chord.transparentContinuation) return true;
+  if (note) return note.tieEnd && note.tiePrev !== null;
+  return chord.notes.some((item) => item.tieEnd && item.tiePrev !== null);
 }
 
 export function pointRotate(p: Point, cos: number, sin: number): Point {
@@ -29,6 +54,8 @@ export class PageItem {
   data: unknown = null;
   _selected = false;
   selectable = false;
+  /** Decorative annotations may draw outside their owner without changing flow/pagination. */
+  affectsLayout = true;
 
   get selected(): boolean {
     return this._selected;
@@ -89,6 +116,7 @@ export class PageItem {
   get childrenBound(): Rect {
     let r = new Rect();
     for (const ch of this.children) {
+      if (!ch.affectsLayout) continue;
       let rr = ch instanceof Group ? ch.childrenBound : ch.bound;
       rr = rr.offset(ch.x, ch.y);
       r = r.union(rr);
@@ -100,6 +128,7 @@ export class PageItem {
     let r = new Rect();
     for (const ch of this.children) {
       ch.update();
+      if (!ch.affectsLayout) continue;
       let rr1 = ch.bound;
       rr1 = rr1.offset(ch.x, ch.y);
       r = r.union(rr1);
@@ -186,33 +215,39 @@ export class GraphicPath extends PageItem {
 
 export class Group extends PageItem {
   get minY(): number | null {
-    if (this.children.length === 0) return null;
-    return this.children.reduce((m, c) => (c.y < m.y ? c : m)).y;
+    const children = this.children.filter((child) => child.affectsLayout);
+    if (children.length === 0) return null;
+    return children.reduce((m, c) => (c.y < m.y ? c : m)).y;
   }
   get minX(): number | null {
-    if (this.children.length === 0) return null;
-    return this.children.reduce((m, c) => (c.x < m.x ? c : m)).x;
+    const children = this.children.filter((child) => child.affectsLayout);
+    if (children.length === 0) return null;
+    return children.reduce((m, c) => (c.x < m.x ? c : m)).x;
   }
   get maxX(): number | null {
-    if (this.children.length === 0) return null;
-    const it = this.children.reduce((m, c) => (c.x + c.width > m.x + m.width ? c : m));
+    const children = this.children.filter((child) => child.affectsLayout);
+    if (children.length === 0) return null;
+    const it = children.reduce((m, c) => (c.x + c.width > m.x + m.width ? c : m));
     return it.x + it.width;
   }
   get maxY(): number | null {
-    if (this.children.length === 0) return null;
-    const it = this.children.reduce((m, c) => (c.y + c.height > m.y + m.height ? c : m));
+    const children = this.children.filter((child) => child.affectsLayout);
+    if (children.length === 0) return null;
+    const it = children.reduce((m, c) => (c.y + c.height > m.y + m.height ? c : m));
     return it.y + it.height;
   }
 
   normalizeX(): void {
     if (this.children.length === 0) return;
-    const mx = this.minX!;
+    const mx = this.minX;
+    if (mx === null) return;
     for (const it of this.children) it.x -= mx;
     this.x += mx;
   }
   normalizeY(): void {
     if (this.children.length === 0) return;
-    const mx = this.minY!;
+    const mx = this.minY;
+    if (mx === null) return;
     for (const it of this.children) it.y -= mx;
     this.y += mx;
   }
@@ -234,6 +269,9 @@ export class Group extends PageItem {
 export class TextFrame extends PageItem {
   text = "";
   color = Colors.black;
+  strokeColor = Colors.black;
+  strokeWidth = 0;
+  nonScalingStroke = false;
   font!: Font;
   previous: TextFrame | null = null;
   next: TextFrame | null = null;
@@ -292,15 +330,22 @@ export class SmuflText extends TextFrame {
   }
 }
 
-export class JpOctaveDot extends TextFrame {
-  constructor() {
+export class JpOctaveDot extends GraphicPath {
+  owner: JpNumber | null = null;
+
+  constructor(radius: number, color: number) {
     super();
-    this.text = ".";
     this.selectable = true;
-  }
-  override get bound(): Rect {
-    const bnd = LayoutOptions.charBound(this.font, this.text[0]);
-    return new Rect(0, bnd.top, this.width, bnd.bottom);
+    this.fill = true;
+    this.fillColor = color;
+    const d = radius * 2;
+    const k = radius * 0.5522847498;
+    this.moveTo(d, radius);
+    this.cubicTo(d, radius + k, radius + k, d, radius, d);
+    this.cubicTo(radius - k, d, 0, radius + k, 0, radius);
+    this.cubicTo(0, radius - k, radius - k, 0, radius, 0);
+    this.cubicTo(radius + k, 0, d, radius - k, d, radius);
+    this.close();
   }
 }
 
@@ -320,7 +365,7 @@ export class JpNumber extends TextFrame {
   }
   get numberPos(): number {
     let end = this.text.length;
-    if (this.text.endsWith("·")) end--;
+    while (end > 0 && this.text[end - 1] === "·") end--;
     return this.measureText(0, end);
   }
   override get bound(): Rect {
@@ -431,6 +476,16 @@ export abstract class Entry {
   group = new Group();
   selected = false;
   line!: Line;
+  /** Shared rhythmic anchor used to align right/left-hand piano entries. */
+  syncMeasure = -1;
+  /** Original score measure index, independent of repeat-flow position. */
+  syncSourceMeasure = -1;
+  syncTick = new Fraction(0);
+  syncOrder = 0;
+  syncBeats = 4;
+  syncBeatType = 4;
+  syncPickup = false;
+  syncDisplayNumber: number | null = null;
   constructor() {
     this.group.classes.add("entry");
   }
@@ -525,10 +580,14 @@ export class NoteEntry extends Entry {
   verse = 0; // repeat pass / lyric verse this rendered entry belongs to
   lrc: Lyric | null = null;
   number: JpNumber | null = null;
+  numbers: JpNumber[] = [];
   accidental: TextFrame | null = null;
   beams = 0;
   octaveDot: JpOctaveDot[] = [];
   notations: SmuflText[] = [];
+  /** Selectable visual group for each non-metrical grace note. */
+  graceItems = new Map<S.Note, Group>();
+  private rowYs: number[] = [];
 
   constructor() {
     super();
@@ -546,7 +605,8 @@ export class NoteEntry extends Entry {
   }
   add(item: JpNumber | Lyric): void {
     if (item instanceof JpNumber) {
-      this.number = item;
+      if (this.number === null) this.number = item;
+      this.numbers.push(item);
       this.group.add(item);
     } else {
       this.lrc = item;
@@ -575,32 +635,86 @@ export class NoteEntry extends Entry {
     if (this.chord.notes[0].tieEnd) return true;
     return false;
   }
-  entryTop(opt: LayoutOptions): number {
-    const nt = this.chord.notes[0];
-    const bnd = opt.numberBound("1");
-    const dotBnd = opt.numberBound(".");
-    let ypos = bnd.top;
-    if (nt.jpOctave > 0) {
-      ypos -= (nt.jpOctave + 0.5) * dotBnd.height * 1.5;
+
+  private static noteTop(nt: S.Note, opt: LayoutOptions): number {
+    const numberTop = opt.numberBound(nt.number || "1").top;
+    if (nt.jpOctave <= 0) return numberTop;
+    const diameter = opt.octaveDotDiameter();
+    const gap = opt.octaveDotGap();
+    return numberTop - gap - nt.jpOctave * diameter - (nt.jpOctave - 1) * gap;
+  }
+
+  private static noteBottom(nt: S.Note, ch: S.Chord, opt: LayoutOptions): number {
+    const numberBottom = opt.numberBound(nt.number || "1").bottom;
+    if (nt.jpOctave >= 0) return Math.max(numberBottom, ch.beams * opt.jpBeamDist);
+    const diameter = opt.octaveDotDiameter();
+    const gap = opt.octaveDotGap();
+    const count = -nt.jpOctave;
+    const anchor = Math.max(numberBottom, ch.beams * opt.jpBeamDist);
+    return anchor + gap + count * diameter + (count - 1) * gap;
+  }
+
+  /** Bottom chord tone stays on the rhythmic baseline; upper tones grow upward. */
+  private static chordRowYs(notes: S.Note[], ch: S.Chord, opt: LayoutOptions): number[] {
+    if (notes.length === 0) return [];
+    const rows = [0];
+    const baseGap = opt.numberSize * opt.engravingStyle.chordRowGap;
+    // Keep an independently adjustable blank band between an octave dot and
+    // the neighbouring chord tone.  The dot-to-owner gap stays small, while
+    // this band makes it visually unambiguous which row owns the dot.
+    const clearance = opt.numberSize * 0.12 * opt.engravingStyle.octaveDotClearance;
+    for (let i = 1; i < notes.length; i++) {
+      const occupied = NoteEntry.noteBottom(notes[i - 1], ch, opt)
+        - NoteEntry.noteTop(notes[i], opt)
+        + clearance;
+      rows.push(rows[i - 1] + Math.max(baseGap, occupied));
     }
+    const bottomBaseline = rows[rows.length - 1];
+    return rows.map((row) => row - bottomBaseline);
+  }
+
+  entryTop(opt: LayoutOptions): number {
+    const bnd = opt.numberBound("1");
+    if (this.numbers.length !== this.chord.notes.length) return bnd.top - opt.numberSize / 8;
+    let ypos = Number.POSITIVE_INFINITY;
+    for (let i = 0; i < this.chord.notes.length; i++) {
+      const nt = this.chord.notes[i];
+      const top = (this.rowYs[i] ?? 0) + NoteEntry.noteTop(nt, opt);
+      ypos = Math.min(ypos, top);
+    }
+    if (!Number.isFinite(ypos)) ypos = bnd.top;
     return ypos - opt.numberSize / 8;
   }
   entryBottom(options: LayoutOptions): number {
-    const oct = this.chord.notes[0].jpOctave;
+    if (this.numbers.length !== this.chord.notes.length) {
+      return Math.max(options.numberBound("1").bottom, this.chord.beams * options.jpBeamDist);
+    }
     let y = this.chord.beams * options.jpBeamDist;
-    if (oct < 0) {
-      const numSize = options.numberFont.size;
-      y += numSize * ((-oct - 1) * 0.175 + 0.25);
-      y += numSize / 4;
+    for (let i = 0; i < this.chord.notes.length; i++) {
+      const nt = this.chord.notes[i];
+      const bottom = (this.rowYs[i] ?? 0) + NoteEntry.noteBottom(nt, this.chord, options);
+      y = Math.max(y, bottom);
     }
     return y;
   }
 
-  static addAccidental(it: JpNumber, options: LayoutOptions, ch: S.Chord, ent: NoteEntry): void {
-    const alt = ch.notes[0].jpAlter;
+  static addAccidental(
+    it: JpNumber,
+    options: LayoutOptions,
+    nt: S.Note,
+    ent: NoteEntry,
+    rowY = 0,
+  ): void {
+    const alt = nt.jpAlter;
     if (alt !== " ") {
       const tf = new SmuflText(options);
-      tf.color = options.color;
+      tf.classes.add("jianpu-accidental");
+      tf.classes.add(alt === "b"
+        ? "jianpu-accidental-flat"
+        : alt === "#"
+          ? "jianpu-accidental-sharp"
+          : "jianpu-accidental-natural");
+      tf.color = continuationColor(options.color, fadeTiedContinuation(ent.chord, options, nt));
       if (options.smuflAsPath) tf.asPath = true;
       let smufl: string;
       switch (alt) {
@@ -611,31 +725,41 @@ export class NoteEntry extends Entry {
       }
       const yOffset = alt === "b" ? 0.1 : 0; // 简谱中降号下移
       tf.text = smufl;
-      const kernMap: Record<string, number> = { "4": 0.1, "2": -0.07, "1": -0.07 };
-      let xx = -tf.font.size * 0.2;
-      xx += (kernMap[it.text[0]] ?? 0) * tf.font.size;
+      tf.font = tf.font.makeWithSize(tf.font.size * 0.8 * options.engravingStyle.accidentalScale);
+      tf.update();
+      const gap = options.numberSize * 0.14 * options.engravingStyle.accidentalGapScale;
+      tf.x = it.x + it.bound.left - gap - tf.bound.right;
       const numBnd = options.numberBound("1");
-      let yy = numBnd.top;
-      yy += options.smuflFont.size * yOffset;
-      const sc = 0.8;
-      tf.matrix.setAffine([sc, 0, 0, sc, xx * sc, yy]);
+      tf.y = rowY + numBnd.top + tf.font.size * yOffset;
       ent.addAccidental(tf);
     }
   }
-  static octaveDot(ch: S.Chord, options: LayoutOptions, ent: NoteEntry): void {
-    const oct = ch.notes[0].jpOctave;
-    const numBound = options.numberBound("1");
-    const dotBound = options.numberBound(".");
+  static octaveDot(
+    nt: S.Note,
+    ch: S.Chord,
+    options: LayoutOptions,
+    ent: NoteEntry,
+    owner: JpNumber,
+    rowY = 0,
+  ): void {
+    const oct = nt.jpOctave;
+    // Digits do not all share exactly the same tight top/bottom bounds.  Use
+    // the owning digit instead of the former generic "1", so an upper or
+    // lower dot hugs the number it actually belongs to.
+    const numBound = options.numberBound(nt.number || "1");
+    const diameter = options.octaveDotDiameter();
+    const gap = options.octaveDotGap();
     for (let d = 0; d < Math.abs(oct); d++) {
-      const tf = new JpOctaveDot();
-      tf.font = options.numberFont;
-      tf.color = options.color;
-      const numSize = options.numberFont.size;
-      if (oct >= 0) {
-        tf.y = numBound.top - (d + 0.5) * dotBound.height * 1.5;
+      const color = continuationColor(options.color, fadeTiedContinuation(ent.chord, options, nt));
+      const tf = new JpOctaveDot(diameter / 2, color);
+      tf.owner = owner;
+      tf.update();
+      tf.x = owner.x + owner.cx - tf.width / 2;
+      if (oct > 0) {
+        tf.y = rowY + numBound.top - gap - diameter - d * (diameter + gap);
       } else {
-        tf.y = numSize * (d * 0.175 + 0.25);
-        tf.y += ch.beams * options.jpBeamDist;
+        const anchor = Math.max(numBound.bottom, ch.beams * options.jpBeamDist);
+        tf.y = rowY + anchor + gap + d * (diameter + gap);
       }
       ent.group.add(tf);
       ent.octaveDot.push(tf);
@@ -682,23 +806,250 @@ export class NoteEntry extends Entry {
       ent.notations.push(t);
     }
   }
+
+  private static addArpeggio(
+    ch: S.Chord,
+    options: LayoutOptions,
+    ent: NoteEntry,
+  ): number {
+    const existingLeft = Math.min(0, ...ent.group.children.map((child) => child.x));
+    if (!ch.arpeggio) return existingLeft;
+    const pitchRange = ch.arpeggioPitches?.length
+      ? new Set(ch.arpeggioPitches)
+      : null;
+    const coveredRows = ch.notes.flatMap((note, index) =>
+      !note.rest && (!pitchRange || pitchRange.has(note.pitch)) ? [index] : []);
+    if (coveredRows.length < 2) return existingLeft;
+
+    let top = Number.POSITIVE_INFINITY;
+    let bottom = Number.NEGATIVE_INFINITY;
+    for (const index of coveredRows) {
+      const note = ch.notes[index];
+      const rowY = ent.rowYs[index] ?? 0;
+      top = Math.min(top, rowY + NoteEntry.noteTop(note, options));
+      bottom = Math.max(bottom, rowY + NoteEntry.noteBottom(note, ch, options));
+    }
+    if (!Number.isFinite(top) || !Number.isFinite(bottom)) return existingLeft;
+    if (bottom - top < options.numberSize * 0.72) {
+      const center = (top + bottom) / 2;
+      top = center - options.numberSize * 0.36;
+      bottom = center + options.numberSize * 0.36;
+    }
+
+    const amplitude = Math.max(1.5, options.numberSize * 0.055);
+    const halfWave = Math.max(3, options.numberSize * 0.12);
+    const gap = options.numberSize * 0.12;
+    const centerX = existingLeft - gap - amplitude;
+    const path = new GraphicPath();
+    path.classes.add("jianpu-arpeggio");
+    path.stroke = true;
+    path.fill = false;
+    path.strokeColor = options.color;
+    path.strokeWidth = Math.max(1, options.numberSize * 0.035);
+    path.moveTo(centerX, top);
+    let y = top;
+    let direction = 1;
+    while (y < bottom - 1e-6) {
+      const next = Math.min(bottom, y + halfWave);
+      const dy = next - y;
+      path.cubicTo(
+        centerX + amplitude * direction, y + dy * 0.22,
+        centerX + amplitude * direction, y + dy * 0.78,
+        centerX, next,
+      );
+      direction *= -1;
+      y = next;
+    }
+    ent.group.add(path);
+    return centerX - amplitude;
+  }
+
+  private static addGraceNotes(
+    ch: S.Chord,
+    options: LayoutOptions,
+    ent: NoteEntry,
+    leftEdge: number,
+  ): void {
+    if (ch.graceNotes.length === 0) return;
+    const group = new Group();
+    group.classes.add("jianpu-grace-group");
+    const font = options.numberFont.scaled(0.56);
+    const gap = options.numberSize * 0.08;
+    const diameter = Math.max(0.5, options.octaveDotDiameter() * 0.62);
+    const mainNumber = ent.number;
+    if (!mainNumber) return;
+    const mainPosition = mainNumber.pos(ent.group);
+    const mainBound = options.numberBound(ch.notes[0]?.number || "1");
+    // Keep the small digit fully above the main note: its visual bottom sits
+    // on the same horizontal line as the main digit's visual top.
+    const graceBottom = mainPosition.y + mainBound.top;
+    let cursor = 0;
+    let firstBeamX = Number.POSITIVE_INFINITY;
+    let lastBeamX = Number.NEGATIVE_INFINITY;
+    let contentBottom = Number.NEGATIVE_INFINITY;
+    const graceNumbers: JpNumber[] = [];
+
+    ch.graceNotes.forEach((note, index) => {
+      const noteGroup = new Group();
+      noteGroup.data = note;
+      noteGroup.selectable = true;
+      noteGroup.classes.add("jianpu-grace-note");
+      const number = new JpNumber();
+      number.classes.add("jianpu-grace-number");
+      number.text = note.number;
+      number.font = font;
+      number.color = options.color;
+      const numberBound = LayoutOptions.charBound(font, note.number || "1");
+      number.y = graceBottom - numberBound.bottom;
+      number.update();
+      noteGroup.add(number);
+
+      if (note.jpAlter !== " ") {
+        const accidental = new SmuflText(options);
+        accidental.classes.add("jianpu-grace-accidental");
+        accidental.color = options.color;
+        accidental.font = options.smuflFont.makeWithSize(font.size * 0.72);
+        accidental.text = note.jpAlter === "b"
+          ? GlyphCodes.accidentalFlat
+          : note.jpAlter === "#"
+            ? GlyphCodes.accidentalSharp
+            : GlyphCodes.accidentalNatural;
+        accidental.update();
+        accidental.x = number.x - accidental.width - gap * 0.35;
+        accidental.y = number.y;
+        noteGroup.add(accidental);
+      }
+
+      for (let dotIndex = 0; dotIndex < Math.abs(note.jpOctave); dotIndex++) {
+        const dot = new JpOctaveDot(diameter / 2, options.color);
+        dot.owner = number;
+        dot.update();
+        dot.x = number.x + number.cx - dot.width / 2;
+        const dotGap = Math.max(0.4, options.octaveDotGap() * 0.62);
+        if (note.jpOctave > 0) {
+          dot.y = number.y + numberBound.top -
+            dotGap - diameter - dotIndex * (diameter + dotGap);
+        } else {
+          dot.y = number.y + numberBound.bottom +
+            dotGap + dotIndex * (diameter + dotGap);
+        }
+        noteGroup.add(dot);
+      }
+
+      noteGroup.update();
+      noteGroup.x = cursor;
+      group.add(noteGroup);
+      ent.graceItems.set(note, noteGroup);
+      graceNumbers.push(number);
+      const numberX = noteGroup.x + number.x;
+      if (index === 0) firstBeamX = numberX;
+      lastBeamX = numberX + number.width;
+      contentBottom = Math.max(contentBottom, noteGroup.y + noteGroup.height);
+      cursor += noteGroup.width + gap;
+    });
+
+    const beamGap = Math.max(1.4, options.jpBeamDist * 0.52);
+    const firstBeamY = contentBottom + beamGap * 0.7;
+    const graceBeams: GraphicLine[] = [];
+    for (let level = 0; level < 2; level++) {
+      const beam = new GraphicLine();
+      beam.data = ch.graceNotes[ch.graceNotes.length - 1];
+      beam.selectable = true;
+      beam.classes.add("jianpu-grace-beam");
+      beam.strokeColor = options.color;
+      beam.strokeWidth = Math.max(1, options.numberSize * 0.032);
+      beam.p0 = new Point(firstBeamX, firstBeamY + level * beamGap);
+      beam.p1 = new Point(lastBeamX, firstBeamY + level * beamGap);
+      group.add(beam);
+      graceBeams.push(beam);
+    }
+
+    group.update();
+    const graceToMainGap = options.numberSize * 0.42;
+    group.x = leftEdge - graceToMainGap - group.width;
+    ent.group.add(group);
+
+    // Compact grace-note link: leave from beneath the grace digit's lower beam
+    // and meet the vertical middle of the main digit.
+    const lastNote = ch.graceNotes[ch.graceNotes.length - 1];
+    const lastNumber = graceNumbers[graceNumbers.length - 1];
+    const lowerBeam = graceBeams[graceBeams.length - 1];
+    if (lastNote && lastNumber && lowerBeam && mainNumber) {
+      const lowerBeamPosition = lowerBeam.pos(ent.group);
+      const lastNumberPosition = lastNumber.pos(ent.group);
+      const startX = Math.max(
+        lowerBeamPosition.x + lowerBeam.width * 0.64,
+        lastNumberPosition.x + lastNumber.width * 0.58,
+      );
+      const startY = lowerBeamPosition.y + lowerBeam.height +
+        Math.max(0.45, options.numberSize * 0.025);
+      const endX = mainPosition.x + mainNumber.bound.left - options.numberSize * 0.035;
+      if (endX > startX + options.numberSize * 0.05) {
+        const endY = mainPosition.y + (mainBound.top + mainBound.bottom) / 2;
+        const span = endX - startX;
+        const drop = Math.max(0, endY - startY);
+        const radius = Math.min(
+          options.numberSize * 0.09,
+          span * 0.22,
+          Math.max(options.numberSize * 0.035, drop * 0.42),
+        );
+        const link = new GraphicPath();
+        link.data = lastNote;
+        link.selectable = true;
+        link.classes.add("jianpu-grace-link");
+        link.stroke = true;
+        link.fill = false;
+        link.strokeColor = options.color;
+        link.strokeWidth = Math.max(1, options.numberSize * 0.032);
+        link.moveTo(startX, startY);
+        // Curved L: descend first, then sweep right.  Both legs bow slightly
+        // so the link reads as one continuous musical gesture rather than two
+        // straight segments joined at a mechanical corner.
+        link.cubicTo(
+          startX - radius * 0.22, startY + drop * 0.44,
+          startX - radius * 0.08, endY - radius * 0.72,
+          startX + radius, endY - radius * 0.08,
+        );
+        link.cubicTo(
+          startX + radius * 1.75, endY + radius * 0.18,
+          endX - span * 0.28, endY + radius * 0.14,
+          endX, endY,
+        );
+        ent.group.add(link);
+      }
+    }
+  }
+
   static fromChord(res: Entry[], ch: S.Chord, lrc: number, options: LayoutOptions): void {
     let ent = new NoteEntry();
     ent.beams = ch.beams;
     ent.chord = ch;
     ent.verse = lrc;
-    let it = new JpNumber();
-    it.color = options.color;
-    it.text = ch.notes[0].number;
-    it.font = options.numberFont;
-    ent.add(it);
-    NoteEntry.addAccidental(it, options, ch, ent);
-    if (ch.beats <= 1) {
-      for (let d = 0; d < ch.dot; d++) it.text += "·";
+    const notes = ch.notes.length > 0 ? ch.notes : [];
+    ent.rowYs = NoteEntry.chordRowYs(notes, ch, options);
+    let it: JpNumber | null = null;
+    for (let i = 0; i < notes.length; i++) {
+      const nt = notes[i];
+      const num = new JpNumber();
+      num.color = continuationColor(options.color, fadeTiedContinuation(ch, options, nt));
+      num.text = nt.number;
+      num.font = options.numberFont;
+      const rowY = ent.rowYs[i] ?? 0;
+      num.y = rowY;
+      ent.add(num);
+      NoteEntry.addAccidental(num, options, nt, ent, rowY);
+      NoteEntry.octaveDot(nt, ch, options, ent, num, rowY);
+      if (i === 0) it = num;
     }
-    NoteEntry.octaveDot(ch, options, ent);
+    if (!it) throw new Error("chord without notes");
+    if (ch.beats <= 1 && ch.dot > 0) {
+      const augmentationDots = "·".repeat(ch.dot);
+      for (const number of ent.numbers) number.text += augmentationDots;
+    }
     NoteEntry.addLyric(ch, options, ent, it, lrc);
     NoteEntry.addNotations(ch, options, ent);
+    const ornamentLeft = NoteEntry.addArpeggio(ch, options, ent);
+    NoteEntry.addGraceNotes(ch, options, ent, ornamentLeft);
     ent.update();
     res.push(ent);
     for (let i = 1; i < ch.beats; i++) {
@@ -708,7 +1059,7 @@ export class NoteEntry extends Entry {
       const num = ch.rest ? "0" : "-";
       it = new JpNumber();
       it.text = num;
-      it.color = options.color;
+      it.color = continuationColor(options.color, fadeTiedContinuation(ch, options));
       it.font = options.numberFont;
       ent.add(it);
       ent.update();
@@ -723,11 +1074,11 @@ export class Barline extends Entry {
     this.group.data = this;
     const top = (-opt.numberSize * 23) / 28;
     const bot = (opt.numberSize * 5) / 28;
-    const heavyWidth = 3.5;
+    const style = opt.engravingStyle;
+    const heavyWidth = style.finalBarlineWidth;
     const res = this.group;
-    const widths = [1.5];
-    if (final) widths.push(heavyWidth);
-    const dist = heavyWidth;
+    const widths = final ? [heavyWidth, heavyWidth] : [style.barlineWidth];
+    const dist = final ? style.finalBarlineGap : heavyWidth;
     let xpos = 0;
     for (const w of widths) {
       const l = new GraphicLine();
@@ -785,6 +1136,200 @@ export class BeamLine extends GraphicLine {
 
 // ---------------- Line / layout ----------------
 
+function entryRhythmAnchor(e: Entry): number {
+  const item = e.entryItem();
+  if (item === null) return e.group.width / 2;
+  if (e instanceof NoteEntry && e.number) return item.x + e.number.cx;
+  return item.x + item.width / 2;
+}
+
+function entryRhythmKind(e: Entry): RhythmColumnKind {
+  if (e instanceof NoteEntry) return "note";
+  if (e instanceof Barline) return "barline";
+  if (e instanceof KeySig) return "key";
+  if (e instanceof TimeSig) return "time";
+  return "other";
+}
+
+function measuredRhythmItem(e: Entry): RhythmItem<Entry> {
+  e.update();
+  const anchor = entryRhythmAnchor(e);
+  return {
+    value: e,
+    tickKey: e.syncTick.toString(),
+    tick: e.syncTick.toFloat(),
+    order: e.syncOrder,
+    kind: entryRhythmKind(e),
+    left: Math.max(0, anchor),
+    right: Math.max(0, e.group.width - anchor),
+  };
+}
+
+function horizontalMeasureOptions(opt: LayoutOptions) {
+  const scale = opt.engravingStyle.noteGapScale;
+  return {
+    edgePadding: opt.numberSize * 0.12 * scale,
+    normalClearance: opt.numberSize * 0.08 * scale,
+    boundaryClearance: opt.numberSize * 0.16 * scale,
+    minimumElasticUnit: opt.numberSize * 0.14 * scale,
+    spacingExponent: opt.engravingStyle.rhythmicSpacingExponent,
+  };
+}
+
+function addSystemMeasureNumber(
+  target: Group,
+  x: number,
+  number: number | null,
+  opt: LayoutOptions,
+  contentTop = target.childrenBound.top,
+): void {
+  if (number === null) return;
+  const label = new TextFrame();
+  label.classes.add("measure-number");
+  label.affectsLayout = false;
+  label.text = `(${number})`;
+  label.font = opt.numberFont.scaled(0.48);
+  label.color = opt.color;
+  label.update();
+  label.x = x;
+  label.y = contentTop - opt.numberSize * 0.12 - label.font.metrics.descent;
+  target.add(label);
+}
+
+interface TempoPositionedEntry {
+  entry: Entry;
+  x: number;
+}
+
+function tempoMarkX(
+  mark: S.TempoMark,
+  positionedEntries: readonly TempoPositionedEntry[],
+): number | null {
+  const anchors = positionedEntries
+    .filter(({ entry }) =>
+      entry.syncSourceMeasure === mark.measure &&
+      (entry instanceof NoteEntry || entry instanceof Barline))
+    .map(({ entry, x }) => ({ tick: entry.syncTick.toFloat(), x }))
+    .sort((left, right) => left.tick - right.tick || left.x - right.x);
+  if (anchors.length === 0) return null;
+
+  const unique: Array<{ tick: number; x: number }> = [];
+  for (const anchor of anchors) {
+    const previous = unique[unique.length - 1];
+    if (previous && Math.abs(previous.tick - anchor.tick) < 1e-8) continue;
+    unique.push(anchor);
+  }
+  const tick = mark.offset.toFloat();
+  const exact = unique.find((anchor) => Math.abs(anchor.tick - tick) < 1e-8);
+  if (exact) return exact.x;
+  if (tick <= unique[0].tick) return unique[0].x;
+  if (tick >= unique[unique.length - 1].tick) return unique[unique.length - 1].x;
+  const rightIndex = unique.findIndex((anchor) => anchor.tick > tick);
+  if (rightIndex <= 0) return unique[0].x;
+  const left = unique[rightIndex - 1];
+  const right = unique[rightIndex];
+  const ratio = (tick - left.tick) / Math.max(1e-8, right.tick - left.tick);
+  return left.x + (right.x - left.x) * ratio;
+}
+
+function makeTempoMarker(mark: S.TempoMark, opt: LayoutOptions): Group {
+  const group = new Group();
+  group.data = mark;
+  group.selectable = true;
+  group.classes.add("tempo-annotation");
+  group.classes.add(`tempo-${mark.kind}`);
+  if (mark.kind === "tempo") {
+    const note = new SmuflText(opt);
+    note.text = mark.beatUnit === "eighth"
+      ? GlyphCodes.metNote8thUp
+      : GlyphCodes.metNoteQuarterUp;
+    // The publication header uses a full-height metronome note.  Keep later
+    // tempo changes at the same visible stem height instead of shrinking the
+    // SMuFL glyph together with the smaller BPM text.
+    note.font = opt.smuflFont.makeWithSize(opt.numberSize * 0.88);
+    note.color = opt.color;
+    note.update();
+    group.add(note);
+    let symbolRight = note.bound.right;
+    if (mark.beatUnit === "dotted-quarter") {
+      const dot = new TextFrame();
+      dot.text = "·";
+      dot.font = opt.lrcFont.scaled(0.34).withBold();
+      dot.color = opt.color;
+      dot.x = symbolRight + opt.numberSize * 0.01;
+      dot.y = -opt.numberSize * 0.01;
+      dot.update();
+      group.add(dot);
+      symbolRight = dot.x + dot.bound.right;
+    }
+
+    const value = new TextFrame();
+    value.text = `=${S.formatTempoBpm(S.tempoBpmForUnit(mark.bpm ?? 90, mark.beatUnit))}`;
+    value.font = opt.lrcFont.scaled(0.46);
+    value.color = opt.color;
+    value.update();
+    value.x = symbolRight + opt.numberSize * 0.08;
+    value.y = -opt.numberSize * 0.02;
+    group.add(value);
+  } else {
+    const text = new TextFrame();
+    text.text = mark.kind === "accel" ? "accel." : "rit.";
+    text.font = opt.lrcFont.scaled(0.46).withBold();
+    text.color = opt.color;
+    text.update();
+    group.add(text);
+  }
+  group.update();
+  return group;
+}
+
+function addTempoAnnotations(
+  target: Group,
+  marks: readonly S.TempoMark[],
+  positionedEntries: readonly TempoPositionedEntry[],
+  opt: LayoutOptions,
+  topFor: (mark: S.TempoMark, marker: Group) => number,
+): void {
+  const canonical: S.TempoMark[] = [];
+  for (const mark of marks) {
+    const existing = canonical.findIndex((item) =>
+      item.measure === mark.measure &&
+      item.offset.equals(mark.offset) &&
+      item.kind === mark.kind);
+    if (existing >= 0) canonical[existing] = mark;
+    else canonical.push(mark);
+  }
+
+  const placed: Array<{ left: number; right: number; top: number; bottom: number }> = [];
+  const horizontalGap = opt.numberSize * 0.1;
+  const verticalGap = opt.numberSize * 0.08;
+  for (const mark of canonical) {
+    const x = tempoMarkX(mark, positionedEntries);
+    if (x === null) continue;
+    const marker = makeTempoMarker(mark, opt);
+    marker.x = x - marker.width / 2;
+    let top = topFor(mark, marker);
+    for (let attempt = 0; attempt <= placed.length; attempt++) {
+      const collisions = placed.filter((item) =>
+        marker.x < item.right + horizontalGap &&
+        marker.x + marker.width > item.left - horizontalGap &&
+        top < item.bottom + verticalGap &&
+        top + marker.height > item.top - verticalGap);
+      if (collisions.length === 0) break;
+      top = Math.min(...collisions.map((item) =>
+        item.top - marker.height - verticalGap - 1e-6));
+    }
+    marker.y = top;
+    target.add(marker);
+    placed.push({
+      left: marker.x,
+      right: marker.x + marker.width,
+      top,
+      bottom: top + marker.height,
+    });
+  }
+}
+
 class EntryItemInfo {
   dist = 0;
   rate = 0;
@@ -802,7 +1347,7 @@ export class Line {
   maxBeamLevel = 0;
   chordEntry = new Map<S.Chord, NoteEntry>();
 
-  private addEntry(e: Entry): void {
+  addEntry(e: Entry): void {
     if (e instanceof NoteEntry) {
       if (e.number?.text === "-") {
         // beat-extension dash: not a chord anchor
@@ -815,6 +1360,10 @@ export class Line {
     e.line = this;
   }
 
+  addEntries(entries: Entry[]): void {
+    for (const e of entries) this.addEntry(e);
+  }
+
   private entryX(e: Entry): number {
     let res = e.group.x;
     const it = e.entryItem();
@@ -823,7 +1372,7 @@ export class Line {
     return res;
   }
 
-  private adjust(width: number, maxHorizontalScale: number): void {
+  private adjust(width: number, maxHorizontalScale: number, noteGapScale = 1): void {
     const infos: EntryItemInfo[] = [];
     let idx = 0;
     for (const e of this.entries) {
@@ -838,7 +1387,7 @@ export class Line {
       const it = new EntryItemInfo();
       it.entry = e;
       it.dist = dist;
-      it.rate = smallDist ? 2 : 1;
+      it.rate = smallDist ? 2 * noteGapScale : 1;
       if (next instanceof TimeSig) it.rate = 0.1;
       infos.push(it);
       idx++;
@@ -901,7 +1450,8 @@ export class Line {
     for (const e of this.entries) {
       if (e instanceof NoteEntry) {
         for (const dot of e.octaveDot) {
-          dot.x = e.number!.x + e.number!.cx - dot.width / 2;
+          const owner = dot.owner ?? e.number!;
+          dot.x = owner.x + owner.cx - dot.width / 2;
         }
       }
       e.group.x += offset;
@@ -921,7 +1471,7 @@ export class Line {
     if (space > 0) lastVisible.group.x += Math.min(space, maxDx - dx);
   }
 
-  private calcXPos(): void {
+  private calcXPos(opt: LayoutOptions): void {
     for (const e of this.entries) e.group.normalizeX();
     let curX = 0;
     this.entries.forEach((e, idx) => {
@@ -937,6 +1487,17 @@ export class Line {
       if (e instanceof TimeSig) curX += it!.height / 5;
       e.group.x = curX - x;
       curX += w;
+      const next = getOrNull(this.entries, idx + 1);
+      if (next && !(next instanceof LineBreak)) {
+        // Give the global horizontal-spacing control a real geometric effect
+        // in single-staff scores as well as paired piano systems. The previous
+        // implementation only changed justification weights, which could look
+        // identical once a line had already filled the page.
+        const nearBoundary = e instanceof Barline || next instanceof Barline ||
+          e instanceof TimeSig || next instanceof TimeSig || e instanceof KeySig || next instanceof KeySig;
+        const gap = opt.numberSize * (nearBoundary ? 0.16 : 0.11) * opt.engravingStyle.noteGapScale;
+        curX += gap;
+      }
     });
     curX = 0;
     let offset = 0;
@@ -959,6 +1520,7 @@ export class Line {
     let idx = 0;
     while (idx < this.entries.length) {
       let last = idx;
+      let preferred = -1;
       const grp = this.entries[idx].group;
       const l = grp.x;
       while (last < this.entries.length) {
@@ -969,9 +1531,14 @@ export class Line {
         }
         const r = lastGrp.x + (lastGrp.maxX ?? 0);
         if (r - l < width) {
+          if (this.entries[last] instanceof Barline) preferred = last + 1;
           last++;
           continue;
         }
+        // Prefer a completed measure over breaking in the middle of one. A
+        // genuinely over-wide single measure may still split as a fallback.
+        if (preferred > idx) last = preferred;
+        else if (last === idx) last++;
         break;
       }
       const line = new Line();
@@ -982,70 +1549,57 @@ export class Line {
     return res;
   }
 
-  private updateXPos(l: Line, width: number, maxHorizontalScale: number): void {
+  private updateXPos(l: Line, width: number, maxHorizontalScale: number, noteGapScale: number): void {
     const first = l.entries[0];
     const dx = first.group.x;
     for (const e of l.entries) e.group.x -= dx;
     const last = l.entries[l.entries.length - 1];
     if (last.group.width < 0) throw new Error("");
-    l.adjust(width, maxHorizontalScale);
+    l.adjust(width, maxHorizontalScale, noteGapScale);
   }
 
-  private layoutVertically(lines: Line[], opt: LayoutOptions, height: number): Group[] {
+  private layoutVertically(lines: Line[], opt: LayoutOptions, height: number, firstHeaderReserve = 0): Group[] {
     const top = opt.marginTop;
-    const maxDist = opt.maxLineDist;
-    const dist = opt.staffDist;
+    const dist = opt.systemGap();
     const res: Page[] = [];
-    let bottomOfLastLine = 0;
+    let occupied = 0;
     let pageBreak = false;
     for (const l of lines) {
-      let newPage = res.length === 0;
       l.group.update();
-      if (bottomOfLastLine + l.group.height + dist > height) newPage = true;
-      if (pageBreak) {
-        newPage = true;
-        pageBreak = false;
-      }
+      const pageIndex = Math.max(0, res.length - 1);
+      const reserve = pageIndex === 0 ? firstHeaderReserve : 0;
+      const availableHeight = Math.max(0, height - reserve);
+      const hasPrevious = res.length > 0 && res[res.length - 1].lines.length > 0;
+      const needed = l.group.height + (hasPrevious ? dist : 0);
+      const newPage = res.length === 0 || pageBreak || occupied + needed > availableHeight;
       if (newPage) {
         res.push(new Page());
-        bottomOfLastLine = 0;
-      } else {
-        bottomOfLastLine += dist;
+        occupied = 0;
+        pageBreak = false;
       }
-      l.group.y = bottomOfLastLine;
-      bottomOfLastLine += l.group.height;
       const pg = res[res.length - 1];
+      if (pg.lines.length > 0) occupied += dist;
+      l.group.y = occupied;
+      occupied += l.group.height;
       pg.lines.push(l);
       const lst = l.entries[l.entries.length - 1];
       if (lst instanceof LineBreak) pageBreak = lst.newPage;
     }
     const grps: Group[] = [];
     let y = 0;
-    for (const pg of res) {
+    res.forEach((pg, pageIndex) => {
       const grp = new Group();
-      let totalHeight = 0;
-      for (const l of pg.lines) {
-        grp.add(l.group);
-        totalHeight += l.group.height;
-      }
-      if (pg.lines.length > 1) {
-        let dd = (height - totalHeight) / (pg.lines.length - 1);
-        y = top;
-        if (dd > maxDist) {
-          y += ((dd - maxDist) * (pg.lines.length - 1)) / 2;
-          dd = maxDist;
-        }
-        for (const ll of pg.lines) {
-          const l = ll.group;
-          l.y = y;
-          y += l.height + dd;
-        }
-      } else {
-        pg.lines[0].group.y = opt.marginTop;
+      const reserve = pageIndex === 0 ? firstHeaderReserve : 0;
+      y = top + reserve;
+      for (const line of pg.lines) {
+        const l = line.group;
+        l.y = y;
+        grp.add(l);
+        y += l.height + dist;
       }
       grp.update();
       grps.push(grp);
-    }
+    });
     return grps;
   }
 
@@ -1120,20 +1674,278 @@ export class Line {
     }
   }
 
-  layout(width: number, height: number, opt: LayoutOptions): Group[] {
-    this.calcXPos();
+  private layoutRhythmically(
+    width: number,
+    height: number,
+    opt: LayoutOptions,
+    firstHeaderReserve: number,
+    tempoMarks: readonly S.TempoMark[],
+  ): Group[] {
+    interface MeasureRecord {
+      index: number;
+      entries: Entry[];
+      pickup: boolean;
+      displayNumber: number | null;
+      breakBefore: boolean;
+      pageBefore: boolean;
+      forceAfter: boolean;
+      pageAfter: boolean;
+    }
+
+    const records: MeasureRecord[] = [];
+    const byIndex = new Map<number, MeasureRecord>();
+    const pendingBefore = new Map<number, boolean>();
+    let current: MeasureRecord | null = null;
+    for (const entry of this.entries) {
+      if (entry instanceof LineBreak) {
+        const target = entry.syncMeasure >= 0 ? byIndex.get(entry.syncMeasure) : current;
+        if (target) {
+          target.forceAfter = true;
+          target.pageAfter ||= entry.newPage;
+        } else if (entry.syncMeasure >= 0) {
+          pendingBefore.set(entry.syncMeasure, entry.newPage);
+        }
+        continue;
+      }
+      let record = byIndex.get(entry.syncMeasure);
+      if (!record) {
+        record = {
+          index: entry.syncMeasure,
+          entries: [],
+          pickup: entry.syncPickup,
+          displayNumber: entry.syncDisplayNumber,
+          breakBefore: pendingBefore.has(entry.syncMeasure),
+          pageBefore: pendingBefore.get(entry.syncMeasure) ?? false,
+          forceAfter: false,
+          pageAfter: false,
+        };
+        records.push(record);
+        byIndex.set(entry.syncMeasure, record);
+      }
+      record.entries.push(entry);
+      current = record;
+    }
+
+    const measureOptions = horizontalMeasureOptions(opt);
+    const measures: HorizontalMeasureLayout<Entry>[] = records.map((record) => {
+      const barDuration = record.entries
+        .filter((entry): entry is Barline => entry instanceof Barline)
+        .reduce((duration, entry) => Math.max(duration, entry.syncTick.toFloat()), 0);
+      const first = record.entries[0];
+      const meterDuration = first ? first.syncBeats * 4 / first.syncBeatType : 4;
+      const duration = record.pickup && barDuration > 1e-8
+        ? barDuration
+        : Math.max(barDuration, meterDuration);
+      return buildMeasureLayout(
+        record.index,
+        duration,
+        record.entries.map(measuredRhythmItem),
+        measureOptions,
+        {
+          ...record,
+          widthWeight: record.pickup ? Math.max(0.12, duration / Math.max(duration, meterDuration)) : 1,
+          countInTarget: !record.pickup,
+        },
+      );
+    });
+    const systems = packMeasureSystems(
+      measures,
+      width,
+      opt.engravingStyle.measuresPerSystem,
+      opt.engravingStyle.justifyLastSystem,
+    );
+
+    const lines: Line[] = [];
+    for (const system of systems) {
+      const line = new Line();
+      line.group.classes.add("rhythmic-system");
+      for (const measure of system.measures) {
+        for (const column of measure.columns) {
+          for (const entry of column.items) {
+            line.addEntry(entry);
+            entry.group.x = measure.x + column.x - entryRhythmAnchor(entry);
+          }
+        }
+      }
+      const lastMeasure = system.measures[system.measures.length - 1];
+      if (lastMeasure?.forceAfter || system.pageAfter) {
+        const lineBreak = new LineBreak();
+        lineBreak.newPage = system.pageAfter;
+        line.addEntry(lineBreak);
+      }
+      const widthAnchor = new GraphicLine();
+      widthAnchor.strokeColor = 0x00000000;
+      widthAnchor.strokeWidth = 0;
+      widthAnchor.p0 = new Point(0, 0);
+      widthAnchor.p1 = new Point(system.width, 0);
+      line.group.add(widthAnchor);
+
+      line.addBeams(opt);
+      line.addTuplet(opt);
+      line.addTie(opt);
+      line.addSlur(opt);
+      line.updateLyricY(opt);
+      line.addSingleTempoMarks(opt, tempoMarks);
+      const numberedMeasure = system.measures.find((measure) => measure.displayNumber !== null);
+      if (numberedMeasure) {
+        addSystemMeasureNumber(line.group, numberedMeasure.x, numberedMeasure.displayNumber, opt);
+      }
+      line.group.normalizeY();
+      line.group.update();
+      line.addRhythmGuide(opt);
+      lines.push(line);
+    }
+    return this.layoutVertically(lines, opt, height, firstHeaderReserve);
+  }
+
+  layout(
+    width: number,
+    height: number,
+    opt: LayoutOptions,
+    firstHeaderReserve = 0,
+    tempoMarks: readonly S.TempoMark[] = [],
+  ): Group[] {
+    if (opt.engravingStyle.rhythmicSpacingEnabled) {
+      return this.layoutRhythmically(width, height, opt, firstHeaderReserve, tempoMarks);
+    }
+    this.calcXPos(opt);
     const lines = this.doLineBreak(width);
     for (const l of lines) {
-      this.updateXPos(l, width, opt.maxHorizontalScale);
+      this.updateXPos(l, width, opt.maxHorizontalScale, opt.engravingStyle.noteGapScale);
       l.addBeams(opt);
       l.addTuplet(opt);
       l.addTie(opt);
       l.addSlur(opt);
       l.updateLyricY(opt);
+      l.addSingleTempoMarks(opt, tempoMarks);
+      const numberedEntry = l.entries.find((entry) => entry.syncDisplayNumber !== null);
+      if (numberedEntry) {
+        addSystemMeasureNumber(
+          l.group,
+          numberedEntry.group.x + entryRhythmAnchor(numberedEntry),
+          numberedEntry.syncDisplayNumber,
+          opt,
+        );
+      }
       l.group.normalizeY();
       l.group.update();
+      l.addRhythmGuide(opt);
     }
-    return this.layoutVertically(lines, opt, height);
+    return this.layoutVertically(lines, opt, height, firstHeaderReserve);
+  }
+
+  private rhythmAnchorX(entry: Entry): number {
+    if (entry instanceof NoteEntry && entry.number) {
+      return entry.group.x + entry.number.x + entry.number.cx;
+    }
+    const item = entry.entryItem();
+    return entry.group.x + (item ? item.x + item.width / 2 : entry.group.width / 2);
+  }
+
+  private addSingleTempoMarks(opt: LayoutOptions, marks: readonly S.TempoMark[]): void {
+    if (marks.length === 0) return;
+    const positioned = this.entries
+      .filter((entry) => entry.syncSourceMeasure >= 0)
+      .map((entry) => ({ entry, x: this.rhythmAnchorX(entry) }));
+    const contentTop = this.group.childrenBound.top;
+    addTempoAnnotations(
+      this.group,
+      marks,
+      positioned,
+      opt,
+      (_mark, marker) => contentTop - marker.height - opt.numberSize * 0.18,
+    );
+  }
+
+  rhythmGuideEntries(offsetX = 0): Array<{ entry: Entry; x: number }> {
+    return this.entries
+      .filter((entry) => entry.syncMeasure >= 0 && (entry instanceof NoteEntry || entry instanceof Barline))
+      .map((entry) => ({ entry, x: offsetX + this.rhythmAnchorX(entry) }));
+  }
+
+  addRhythmGuide(
+    opt: LayoutOptions,
+    positionedEntries: Array<{ entry: Entry; x: number }> = this.rhythmGuideEntries(),
+    target: Group = this.group,
+    baselineY = this.group.height + opt.numberSize * 0.46,
+    updateTarget = true,
+  ): void {
+    const style = opt.engravingStyle;
+    if (!style.rhythmGuideEnabled) return;
+    const byMeasure = new Map<number, Array<{ entry: Entry; x: number }>>();
+    for (const positioned of positionedEntries) {
+      const list = byMeasure.get(positioned.entry.syncMeasure) ?? [];
+      list.push(positioned);
+      byMeasure.set(positioned.entry.syncMeasure, list);
+    }
+    if (byMeasure.size === 0) return;
+
+    const strokeWidth = Math.max(0.8, opt.numberSize * 0.038);
+    for (const entries of byMeasure.values()) {
+      const anchors = entries.map((positioned) => ({
+        tick: positioned.entry.syncTick.toFloat(),
+        x: positioned.x,
+        entry: positioned.entry,
+      })).sort((a, b) => a.tick - b.tick || a.x - b.x);
+      const endAnchor = [...anchors].reverse().find((item) => item.entry instanceof Barline);
+      if (!endAnchor || endAnchor.tick <= 1e-8 || anchors.length < 2) continue;
+
+      const beatType = anchors.find((anchor) => anchor.entry.syncBeatType > 0)?.entry.syncBeatType ?? 4;
+      let minorDivision: number = Math.max(4, beatType);
+      if (style.rhythmGuideMode === "manual") {
+        minorDivision = Math.max(minorDivision, style.rhythmGuideDivision);
+      } else {
+        for (const anchor of anchors) {
+          if (anchor.entry instanceof NoteEntry) {
+            minorDivision = Math.max(minorDivision, Math.min(64, 4 * (1 << Math.max(0, anchor.entry.beams))));
+          }
+        }
+      }
+      const majorStep = 4 / beatType;
+      const minorStep = 4 / minorDivision;
+      const unique: Array<{ tick: number; x: number }> = [];
+      for (const anchor of anchors) {
+        const existing = unique.find((item) => Math.abs(item.tick - anchor.tick) < 1e-8);
+        if (existing) existing.x = anchor.x;
+        else unique.push({ tick: anchor.tick, x: anchor.x });
+      }
+      const xAt = (tick: number): number => {
+        const exact = unique.find((item) => Math.abs(item.tick - tick) < 1e-8);
+        if (exact) return exact.x;
+        const rightIndex = unique.findIndex((item) => item.tick > tick);
+        if (rightIndex <= 0) return unique[0].x;
+        if (rightIndex < 0) return unique[unique.length - 1].x;
+        const left = unique[rightIndex - 1], right = unique[rightIndex];
+        const ratio = (tick - left.tick) / Math.max(1e-8, right.tick - left.tick);
+        return left.x + (right.x - left.x) * ratio;
+      };
+
+      const baseline = new GraphicLine();
+      baseline.classes.add("rhythm-guide-line");
+      baseline.strokeColor = opt.color;
+      baseline.strokeWidth = strokeWidth;
+      baseline.p0 = new Point(xAt(0), baselineY);
+      baseline.p1 = new Point(endAnchor.x, baselineY);
+      target.add(baseline);
+
+      const tickCount = Math.ceil(endAnchor.tick / minorStep - 1e-8);
+      for (let index = 0; index < tickCount; index++) {
+        const tick = index * minorStep;
+        const majorRatio = tick / majorStep;
+        const major = Math.abs(majorRatio - Math.round(majorRatio)) < 1e-7;
+        const mark = new GraphicLine();
+        mark.classes.add("rhythm-guide-tick");
+        mark.classes.add(major ? "rhythm-guide-major" : "rhythm-guide-minor");
+        mark.strokeColor = opt.color;
+        mark.strokeWidth = strokeWidth;
+        const x = xAt(tick);
+        const height = opt.numberSize * (major ? 0.34 : 0.18);
+        mark.p0 = new Point(x, baselineY);
+        mark.p1 = new Point(x, baselineY - height);
+        target.add(mark);
+      }
+    }
+    if (updateTarget) target.update();
   }
 
   private getEntry(ch: S.Chord): NoteEntry | null {
@@ -1268,13 +2080,33 @@ export class Line {
     });
   }
 
-  load(m: S.Measure, lrc: number, options: LayoutOptions, final: boolean): void {
+  load(
+    m: S.Measure,
+    lrc: number,
+    options: LayoutOptions,
+    final: boolean,
+    syncMeasure = m.index,
+  ): void {
+    const mark = (e: Entry, tick: Fraction, order: number): void => {
+      e.syncMeasure = syncMeasure;
+      e.syncSourceMeasure = m.index;
+      e.syncTick = tick;
+      e.syncOrder = order;
+      e.syncBeats = m.time.beats;
+      e.syncBeatType = m.time.beatType;
+      e.syncPickup = m.pickup;
+      e.syncDisplayNumber = m.displayNumber;
+      e.group.classes.add(`measure-${syncMeasure}`);
+      if (order === 3) e.group.classes.add("measure-barline");
+    };
     if (m.timeChange && m.index !== 0) {
       const ts = TimeSig.fromTime(m.time, options);
+      mark(ts, new Fraction(0), 1);
       this.entries.push(ts);
     }
     if (m.keyChange && m.index !== 0) {
       const key = new KeySig(m.key, options);
+      mark(key, new Fraction(0), 0);
       const first = m.entries[0];
       if (first instanceof S.Chord) {
         if (first.slurStart) key.group.y -= options.numberSize / 4;
@@ -1288,14 +2120,20 @@ export class Line {
         if (!ignore) {
           const br = new LineBreak();
           br.newPage = ch.newPage;
+          mark(br, ch.position, 4);
           this.entries.push(br);
         }
         continue;
       } else if (ch instanceof S.Chord) {
+        const begin = this.entries.length;
         NoteEntry.fromChord(this.entries, ch, lrc, options);
+        for (let i = begin; i < this.entries.length; i++) {
+          mark(this.entries[i], ch.position.plus(new Fraction(i - begin)), 2);
+        }
       } else if (ch instanceof S.BarlineEntry) {
         const ent = new Barline(final, options);
         ent.update();
+        mark(ent, ch.position, 3);
         this.entries.push(ent);
         hasBarline = true;
       }
@@ -1303,12 +2141,25 @@ export class Line {
     if (!hasBarline) {
       const ent = new Barline(final, options);
       ent.update();
+      mark(ent, m.duration, 3);
       if (this.entries[this.entries.length - 1] instanceof LineBreak) {
         this.entries.splice(this.entries.length - 1, 0, ent);
       } else {
         this.entries.push(ent);
       }
     }
+  }
+
+  /** Add beams/slurs/lyrics after piano code has assigned shared x positions. */
+  finishPiano(options: LayoutOptions): void {
+    this.connectTextFrames();
+    this.addBeams(options);
+    this.addTuplet(options);
+    this.addTie(options);
+    this.addSlur(options);
+    this.updateLyricY(options);
+    this.group.normalizeY();
+    this.group.update();
   }
 }
 
@@ -1349,11 +2200,12 @@ export class LayoutOptions {
   maxLineDist: number;
   maxHorizontalScale = 2.0;
   jpBeamDist: number;
+  engravingStyle: EngravingStyle = normalizeEngravingStyle();
 
   constructor(public fontSize: number) {
     // Original used 苹方-简 / Microsoft YaHei; in the webview we rely on the
     // system CJK font via a CSS stack.
-    const cjk = "PingFang SC, Microsoft YaHei, sans-serif";
+    const cjk = "PingFang SC, Microsoft YaHei, Microsoft YaHei UI, 微软雅黑, Source Han Sans SC, Noto Sans CJK SC, Yu Gothic UI, Meiryo, Malgun Gothic, Arial Unicode MS, SimSun, sans-serif";
     this.lrcFont = new Font(cjk, fontSize);
     this.numberFont = new Font(cjk, fontSize);
     this.smuflFont = new Font("Bravura", fontSize);
@@ -1361,6 +2213,7 @@ export class LayoutOptions {
     this.marginBottom = fontSize * 3;
     this.maxLineDist = fontSize * 0.75;
     this.jpBeamDist = fontSize / 8;
+    this.applyEngravingStyle(this.engravingStyle);
   }
 
   get lrcSize(): number {
@@ -1376,9 +2229,162 @@ export class LayoutOptions {
     this.numberFont = this.numberFont.makeWithSize(v);
   }
 
-  numberBound(ch: string): Rect {
-    return LayoutOptions.charBound(this.lrcFont, ch);
+  applyEngravingStyle(style: Partial<EngravingStyle>): void {
+    this.engravingStyle = normalizeEngravingStyle(style);
+    this.numberFont = new Font(
+      this.lrcFont.family,
+      this.fontSize * this.engravingStyle.numberScale,
+      this.engravingStyle.numberBold,
+    );
+    this.jpBeamDist = this.numberSize / 8;
   }
+
+  numberBound(ch: string): Rect {
+    return LayoutOptions.charBound(this.numberFont, ch);
+  }
+
+  octaveDotDiameter(): number {
+    return Math.max(0.5, this.numberSize * 0.16 * this.engravingStyle.octaveDotScale);
+  }
+
+  octaveDotGap(): number {
+    return Math.max(0.35, this.numberSize * 0.055 * this.engravingStyle.octaveDotDistance);
+  }
+
+  /** Fixed blank space between notation systems; it also drives pagination. */
+  systemGap(): number {
+    return Math.max(this.staffDist, this.numberSize * 2 * this.engravingStyle.systemGapScale);
+  }
+}
+
+interface PianoChunk {
+  right: Entry[];
+  left: Entry[];
+  pickup: boolean;
+  displayNumber: number | null;
+  forceAfter: boolean;
+  pageAfter: boolean;
+  breakBefore: boolean;
+  pageBefore: boolean;
+}
+
+interface PianoSystem {
+  group: Group;
+  pageAfter: boolean;
+}
+
+interface PianoSystemGeometry {
+  systemLeftX: number;
+  musicStart: number;
+  braceWidth: number;
+  braceLeft: number;
+  instrumentFont: Font;
+  instrumentX: number;
+}
+
+interface EnsembleChunk {
+  rows: Entry[][];
+  pickup: boolean;
+  displayNumber: number | null;
+  forceAfter: boolean;
+  pageAfter: boolean;
+  breakBefore: boolean;
+  pageBefore: boolean;
+}
+
+interface EnsembleGroup {
+  name: string;
+  rows: number[];
+}
+
+interface EnsembleSystemGeometry {
+  bracketLeft: number;
+  labelX: number;
+  braceLeft: number;
+  braceWidth: number;
+  systemLeftX: number;
+  musicStart: number;
+  instrumentFont: Font;
+}
+
+interface PianoSlot {
+  measure: number;
+  tick: Fraction;
+  order: number;
+  entries: Entry[];
+  left: number;
+  right: number;
+  x: number;
+}
+
+function pianoEntryAnchor(e: Entry): number {
+  const it = e.entryItem();
+  if (it === null) return e.group.width / 2;
+  if (e instanceof NoteEntry && e.number) return it.x + e.number.cx;
+  return it.x + it.width / 2;
+}
+
+function pianoSlotKey(e: Entry): string {
+  if (e instanceof Barline) return `${e.syncMeasure}|bar|${e.syncOrder}`;
+  return `${e.syncMeasure}|${e.syncTick.toString()}|${e.syncOrder}`;
+}
+
+/** Assign one shared rhythmic x-axis to a right/left pair; returns used width. */
+function alignPianoEntries(
+  right: Entry[],
+  left: Entry[],
+  opt: LayoutOptions,
+  targetWidth: number | null,
+): number {
+  const slotsByKey = new Map<string, PianoSlot>();
+  for (const e of [...right, ...left]) {
+    e.update();
+    const key = pianoSlotKey(e);
+    let slot = slotsByKey.get(key);
+    if (!slot) {
+      slot = {
+        measure: e.syncMeasure,
+        tick: e.syncTick,
+        order: e.syncOrder,
+        entries: [],
+        left: 0,
+        right: 0,
+        x: 0,
+      };
+      slotsByKey.set(key, slot);
+    } else if (e instanceof Barline && e.syncTick.compareTo(slot.tick) > 0) {
+      slot.tick = e.syncTick;
+    }
+    slot.entries.push(e);
+    const anchor = pianoEntryAnchor(e);
+    slot.left = Math.max(slot.left, anchor);
+    slot.right = Math.max(slot.right, Math.max(0, e.group.width - anchor));
+  }
+  const slots = [...slotsByKey.values()].sort((a, b) =>
+    a.measure - b.measure || a.tick.compareTo(b.tick) || a.order - b.order,
+  );
+  if (slots.length === 0) return 0;
+
+  slots[0].x = slots[0].left;
+  for (let i = 1; i < slots.length; i++) {
+    const prev = slots[i - 1];
+    const cur = slots[i];
+    const nearBarline = prev.order === 3 || cur.order <= 1;
+    const gap = opt.numberSize * (nearBarline ? 0.62 : 0.5) * opt.engravingStyle.noteGapScale;
+    cur.x = prev.x + prev.right + gap + cur.left;
+  }
+  let used = slots[slots.length - 1].x + slots[slots.length - 1].right;
+  if (targetWidth !== null && slots.length > 1 && targetWidth > used) {
+    // Publication-style piano numbered notation aligns every system, including
+    // sparse final systems, to the same right edge (the final double barline).
+    const extra = targetWidth - used;
+    for (let i = 1; i < slots.length; i++) slots[i].x += (extra * i) / (slots.length - 1);
+    used += extra;
+  }
+  for (const slot of slots) {
+    for (const e of slot.entries) e.group.x = slot.x - pianoEntryAnchor(e);
+  }
+  return used;
 }
 
 export class Layout {
@@ -1480,21 +2486,953 @@ export class Layout {
     l.entries = newEnt;
   }
 
-  fromScore(scr: S.Score, dur: string | null, width: number, height: number): void {
+  private pianoChunks(scr: S.Score): PianoChunk[] {
+    const rightPart = scr.parts[0];
+    const leftPart = scr.parts[1];
+    const ranges = scr.playData.measures.length > 0
+      ? scr.playData.measures
+      : [{ mid: 0, end: Math.max(rightPart.measures.length, leftPart.measures.length), pass: 1, endOfPass: false }];
+    const sequence: Array<{ mid: number; pass: number; pageAfter: boolean }> = [];
+    for (const range of ranges) {
+      for (let mid = range.mid; mid < range.end; mid++) {
+        sequence.push({
+          mid,
+          pass: range.pass,
+          pageAfter: Boolean(range.endOfPass && mid === range.end - 1),
+        });
+      }
+    }
+
+    const chunks: PianoChunk[] = [];
+    for (let flow = 0; flow < sequence.length; flow++) {
+      const item = sequence[flow];
+      const rm = rightPart.measures[item.mid];
+      const lm = leftPart.measures[item.mid];
+      const final = flow === sequence.length - 1;
+      const make = (m: S.Measure | undefined, fallback: S.Measure | undefined): Entry[] => {
+        if (m) {
+          m.autoBeamGroup();
+          const line = new Line();
+          line.load(m, item.pass, this.options, final, flow);
+          return line.entries;
+        }
+        // Keep a barline in a temporarily incomplete hand while the user is
+        // typing, so the paired editor remains live instead of failing parse.
+        const bar = new Barline(final, this.options);
+        bar.update();
+        bar.syncMeasure = flow;
+        bar.syncSourceMeasure = item.mid;
+        bar.syncTick = fallback?.duration ?? new Fraction(4);
+        bar.syncOrder = 3;
+        bar.syncBeats = fallback?.time.beats ?? 4;
+        bar.syncBeatType = fallback?.time.beatType ?? 4;
+        bar.syncPickup = fallback?.pickup ?? false;
+        bar.syncDisplayNumber = fallback?.displayNumber ?? null;
+        return [bar];
+      };
+      const rentries = make(rm, lm);
+      const lentries = make(lm, rm);
+      const breaks = [...rentries, ...lentries].filter((e): e is LineBreak => e instanceof LineBreak);
+      chunks.push({
+        right: rentries.filter((e) => !(e instanceof LineBreak)),
+        left: lentries.filter((e) => !(e instanceof LineBreak)),
+        pickup: Boolean(rm?.pickup || lm?.pickup),
+        displayNumber: (rm ?? lm)?.displayNumber ?? null,
+        forceAfter: breaks.length > 0 || item.pageAfter,
+        pageAfter: breaks.some((e) => e.newPage) || item.pageAfter,
+        breakBefore: Boolean(rm?.newSystem || lm?.newSystem),
+        pageBefore: Boolean(rm?.newPage || lm?.newPage),
+      });
+    }
+    return chunks;
+  }
+
+  private ensembleGroups(scr: S.Score): EnsembleGroup[] {
+    const groups: EnsembleGroup[] = [];
+    const byName = new Map<string, EnsembleGroup>();
+    scr.parts.forEach((part, row) => {
+      const name = part.instrumentName.trim() || `乐器 ${row + 1}`;
+      let group = byName.get(name);
+      if (!group) {
+        group = { name, rows: [] };
+        byName.set(name, group);
+        groups.push(group);
+      }
+      group.rows.push(row);
+    });
+    return groups;
+  }
+
+  private ensembleChunks(scr: S.Score): EnsembleChunk[] {
+    const measureCount = Math.max(0, ...scr.parts.map((part) => part.measures.length));
+    const ranges = scr.playData.measures.length > 0
+      ? scr.playData.measures
+      : [{ mid: 0, end: measureCount, pass: 1, endOfPass: false }];
+    const sequence: Array<{ mid: number; pass: number; pageAfter: boolean }> = [];
+    for (const range of ranges) {
+      for (let mid = range.mid; mid < range.end; mid++) {
+        sequence.push({
+          mid,
+          pass: range.pass,
+          pageAfter: Boolean(range.endOfPass && mid === range.end - 1),
+        });
+      }
+    }
+
+    const chunks: EnsembleChunk[] = [];
+    for (let flow = 0; flow < sequence.length; flow++) {
+      const item = sequence[flow];
+      const measures = scr.parts.map((part) => part.measures[item.mid]);
+      const fallback = measures.find((measure) => measure !== undefined);
+      const final = flow === sequence.length - 1;
+      const make = (measure: S.Measure | undefined): Entry[] => {
+        if (measure) {
+          measure.autoBeamGroup();
+          const line = new Line();
+          line.load(measure, item.pass, this.options, final, flow);
+          return line.entries;
+        }
+        const bar = new Barline(final, this.options);
+        bar.update();
+        bar.syncMeasure = flow;
+        bar.syncSourceMeasure = item.mid;
+        bar.syncTick = fallback?.duration ?? new Fraction(4);
+        bar.syncOrder = 3;
+        bar.syncBeats = fallback?.time.beats ?? 4;
+        bar.syncBeatType = fallback?.time.beatType ?? 4;
+        bar.syncPickup = fallback?.pickup ?? false;
+        bar.syncDisplayNumber = fallback?.displayNumber ?? null;
+        return [bar];
+      };
+      const loaded = measures.map(make);
+      const breaks = loaded.flat().filter((entry): entry is LineBreak => entry instanceof LineBreak);
+      chunks.push({
+        rows: loaded.map((entries) => entries.filter((entry) => !(entry instanceof LineBreak))),
+        pickup: measures.some((measure) => measure?.pickup),
+        displayNumber: fallback?.displayNumber ?? null,
+        forceAfter: breaks.length > 0 || item.pageAfter,
+        pageAfter: breaks.some((entry) => entry.newPage) || item.pageAfter,
+        breakBefore: measures.some((measure) => measure?.newSystem),
+        pageBefore: measures.some((measure) => measure?.newPage),
+      });
+    }
+    return chunks;
+  }
+
+  private pianoSystemGeometry(instrumentName: string, continuationBraceLeft: number | null = null): PianoSystemGeometry {
+    const style = this.options.engravingStyle;
+    const numberSize = this.options.numberSize;
+    const instrumentFont = this.options.lrcFont.scaled(0.56 / 1.5);
+    // Width and weight are independent controls. The former 11-unit floor
+    // swallowed most of the lower half of the width slider, while multiplying
+    // weight into width made both controls change the same geometry.
+    const braceWidth = Math.max(numberSize * 0.08, numberSize * 0.52 * style.braceWidthScale);
+    const instrumentWidth = instrumentFont.measureText(instrumentName);
+    const systemLeftX = continuationBraceLeft === null
+      ? Math.max(68, 1 + instrumentWidth + numberSize * 0.25 + braceWidth + numberSize * 0.12)
+      : Math.max(1, continuationBraceLeft) + braceWidth + numberSize * 0.12;
+    const braceLeft = continuationBraceLeft === null
+      ? systemLeftX - numberSize * 0.12 - braceWidth
+      : Math.max(1, continuationBraceLeft);
+    const instrumentX = Math.max(1, braceLeft - numberSize * 0.22 - instrumentWidth);
+    return {
+      systemLeftX,
+      musicStart: systemLeftX + numberSize * 0.62,
+      braceWidth,
+      braceLeft,
+      instrumentFont,
+      instrumentX,
+    };
+  }
+
+  private ensembleSystemGeometry(groups: EnsembleGroup[]): EnsembleSystemGeometry {
+    const style = this.options.engravingStyle;
+    const numberSize = this.options.numberSize;
+    const instrumentFont = this.options.lrcFont.scaled(0.56 / 1.5);
+    const bracketLeft = 1;
+    const labelX = groups.length >= 2 ? bracketLeft + numberSize * 0.42 : bracketLeft;
+    const labelWidth = Math.max(0, ...groups.map((group) => instrumentFont.measureText(group.name)));
+    const braceWidth = Math.max(numberSize * 0.08, numberSize * 0.52 * style.braceWidthScale);
+    const braceLeft = labelX + labelWidth + numberSize * 0.18;
+    const hasMultiVoiceInstrument = groups.some((group) => group.rows.length >= 2);
+    const systemLeftX = hasMultiVoiceInstrument
+      ? braceLeft + braceWidth + numberSize * 0.12
+      : labelX + labelWidth + numberSize * 0.38;
+    return {
+      bracketLeft,
+      labelX,
+      braceLeft,
+      braceWidth,
+      systemLeftX,
+      musicStart: systemLeftX + numberSize * 0.62,
+      instrumentFont,
+    };
+  }
+
+  private makePianoSystem(
+    chunks: PianoChunk[],
+    width: number,
+    pageAfter: boolean,
+    instrumentName: string,
+    showInstrument: boolean,
+    geometry: PianoSystemGeometry,
+    tempoMarks: readonly S.TempoMark[],
+    horizontalMeasures: readonly HorizontalMeasureLayout<Entry>[] | null = null,
+  ): PianoSystem {
+    const rightEntries = chunks.flatMap((c) => c.right);
+    const leftEntries = chunks.flatMap((c) => c.left);
+    const right = new Line();
+    const left = new Line();
+    right.addEntries(rightEntries);
+    left.addEntries(leftEntries);
+
+    const style = this.options.engravingStyle;
+    const { systemLeftX, musicStart, braceWidth, braceLeft, instrumentFont, instrumentX } = geometry;
+    if (horizontalMeasures) {
+      for (const measure of horizontalMeasures) {
+        for (const column of measure.columns) {
+          for (const entry of column.items) {
+            entry.group.x = measure.x + column.x - entryRhythmAnchor(entry);
+          }
+        }
+      }
+    } else {
+      const musicWidth = Math.max(this.options.numberSize * 4, width - musicStart);
+      alignPianoEntries(rightEntries, leftEntries, this.options, musicWidth);
+    }
+    right.finishPiano(this.options);
+    left.finishPiano(this.options);
+
+    const pair = new Group();
+    pair.classes.add("piano-system");
+    if (horizontalMeasures) pair.classes.add("rhythmic-system");
+    const handGap = this.options.numberSize * style.pianoHandGap;
+    right.group.x += musicStart;
+    right.group.y = 0;
+    left.group.x += musicStart;
+    left.group.y = right.group.height + handGap;
+    pair.add(right.group);
+    pair.add(left.group);
+
+    // Keep every system on the same left edge even though only the first one
+    // prints the instrument name.
+    const leftAnchor = new GraphicLine();
+    leftAnchor.strokeColor = 0x00000000;
+    leftAnchor.strokeWidth = 0;
+    leftAnchor.p0 = new Point(0, 0);
+    leftAnchor.p1 = new Point(1, 1);
+    pair.add(leftAnchor);
+
+    const y0 = 0;
+    const y1 = left.group.y + left.group.height;
+    const tempoEntries = (right.entries.length > 0 ? right.entries : left.entries)
+      .map((entry) => ({
+        entry,
+        x: (right.entries.length > 0 ? right.group.x : left.group.x) +
+          entry.group.x + pianoEntryAnchor(entry),
+      }));
+    addTempoAnnotations(
+      pair,
+      tempoMarks,
+      tempoEntries,
+      this.options,
+      (mark, marker) => mark.kind === "tempo"
+        // Leave the compact measure number sitting directly above the brace;
+        // a tempo change on the first beat belongs in the next tier above it.
+        ? y0 - marker.height - this.options.numberSize * 0.42
+        : right.group.y + right.group.height + (handGap - marker.height) / 2,
+    );
+    if (style.rhythmGuideEnabled) {
+      const positioned = [
+        ...right.rhythmGuideEntries(right.group.x),
+        ...left.rhythmGuideEntries(left.group.x),
+      ];
+      // One shared ruler below the lower hand uses the already synchronized
+      // piano x-axis. The brace and connecting barlines still end at the hand
+      // rows; the ruler occupies its own additional row underneath.
+      left.addRhythmGuide(
+        this.options,
+        positioned,
+        pair,
+        y1 + this.options.numberSize * 0.46,
+        false,
+      );
+    }
+    if (showInstrument && instrumentName.trim()) {
+      const tf = new TextFrame();
+      tf.text = instrumentName;
+      tf.font = instrumentFont;
+      tf.color = this.options.color;
+      tf.update();
+      tf.x = instrumentX;
+      const metrics = instrumentFont.metrics;
+      tf.y = (y0 + y1) / 2 - (metrics.ascent + metrics.descent) / 2;
+      pair.add(tf);
+    }
+
+    // Use Bravura's actual SMuFL staff brace and scale it to the paired rows.
+    // This preserves the familiar engraved thick/thin silhouette instead of
+    // approximating it with a single stroked bezier curve.
+    const braceBox = this.options.smuflMeta.getBBox(GlyphCodes.brace);
+    const baseWidth = braceBox
+      ? Math.max(0.1, (braceBox.bBoxNE[0] - braceBox.bBoxSW[0]) * this.options.smuflFont.size / 4)
+      : this.options.smuflFont.size * 0.08;
+    const baseHeight = braceBox
+      ? Math.max(0.1, (braceBox.bBoxNE[1] - braceBox.bBoxSW[1]) * this.options.smuflFont.size / 4)
+      : this.options.smuflFont.size;
+    // A non-scaling outline changes the filled SMuFL brace's visual weight.
+    // Compress the fill by the same amount so braceWidth remains the requested
+    // outer width instead of growing when only the weight slider is moved.
+    const braceGlyphWidth = Math.max(braceWidth * 0.2, braceWidth - style.braceStrokeWidth);
+    const braceGroup = new Group();
+    braceGroup.classes.add("piano-brace");
+    const braceMatrix = new Matrix33();
+    braceMatrix.setAffine([braceGlyphWidth / baseWidth, 0, 0, (y1 - y0) / baseHeight, braceLeft + style.braceStrokeWidth / 2, y1]);
+    braceGroup.matrix = braceMatrix;
+    const braceGlyph = new SmuflText(this.options);
+    braceGlyph.classes.add("piano-brace-glyph");
+    braceGlyph.text = GlyphCodes.brace;
+    braceGlyph.color = this.options.color;
+    braceGlyph.strokeColor = this.options.color;
+    braceGlyph.strokeWidth = style.braceStrokeWidth;
+    braceGlyph.nonScalingStroke = true;
+    braceGroup.add(braceGlyph);
+    pair.add(braceGroup);
+
+    // Piano-system left edge: the brace terminates on one continuous vertical
+    // line, matching conventional paired numbered-notation engraving.
+    const systemLeft = new GraphicLine();
+    systemLeft.classes.add("piano-system-left");
+    systemLeft.strokeColor = this.options.color;
+    systemLeft.strokeWidth = style.pianoLeftLineWidth;
+    systemLeft.p0 = new Point(systemLeftX, y0);
+    systemLeft.p1 = new Point(systemLeftX, y1);
+    pair.add(systemLeft);
+
+    // Join matching measure barlines through the gap.  Their x coordinates
+    // already come from the shared rhythmic axis, so this also makes alignment
+    // visually obvious when editing either hand.
+    const leftBars = new Map<string, Barline>();
+    for (const e of left.entries) if (e instanceof Barline) leftBars.set(pianoSlotKey(e), e);
+    const extendBarline = (x: number, fromY: number, toY: number, strokeWidth: number): void => {
+      if (toY - fromY <= 0.01) return;
+      const extension = new GraphicLine();
+      extension.classes.add("piano-barline-extension");
+      extension.strokeColor = this.options.color;
+      extension.strokeWidth = strokeWidth;
+      extension.p0 = new Point(x, fromY);
+      extension.p1 = new Point(x, toY);
+      pair.add(extension);
+    };
+    for (const rb of right.entries) {
+      if (!(rb instanceof Barline)) continue;
+      const lb = leftBars.get(pianoSlotKey(rb));
+      if (!lb) continue;
+      const rlines = rb.group.children.filter((x): x is GraphicLine => x instanceof GraphicLine);
+      const llines = lb.group.children.filter((x): x is GraphicLine => x instanceof GraphicLine);
+      for (let i = 0; i < Math.min(rlines.length, llines.length); i++) {
+        const ri = rlines[i], li = llines[i];
+        const rp = ri.pos(pair);
+        const lp = li.pos(pair);
+        const connector = new GraphicLine();
+        connector.classes.add("piano-barline-connector");
+        connector.strokeColor = this.options.color;
+        connector.strokeWidth = Math.max(ri.strokeWidth, li.strokeWidth) * style.pianoConnectorScale;
+        connector.p0 = new Point(rp.x, rp.y + ri.height);
+        connector.p1 = new Point(lp.x, lp.y);
+        pair.add(connector);
+
+        // A hand-local barline only spans the number row. Chords and octave
+        // dots can make the brace-side system line taller, so extend every
+        // matched barline to the exact same y0/y1 limits. Keep the middle
+        // connector separate so its user-adjustable weight still applies.
+        extendBarline(rp.x, y0, rp.y, ri.strokeWidth);
+        extendBarline(lp.x, lp.y + li.height, y1, li.strokeWidth);
+      }
+    }
+    if (horizontalMeasures) {
+      const numberedMeasure = horizontalMeasures.find((measure) => measure.displayNumber !== null);
+      if (numberedMeasure) {
+        addSystemMeasureNumber(
+          pair,
+          braceLeft,
+          numberedMeasure.displayNumber,
+          this.options,
+          y0,
+        );
+      }
+    } else {
+      const numberedEntry = [...rightEntries, ...leftEntries]
+        .find((entry) => entry.syncDisplayNumber !== null);
+      if (numberedEntry) {
+        addSystemMeasureNumber(pair, braceLeft, numberedEntry.syncDisplayNumber, this.options, y0);
+      }
+    }
+    pair.update();
+    return { group: pair, pageAfter };
+  }
+
+  private makeEnsembleSystem(
+    chunks: EnsembleChunk[],
+    width: number,
+    pageAfter: boolean,
+    groups: EnsembleGroup[],
+    geometry: EnsembleSystemGeometry,
+    tempoMarks: readonly S.TempoMark[],
+    horizontalMeasures: readonly HorizontalMeasureLayout<Entry>[] | null = null,
+  ): PianoSystem {
+    const rowCount = chunks[0]?.rows.length ?? 0;
+    const rowEntries = Array.from({ length: rowCount }, (_unused, row) =>
+      chunks.flatMap((chunk) => chunk.rows[row] ?? []),
+    );
+    const lines = rowEntries.map((entries) => {
+      const line = new Line();
+      line.addEntries(entries);
+      return line;
+    });
+    if (horizontalMeasures) {
+      for (const measure of horizontalMeasures) {
+        for (const column of measure.columns) {
+          for (const entry of column.items) {
+            entry.group.x = measure.x + column.x - entryRhythmAnchor(entry);
+          }
+        }
+      }
+    } else {
+      const musicWidth = Math.max(this.options.numberSize * 4, width - geometry.musicStart);
+      alignPianoEntries(rowEntries.flat(), [], this.options, musicWidth);
+    }
+    for (const line of lines) line.finishPiano(this.options);
+
+    const system = new Group();
+    system.classes.add("ensemble-system");
+    if (horizontalMeasures) system.classes.add("rhythmic-system");
+    const rowToGroup = new Map<number, number>();
+    groups.forEach((group, groupIndex) => group.rows.forEach((row) => rowToGroup.set(row, groupIndex)));
+    const intraGroupGap = this.options.numberSize * this.options.engravingStyle.pianoHandGap;
+    const interGroupGap = intraGroupGap + Math.max(this.options.numberSize * 1.1, intraGroupGap * 0.75);
+    // A rhythm guide belongs to one complete instrument group.  Reserve its
+    // baseline below the group's bottom voice before positioning the next
+    // instrument, so guides never collide with the following staff group and
+    // pagination sees their real height.
+    const guideReserve = this.options.engravingStyle.rhythmGuideEnabled
+      ? this.options.numberSize * 0.58
+      : 0;
+    const rowTops: number[] = [];
+    const rowBottoms: number[] = [];
+    let y = 0;
+    for (let row = 0; row < lines.length; row++) {
+      const line = lines[row];
+      line.group.x += geometry.musicStart;
+      line.group.y = y;
+      rowTops[row] = y;
+      rowBottoms[row] = y + line.group.height;
+      system.add(line.group);
+      if (row + 1 < lines.length) {
+        const sameInstrument = rowToGroup.get(row) === rowToGroup.get(row + 1);
+        y = rowBottoms[row] + (sameInstrument ? intraGroupGap : interGroupGap + guideReserve);
+      }
+    }
+    const y0 = rowTops[0] ?? 0;
+    const y1 = rowBottoms[rowBottoms.length - 1] ?? 0;
+    const tempoEntries = (lines[0]?.entries ?? []).map((entry) => ({
+      entry,
+      x: (lines[0]?.group.x ?? 0) + entry.group.x + pianoEntryAnchor(entry),
+    }));
+    addTempoAnnotations(
+      system,
+      tempoMarks,
+      tempoEntries,
+      this.options,
+      (_mark, marker) => y0 - marker.height - this.options.numberSize * 0.18,
+    );
+
+    const style = this.options.engravingStyle;
+    const braceBox = this.options.smuflMeta.getBBox(GlyphCodes.brace);
+    const braceBaseWidth = braceBox
+      ? Math.max(0.1, (braceBox.bBoxNE[0] - braceBox.bBoxSW[0]) * this.options.smuflFont.size / 4)
+      : this.options.smuflFont.size * 0.08;
+    const braceBaseHeight = braceBox
+      ? Math.max(0.1, (braceBox.bBoxNE[1] - braceBox.bBoxSW[1]) * this.options.smuflFont.size / 4)
+      : this.options.smuflFont.size;
+    for (const group of groups) {
+      const firstRow = group.rows[0];
+      const lastRow = group.rows[group.rows.length - 1];
+      const top = rowTops[firstRow] ?? y0;
+      const bottom = rowBottoms[lastRow] ?? top;
+
+      // One guide per instrument: all of that instrument's voices contribute
+      // their rhythmic anchors, while the guide is drawn below its bottom row.
+      if (style.rhythmGuideEnabled) {
+        const groupLines = group.rows.map((row) => lines[row]).filter((line) => line !== undefined);
+        if (groupLines.length > 0) {
+          const positioned = groupLines.flatMap((line) => line.rhythmGuideEntries(line.group.x));
+          groupLines[groupLines.length - 1].addRhythmGuide(
+            this.options,
+            positioned,
+            system,
+            bottom + this.options.numberSize * 0.46,
+            false,
+          );
+        }
+      }
+
+      const label = new TextFrame();
+      label.classes.add("ensemble-instrument-label");
+      label.text = group.name;
+      label.font = geometry.instrumentFont;
+      label.color = this.options.color;
+      label.update();
+      label.x = geometry.labelX;
+      const metrics = geometry.instrumentFont.metrics;
+      label.y = (top + bottom) / 2 - (metrics.ascent + metrics.descent) / 2;
+      system.add(label);
+
+      if (group.rows.length >= 2) {
+        const braceGlyphWidth = Math.max(
+          geometry.braceWidth * 0.2,
+          geometry.braceWidth - style.braceStrokeWidth,
+        );
+        const braceGroup = new Group();
+        braceGroup.classes.add("ensemble-instrument-brace");
+        const braceMatrix = new Matrix33();
+        braceMatrix.setAffine([
+          braceGlyphWidth / braceBaseWidth,
+          0,
+          0,
+          (bottom - top) / braceBaseHeight,
+          geometry.braceLeft + style.braceStrokeWidth / 2,
+          bottom,
+        ]);
+        braceGroup.matrix = braceMatrix;
+        const braceGlyph = new SmuflText(this.options);
+        braceGlyph.classes.add("ensemble-instrument-brace-glyph");
+        braceGlyph.text = GlyphCodes.brace;
+        braceGlyph.color = this.options.color;
+        braceGlyph.strokeColor = this.options.color;
+        braceGlyph.strokeWidth = style.braceStrokeWidth;
+        braceGlyph.nonScalingStroke = true;
+        braceGroup.add(braceGlyph);
+        system.add(braceGroup);
+      }
+
+      const groupLine = new GraphicLine();
+      groupLine.classes.add("ensemble-group-line");
+      groupLine.strokeColor = this.options.color;
+      groupLine.strokeWidth = style.pianoLeftLineWidth;
+      groupLine.p0 = new Point(geometry.systemLeftX, top);
+      groupLine.p1 = new Point(geometry.systemLeftX, bottom);
+      system.add(groupLine);
+
+      const referenceBars = rowEntries[firstRow]?.filter((entry): entry is Barline => entry instanceof Barline) ?? [];
+      for (const bar of referenceBars) {
+        const linesInBar = bar.group.children.filter((item): item is GraphicLine => item instanceof GraphicLine);
+        for (const barLine of linesInBar) {
+          const pos = barLine.pos(system);
+          const connector = new GraphicLine();
+          connector.classes.add("ensemble-barline-connector");
+          connector.strokeColor = this.options.color;
+          connector.strokeWidth = barLine.strokeWidth * style.pianoConnectorScale;
+          connector.p0 = new Point(pos.x, top);
+          connector.p1 = new Point(pos.x, bottom);
+          system.add(connector);
+        }
+      }
+    }
+
+    // A full-score bracket describes a relationship between instrument
+    // groups.  One instrument (even with several internal voices) keeps its
+    // own brace but must not receive a redundant outer square bracket.
+    if (groups.length >= 2) {
+      const bracketWidth = Math.max(1.2, this.options.engravingStyle.pianoLeftLineWidth);
+      const hook = Math.max(5, this.options.numberSize * 0.24);
+      // GraphicLine coordinates run along the stroke centre.  Start the hooks at
+      // the vertical stroke's outer-left edge so their visible left edges align
+      // and the square 90-degree joint has no half-stroke-width step.
+      const hookLeft = geometry.bracketLeft - bracketWidth / 2;
+      const bracket = new GraphicLine();
+      bracket.classes.add("ensemble-bracket");
+      bracket.strokeColor = this.options.color;
+      bracket.strokeWidth = bracketWidth;
+      bracket.p0 = new Point(geometry.bracketLeft, y0);
+      bracket.p1 = new Point(geometry.bracketLeft, y1);
+      system.add(bracket);
+      const topHook = new GraphicLine();
+      topHook.classes.add("ensemble-bracket-hook");
+      topHook.strokeColor = this.options.color;
+      topHook.strokeWidth = bracketWidth;
+      topHook.p0 = new Point(hookLeft, y0);
+      topHook.p1 = new Point(geometry.bracketLeft + hook, y0);
+      system.add(topHook);
+      const bottomHook = new GraphicLine();
+      bottomHook.classes.add("ensemble-bracket-hook");
+      bottomHook.strokeColor = this.options.color;
+      bottomHook.strokeWidth = bracketWidth;
+      bottomHook.p0 = new Point(hookLeft, y1);
+      bottomHook.p1 = new Point(geometry.bracketLeft + hook, y1);
+      system.add(bottomHook);
+    }
+
+    if (horizontalMeasures) {
+      const numberedMeasure = horizontalMeasures.find((measure) => measure.displayNumber !== null);
+      if (numberedMeasure) {
+        addSystemMeasureNumber(
+          system,
+          geometry.musicStart + numberedMeasure.x,
+          numberedMeasure.displayNumber,
+          this.options,
+          y0,
+        );
+      }
+    }
+    system.update();
+    return { group: system, pageAfter };
+  }
+
+  private pianoLineLimits(dur: string | null): number[] | null {
+    if (!dur || !/LinesPerPage/i.test(dur)) return null;
+    const rhs = substringAfter(dur, "=").trim();
+    const values = rhs.split("|").map((s) => parseInt(s.trim(), 10)).filter((n) => n > 0);
+    return values.length > 0 ? values : null;
+  }
+
+  private publicationHeaderReserve(scr: S.Score): number {
+    const hasTitleText = Boolean(scr.title.trim() || scr.subtitle.trim());
+    const hasTitleBlock = Boolean(scr.title.trim() || scr.subtitle.trim() || scr.composer.trim() || scr.arranger.trim() || scr.lyricist.trim());
+    const titleFontSize = Math.min(this.options.titleSize, this.options.numberSize * 1.25);
+    const titleShift = hasTitleText ? titleFontSize : 0;
+    return this.options.numberSize * (hasTitleBlock ? 3.85 : 2.35)
+      + titleShift
+      + this.options.numberSize * 0.35;
+  }
+
+  private addPublicationHeader(page: Group, scr: S.Score, width: number, reserve: number): void {
+    const opt = this.options;
+    // paginatePiano normalizes each page group and stores the first system's
+    // absolute y in page.y. Move that offset back into the music children so
+    // header items and systems share one page-local coordinate system.
+    if (page.y !== 0) {
+      for (const child of page.children) child.y += page.y;
+      page.y = 0;
+    }
+    const addText = (text: string, font: Font, x: number, y: number, align: "left" | "center" | "right" = "left"): void => {
+      if (!text.trim()) return;
+      const tf = new TextFrame();
+      tf.text = text;
+      tf.font = font;
+      tf.color = opt.color;
+      const measured = tf.measureText();
+      tf.x = align === "center" ? x - measured / 2 : align === "right" ? x - measured : x;
+      tf.y = y;
+      tf.update();
+      page.add(tf);
+    };
+
+    const titleFont = opt.lrcFont.makeWithSize(Math.min(opt.titleSize, opt.numberSize * 1.25));
+    const subtitleFont = opt.lrcFont.makeWithSize(opt.numberSize * 0.62);
+    const metaFont = opt.lrcFont.makeWithSize(opt.numberSize * 0.87);
+    const creditFont = opt.lrcFont.makeWithSize(opt.numberSize * 0.52);
+    // Use the title font's own ascent, not the number size, to keep larger
+    // publication titles fully inside the page instead of clipping their top.
+    const titleY = titleFont.size * 2.2 + opt.numberSize * 0.35;
+    addText(scr.title, titleFont, width / 2, titleY, "center");
+    addText(scr.subtitle, subtitleFont, width / 2, titleY + opt.numberSize * 0.9, "center");
+
+    const first = scr.parts[0]?.measures[0];
+    if (first) {
+      const rawKey = first.key.name;
+      const displayKey = rawKey.startsWith("#") ? `${rawKey.slice(1)}♯` : rawKey.startsWith("b") ? `${rawKey.slice(1)}♭` : rawKey;
+      const tempoSymbol = scr.tempoBeatUnit === "eighth"
+        ? "♪"
+        : scr.tempoBeatUnit === "dotted-quarter" ? "♩." : "♩";
+      const displayTempo = S.tempoBpmForUnit(scr.tempoBpm, scr.tempoBeatUnit);
+      const meta = `1=${displayKey}   ${first.time.beats}/${first.time.beatType}   ${tempoSymbol}=${S.formatTempoBpm(displayTempo)}`;
+      // Measure numbers float just above systems without consuming pagination
+      // height. Keep the publication metadata one small-number row higher so
+      // the first system's label cannot collide with key/meter/tempo text.
+      addText(meta, metaFont, 0, opt.marginTop + reserve - opt.numberSize * 0.88, "left");
+    }
+
+    const explicitCredits = [
+      scr.lyricist.trim() ? `作词：${scr.lyricist.trim()}` : "",
+      scr.composer.trim() ? `作曲：${scr.composer.trim()}` : "",
+      scr.arranger.trim() ? `编曲：${scr.arranger.trim()}` : "",
+    ].filter(Boolean);
+    const credits = explicitCredits.length > 0
+      ? explicitCredits
+      : scr.credit.filter((x) => x.type !== "title").flatMap((x) => x.text.split("\n").map((s) => s.trim()).filter(Boolean));
+    const creditGap = creditFont.size * 1.18;
+    const creditBottom = opt.marginTop + reserve - opt.numberSize * 0.88;
+    credits.forEach((text, index) => {
+      const y = creditBottom - (credits.length - 1 - index) * creditGap;
+      addText(text, creditFont, width, y, "right");
+    });
+  }
+
+  private paginatePiano(systems: PianoSystem[], height: number, dur: string | null, firstHeaderReserve = 0): Group[] {
+    const pages: PianoSystem[][] = [];
+    const limits = this.pianoLineLimits(dur);
+    const systemGap = this.options.systemGap();
+    let forcePage = false;
+    for (const sys of systems) {
+      let page = pages[pages.length - 1];
+      const pageIndex = Math.max(0, pages.length - 1);
+      const headerReserve = pageIndex === 0 ? firstHeaderReserve : 0;
+      const limit = limits?.[Math.min(pageIndex, limits.length - 1)] ?? Number.POSITIVE_INFINITY;
+      const occupied = page?.reduce((sum, s) => sum + s.group.height, 0) ?? 0;
+      const gaps = page ? page.length * systemGap : 0;
+      const availableHeight = Math.max(0, height - headerReserve);
+      const overflow = Boolean(page && occupied + gaps + sys.group.height > availableHeight);
+      if (!page || forcePage || overflow || page.length >= limit) {
+        page = [];
+        pages.push(page);
+        forcePage = false;
+      }
+      page.push(sys);
+      if (sys.pageAfter) forcePage = true;
+    }
+
+    return pages.map((page, pageIndex) => {
+      const grp = new Group();
+      let y = this.options.marginTop + (pageIndex === 0 ? firstHeaderReserve : 0);
+      for (const sys of page) {
+        sys.group.x = 0;
+        sys.group.y = y;
+        grp.add(sys.group);
+        y += sys.group.height + systemGap;
+      }
+      grp.update();
+      return grp;
+    });
+  }
+
+  private fromEnsembleScore(scr: S.Score, dur: string | null, width: number, height: number, showPublicationHeader: boolean): void {
+    const cw = width - this.options.marginLeft * 2;
+    const ch = height - this.options.marginTop - this.options.marginBottom;
+    if (dur !== null) scr.clearSystemBreak();
+    const chunks = this.ensembleChunks(scr);
+    const groups = this.ensembleGroups(scr);
+    const geometry = this.ensembleSystemGeometry(groups);
+    const systems: PianoSystem[] = [];
+    if (this.options.engravingStyle.rhythmicSpacingEnabled) {
+      const measureOptions = horizontalMeasureOptions(this.options);
+      const measureLayouts = chunks.map((chunk, index) => {
+        const entries = chunk.rows.flat();
+        const barDuration = entries
+          .filter((entry): entry is Barline => entry instanceof Barline)
+          .reduce((duration, entry) => Math.max(duration, entry.syncTick.toFloat()), 0);
+        const first = entries[0];
+        const meterDuration = first ? first.syncBeats * 4 / first.syncBeatType : 4;
+        const duration = chunk.pickup && barDuration > 1e-8
+          ? barDuration
+          : Math.max(barDuration, meterDuration);
+        return buildMeasureLayout(
+          index,
+          duration,
+          entries.map(measuredRhythmItem),
+          measureOptions,
+          {
+            ...chunk,
+            widthWeight: chunk.pickup ? Math.max(0.12, duration / Math.max(duration, meterDuration)) : 1,
+            countInTarget: !chunk.pickup,
+          },
+        );
+      });
+      const packed = packMeasureSystems(
+        measureLayouts,
+        Math.max(this.options.numberSize * 4, cw - geometry.musicStart),
+        this.options.engravingStyle.measuresPerSystem,
+        this.options.engravingStyle.justifyLastSystem,
+      );
+      for (const packedSystem of packed) {
+        const systemChunks = packedSystem.measures.map((measure) => chunks[measure.index]);
+        systems.push(this.makeEnsembleSystem(
+          systemChunks,
+          cw,
+          packedSystem.pageAfter,
+          groups,
+          geometry,
+          scr.tempoMarks,
+          packedSystem.measures,
+        ));
+      }
+    } else {
+      let current: EnsembleChunk[] = [];
+      let currentPageAfter = false;
+      const flush = (): void => {
+        if (current.length === 0) return;
+        systems.push(this.makeEnsembleSystem(
+          current,
+          cw,
+          currentPageAfter,
+          groups,
+          geometry,
+          scr.tempoMarks,
+        ));
+        current = [];
+        currentPageAfter = false;
+      };
+      for (const chunk of chunks) {
+        if (chunk.breakBefore && current.length > 0) {
+          currentPageAfter = chunk.pageBefore;
+          flush();
+        }
+        const candidate = [...current, chunk];
+        const entries = candidate.flatMap((item) => item.rows.flat());
+        const natural = alignPianoEntries(entries, [], this.options, null) + geometry.musicStart;
+        if (natural > cw && current.length > 0) flush();
+        current.push(chunk);
+        if (chunk.forceAfter) {
+          currentPageAfter = chunk.pageAfter;
+          flush();
+        }
+      }
+      flush();
+    }
+    const headerReserve = showPublicationHeader ? this.publicationHeaderReserve(scr) : 0;
+    const pages = this.paginatePiano(systems, ch, dur, headerReserve);
+    if (showPublicationHeader && pages[0]) this.addPublicationHeader(pages[0], scr, cw, headerReserve);
+    this.pages.push(...pages);
+    this.titleAndPageNumber("", width, height, cw);
+  }
+
+  private fromPianoScore(scr: S.Score, dur: string | null, width: number, height: number, showPublicationHeader: boolean): void {
+    const cw = width - this.options.marginLeft * 2;
+    const ch = height - this.options.marginTop - this.options.marginBottom;
+    const chunks = this.pianoChunks(scr);
+    const systems: PianoSystem[] = [];
+    const instrumentName = scr.instrumentName.trim() || "钢琴";
+    const firstGeometry = this.pianoSystemGeometry(instrumentName);
+    const continuationGeometry = this.pianoSystemGeometry(instrumentName, firstGeometry.instrumentX);
+    if (this.options.engravingStyle.rhythmicSpacingEnabled) {
+      const measureOptions = horizontalMeasureOptions(this.options);
+      const measureLayouts = chunks.map((chunk, index) => {
+        const entries = [...chunk.right, ...chunk.left];
+        const barDuration = entries
+          .filter((entry): entry is Barline => entry instanceof Barline)
+          .reduce((duration, entry) => Math.max(duration, entry.syncTick.toFloat()), 0);
+        const first = entries[0];
+        const meterDuration = first ? first.syncBeats * 4 / first.syncBeatType : 4;
+        const duration = chunk.pickup && barDuration > 1e-8
+          ? barDuration
+          : Math.max(barDuration, meterDuration);
+        return buildMeasureLayout(
+          index,
+          duration,
+          entries.map(measuredRhythmItem),
+          measureOptions,
+          {
+            ...chunk,
+            widthWeight: chunk.pickup ? Math.max(0.12, duration / Math.max(duration, meterDuration)) : 1,
+            countInTarget: !chunk.pickup,
+          },
+        );
+      });
+      const packed = packMeasureSystems(
+        measureLayouts,
+        (systemIndex) => {
+          const geometry = systemIndex === 0 ? firstGeometry : continuationGeometry;
+          return Math.max(this.options.numberSize * 4, cw - geometry.musicStart);
+        },
+        this.options.engravingStyle.measuresPerSystem,
+        this.options.engravingStyle.justifyLastSystem,
+      );
+      for (const system of packed) {
+        const firstSystem = systems.length === 0;
+        const geometry = firstSystem ? firstGeometry : continuationGeometry;
+        const systemChunks = system.measures.map((measure) => chunks[measure.index]);
+        systems.push(this.makePianoSystem(
+          systemChunks,
+          cw,
+          system.pageAfter,
+          instrumentName,
+          firstSystem,
+          geometry,
+          scr.tempoMarks,
+          system.measures,
+        ));
+      }
+    } else {
+      let current: PianoChunk[] = [];
+      let currentPageAfter = false;
+      const flush = (): void => {
+        if (current.length === 0) return;
+        const firstSystem = systems.length === 0;
+        const geometry = firstSystem ? firstGeometry : continuationGeometry;
+        systems.push(this.makePianoSystem(
+          current,
+          cw,
+          currentPageAfter,
+          instrumentName,
+          firstSystem,
+          geometry,
+          scr.tempoMarks,
+        ));
+        current = [];
+        currentPageAfter = false;
+      };
+      for (const chunk of chunks) {
+        if (chunk.breakBefore && current.length > 0) {
+          currentPageAfter = chunk.pageBefore;
+          flush();
+        }
+        const candidate = [...current, chunk];
+        const r = candidate.flatMap((c) => c.right);
+        const l = candidate.flatMap((c) => c.left);
+        const geometry = systems.length === 0 ? firstGeometry : continuationGeometry;
+        const natural = alignPianoEntries(r, l, this.options, null) + geometry.musicStart;
+        if (natural > cw && current.length > 0) flush();
+        current.push(chunk);
+        if (chunk.forceAfter) {
+          currentPageAfter = chunk.pageAfter;
+          flush();
+        }
+      }
+      flush();
+    }
+    const headerReserve = showPublicationHeader ? this.publicationHeaderReserve(scr) : 0;
+    const pages = this.paginatePiano(systems, ch, dur, headerReserve);
+    if (showPublicationHeader && pages[0]) this.addPublicationHeader(pages[0], scr, cw, headerReserve);
+    this.pages.push(...pages);
+    this.titleAndPageNumber("", width, height, cw);
+  }
+
+  fromScore(scr: S.Score, dur: string | null, width: number, height: number, showPublicationHeader = true): void {
+    S.normalizeOpeningPickup(scr);
+    for (const mark of scr.tempoMarks) mark.beatUnit = scr.tempoBeatUnit;
     this.pages = [];
+    if (scr.ensemble && scr.parts.length > 0) {
+      this.fromEnsembleScore(scr, dur, width, height, showPublicationHeader);
+      return;
+    }
+    if (scr.piano && scr.parts.length >= 2) {
+      this.fromPianoScore(scr, dur, width, height, showPublicationHeader);
+      return;
+    }
     const cw = width - this.options.marginLeft * 2;
     const ch = height - this.options.marginTop - this.options.marginBottom;
     const p = scr.parts[0];
     if (dur !== null) scr.clearSystemBreak();
     const l = new Line();
     const repMeasures = scr.playData.measures;
+    let flowMeasure = 0;
     repMeasures.forEach((it, idx) => {
       for (let mid = it.mid; mid < it.end; mid++) {
         const m = p.measures[mid];
         const pass = it.pass;
+        if (m.newSystem && l.entries.length > 0) {
+          const last = l.entries[l.entries.length - 1];
+          if (last instanceof LineBreak) {
+            if (m.newPage) last.newPage = true;
+          } else {
+            const br = new LineBreak();
+            br.newPage = m.newPage;
+            l.entries.push(br);
+          }
+        }
         m.autoBeamGroup();
         const final = mid === it.end - 1 && idx === repMeasures.length - 1;
-        l.load(m, pass, this.options, final);
+        l.load(m, pass, this.options, final, flowMeasure++);
       }
       if (it.endOfPass && dur === null) {
         const lst = l.entries[l.entries.length - 1];
@@ -1511,11 +3449,13 @@ export class Layout {
       this.breakByDur(l, dur, total, pass);
     }
     l.connectTextFrames();
-    for (const g of l.layout(cw, ch, this.options)) this.pages.push(g);
-    this.titleAndPageNumber(scr.title, width, height, cw);
+    const headerReserve = showPublicationHeader ? this.publicationHeaderReserve(scr) : 0;
+    for (const g of l.layout(cw, ch, this.options, headerReserve, scr.tempoMarks)) this.pages.push(g);
+    if (showPublicationHeader && this.pages[0]) this.addPublicationHeader(this.pages[0], scr, cw, headerReserve);
+    this.titleAndPageNumber("", width, height, cw);
   }
 
-  titleAndPageNumber(title: string, width: number, height: number, cw: number): void {
+  titleAndPageNumber(title: string, _width: number, height: number, cw: number): void {
     this.pages.forEach((pg, idx) => {
       pg.x += this.options.marginLeft;
       const tf = new TextFrame();
@@ -1528,10 +3468,10 @@ export class Layout {
       const tf1 = new TextFrame();
       tf1.text = `${idx + 1}/${this.pages.length}`;
       tf1.color = this.options.color;
-      tf1.x = 0.8 * width;
       tf1.y = tf.y;
-      tf1.font = tf.font;
+      tf1.font = this.options.lrcFont.scaled(0.8 / 3);
       tf1.update();
+      tf1.x = cw - tf1.width;
       pg.add(tf);
       pg.add(tf1);
     });

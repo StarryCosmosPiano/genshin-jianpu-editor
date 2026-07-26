@@ -1,8 +1,8 @@
 [package]
 name = "jpeditor"
-version = "0.5.4"
-description = "简谱编辑器"
-authors = []
+version = "0.1.0"
+description = "原琴简谱编辑器 / Genshin Jianpu Editor"
+authors = ["StarryCosmosPiano"]
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html

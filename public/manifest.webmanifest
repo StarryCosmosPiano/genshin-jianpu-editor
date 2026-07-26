@@ -1,7 +1,7 @@
 {
-  "name": "简谱编辑器 jpeditor",
-  "short_name": "jpeditor",
-  "description": "在线简谱（.jpwabc）排版与编辑器，支持简谱·五线谱混排、MusicXML 导入与多格式导出。",
+  "name": "原琴简谱编辑器",
+  "short_name": "原琴简谱",
+  "description": "面向原神琴谱制作的 MIDI 转简谱、键盘谱与实时 SVG 排版工具。",
   "lang": "zh-CN",
   "start_url": "./",
   "scope": "./",

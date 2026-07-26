@@ -1,0 +1,18 @@
+// Arpeggio, grace-note and MIDI tempo-annotation layout example
+.Title
+Title = 琶音、倚音与速度变化
+SubTitle = {钢琴双行简谱示例}
+Composer = {}
+Arranger = {}
+Lyricist = {}
+Instrument = {钢琴}
+KeyAndMeters = {1=C,4/4}
+Tempo = {90}
+TempoMarks = {1@0=accel;2@0=tempo:120;3@0=rit;4@0=tempo:90}
+Arpeggios = {1:1@1}
+WordsByAndMusicBy =
+.Voice.RH
+{2'}1' [1'3'5']-- |4' 5' 6' 1'' |7' 6' 5' 4' |3' 2' 1'- |]$(true,0,0,true)
+.Voice.LH
+1,--- |4,--- |5,--- |1,--- |]$(true,0,0,true)
+.Words

@@ -48,14 +48,10 @@ export async function saveBytes(
     new Uint8Array(ab).set(bytes);
     const blob = new Blob([ab], { type: mime });
     const a = document.createElement("a");
-    const url = URL.createObjectURL(blob);
-    a.href = url;
+    a.href = URL.createObjectURL(blob);
     a.download = defaultName;
-    a.style.display = "none";
-    document.body.append(a);
     a.click();
-    a.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    URL.revokeObjectURL(a.href);
   }
 }
 

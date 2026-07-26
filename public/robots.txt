@@ -11,4 +11,4 @@ Allow: /
 User-agent: Google-Extended
 Allow: /
 
-Sitemap: https://lodebar2026.github.io/jpeditor/sitemap.xml
+Sitemap: https://starrycosmospiano.github.io/genshin-jianpu-editor/sitemap.xml

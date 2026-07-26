@@ -10,13 +10,25 @@
     "dialog:default",
     "fs:allow-read-file",
     "fs:allow-write-file",
+    "fs:allow-read-dir",
+    "fs:allow-mkdir",
+    "fs:allow-exists",
+    {
+      "identifier": "opener:allow-open-path",
+      "allow": [
+        { "path": "$APPLOCALDATA/soundfonts" },
+        { "path": "$APPLOCALDATA/soundfonts/**" }
+      ]
+    },
     {
       "identifier": "fs:scope",
       "allow": [
         { "path": "$HOME/**" },
         { "path": "$DESKTOP/**" },
         { "path": "$DOCUMENT/**" },
-        { "path": "$DOWNLOAD/**" }
+        { "path": "$DOWNLOAD/**" },
+        { "path": "$APPLOCALDATA/soundfonts" },
+        { "path": "$APPLOCALDATA/soundfonts/**" }
       ]
     }
   ]
