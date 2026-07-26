@@ -66,8 +66,9 @@ jobs:
           prerelease: ${{ github.event.release.prerelease }}
           args: --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
 
-  # Web 版在 main 更新、手动触发或发布 release 时部署到 GitHub Pages
+  # Web 版在 main 更新或手动触发时部署到 GitHub Pages；release 标签只构建桌面安装包。
   pages-build:
+    if: github.event_name != 'release'
     runs-on: ubuntu-latest
     permissions:
       contents: read
