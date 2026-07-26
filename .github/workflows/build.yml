@@ -50,6 +50,10 @@ jobs:
       - name: Type check
         run: npx tsc --noEmit
 
+      - name: Verify release contains no bundled SF2
+        run: >-
+          node -e "const fs=require('fs');const dir='src/assets/soundfonts';const files=fs.existsSync(dir)?fs.readdirSync(dir).filter((name)=>name.toLowerCase().endsWith('.sf2')):[];if(files.length)throw new Error('SF2 files must not be included in release packages - '+files.join(', '))"
+
       - name: Build and upload to release
         uses: tauri-apps/tauri-action@v1
         env:

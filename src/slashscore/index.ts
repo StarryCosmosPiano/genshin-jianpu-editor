@@ -17,7 +17,7 @@ import type { MidiImportOptions, MidiQuantizeDivision, ParsedMidi, ParsedMidiNot
 
 export type SlashScoreKind = "keyboard" | "number";
 export type SlashDurationDivision = 4 | 8 | 16 | 32 | 64;
-export type SlashGroupMode = "subdivide" | "grace" | "arpeggio" | "triplet";
+export type SlashGroupMode = "none" | "subdivide" | "grace" | "arpeggio" | "triplet";
 /** Zero-width marker used by editable TXT scores to assign one pitch to a voice. */
 export const SLASH_VOICE_SEPARATOR = "\u2063";
 export const MAX_SLASH_VOICES = 9;
@@ -241,22 +241,95 @@ function looksLikeScoreLine(line: string): boolean {
   return nonSpace.length === 0 || latinLike / nonSpace.length >= 0.72;
 }
 
-function sourceLines(text: string): SourceLines {
-  const score: string[] = [];
-  const comments: string[] = [];
-  let ignoredTags = 0;
-  for (const raw of text.replace(/^\uFEFF/, "").replace(/\r/g, "").split("\n")) {
+interface SourceLineRecord {
+  raw: string;
+  text: string;
+  from: number;
+  score: boolean;
+  kind: SlashScoreKind | null;
+  sectionKind: SlashScoreKind | null;
+  ignoredTags: number;
+}
+
+function scoreLineKind(line: string): SlashScoreKind | null {
+  const withoutTags = line.replace(LINE_TAG_RE, "");
+  const keyboardCount = (withoutTags.match(/[A-Z]/g) ?? []).length;
+  const numberCount = [...withoutTags.matchAll(/(?:[#♯b♭]?[+-]*)([1-7])(?!\d)/g)].length;
+  if (keyboardCount === 0 && numberCount === 0) return null;
+  if (keyboardCount === numberCount) return null;
+  return keyboardCount > numberCount ? "keyboard" : "number";
+}
+
+function sourceLineRecords(text: string): SourceLineRecord[] {
+  const records: SourceLineRecord[] = [];
+  let lineFrom = text.startsWith("\uFEFF") ? 1 : 0;
+  let sectionKind: SlashScoreKind | null = null;
+  while (lineFrom <= text.length) {
+    let lineTo = lineFrom;
+    while (lineTo < text.length && text[lineTo] !== "\r" && text[lineTo] !== "\n") lineTo++;
+    const raw = text.slice(lineFrom, lineTo);
+    const header = raw.trim();
+    if (/^键盘谱$/i.test(header)) sectionKind = "keyboard";
+    else if (/^数字谱$/i.test(header)) sectionKind = "number";
     const stripped = stripLineTags(raw);
-    ignoredTags += stripped.count;
-    if (looksLikeScoreLine(stripped.text)) score.push(stripped.text);
-    else if (raw.trim()) comments.push(raw);
+    const score = looksLikeScoreLine(stripped.text);
+    records.push({
+      raw,
+      text: stripped.text,
+      from: lineFrom,
+      score,
+      kind: score ? scoreLineKind(stripped.text) : null,
+      sectionKind,
+      ignoredTags: stripped.count,
+    });
+    if (lineTo >= text.length) break;
+    lineFrom = lineTo + (text[lineTo] === "\r" && text[lineTo + 1] === "\n" ? 2 : 1);
   }
-  return { score, comments, ignoredTags };
+  return records;
+}
+
+function scoreLineOwner(records: readonly SourceLineRecord[], index: number): SlashScoreKind | null {
+  const record = records[index];
+  if (record.kind) return record.kind;
+  if (record.sectionKind) return record.sectionKind;
+  for (let cursor = index - 1; cursor >= 0; cursor--) {
+    if (!records[cursor].score) continue;
+    if (records[cursor].kind) return records[cursor].kind;
+  }
+  for (let cursor = index + 1; cursor < records.length; cursor++) {
+    if (!records[cursor].score) continue;
+    if (records[cursor].kind) return records[cursor].kind;
+  }
+  return null;
+}
+
+function selectedScoreLine(
+  records: readonly SourceLineRecord[],
+  index: number,
+  kind?: SlashScoreKind,
+): boolean {
+  if (!records[index].score) return false;
+  if (!kind) return true;
+  const owner = scoreLineOwner(records, index);
+  return owner === null || owner === kind;
+}
+
+function sourceLines(text: string, kind?: SlashScoreKind): SourceLines {
+  const records = sourceLineRecords(text);
+  return {
+    score: records
+      .filter((_record, index) => selectedScoreLine(records, index, kind))
+      .map((record) => record.text),
+    comments: records
+      .filter((record) => !record.score && record.raw.trim())
+      .map((record) => record.raw),
+    ignoredTags: records.reduce((sum, record) => sum + record.ignoredTags, 0),
+  };
 }
 
 /** Infer the minimum voice count from markers in real score lines only. */
-export function inferSlashVoiceCount(text: string): number {
-  const lines = sourceLines(text);
+export function inferSlashVoiceCount(text: string, kind?: SlashScoreKind): number {
+  const lines = sourceLines(text, kind);
   let maxMarkers = 0;
   for (const line of lines.score) {
     const runs = line.matchAll(/\u2063+(?=(?:[#♯b♭]*[,+']*|[#♯b♭]*[+-]*)[A-Z1-7])/g);
@@ -265,9 +338,9 @@ export function inferSlashVoiceCount(text: string): number {
   return clamp(maxMarkers + 1, 1, MAX_SLASH_VOICES);
 }
 
-function straySlashVoiceMarkerCount(text: string): number {
+function straySlashVoiceMarkerCount(text: string, kind?: SlashScoreKind): number {
   let stray = 0;
-  for (const line of sourceLines(text).score) {
+  for (const line of sourceLines(text, kind).score) {
     const all = (line.match(/\u2063/g) ?? []).length;
     const valid = [...line.matchAll(/\u2063+(?=(?:[#♯b♭]*[,+']*|[#♯b♭]*[+-]*)[A-Z1-7])/g)]
       .reduce((sum, match) => sum + match[0].length, 0);
@@ -375,6 +448,7 @@ function readDirectives(text: string): Directives {
     }
     const groupMode = (label: "花括号" | "方括号"): SlashGroupMode | null => {
       if (!line.includes(label)) return null;
+      if (/(?:留空|忽略|不使用|无特殊功能)/.test(line)) return "none";
       if (/倚音/.test(line)) return "grace";
       if (/琶音/.test(line)) return "arpeggio";
       if (/三连音/.test(line)) return "triplet";
@@ -393,7 +467,7 @@ function readDirectives(text: string): Directives {
         bpm?: number; f?: number; m?: [number, number]; s?: Record<string, SlashDurationDivision>;
         bu?: TempoBeatUnit;
         sp?: SlashDurationDivision | null; nd?: SlashDurationDivision | null;
-        b?: "g" | "s" | "a" | "t"; q?: "g" | "s" | "a" | "t";
+        b?: "n" | "g" | "s" | "a" | "t"; q?: "n" | "g" | "s" | "a" | "t";
         tm?: SlashTempoMark[];
       };
       const value = JSON.parse(stored[1]) as Stored;
@@ -443,13 +517,15 @@ function readDirectives(text: string): Directives {
         result.noteDivision = storedNote as SlashDurationDivision | null;
       }
       const compactMode = (value: unknown): SlashGroupMode | undefined =>
-        value === "g" ? "grace"
+        value === "n" ? "none"
+          : value === "g" ? "grace"
           : value === "s" ? "subdivide"
             : value === "a" ? "arpeggio"
               : value === "t" ? "triplet"
                 : undefined;
       const validMode = (value: unknown): value is SlashGroupMode =>
-        value === "grace" || value === "subdivide" || value === "arpeggio" || value === "triplet";
+        value === "none" || value === "grace" || value === "subdivide"
+        || value === "arpeggio" || value === "triplet";
       const storedBrace = value.braceMode ?? compactMode(value.b);
       const storedBracket = value.bracketMode ?? compactMode(value.q);
       if (validMode(storedBrace)) result.braceMode = storedBrace;
@@ -541,7 +617,7 @@ function segmentMarkerDuration(
       const atomCount = braceAtomsText(content).length;
       if (mode === "triplet") {
         duration += (nominal > 1e-8 ? nominal : atomCount * (noteUnit || braceUnit)) * 2 / 3;
-      } else if (mode === "subdivide") {
+      } else if (mode === "subdivide" || mode === "none") {
         duration += nominal > 1e-8 ? nominal : atomCount * braceUnit;
       }
       // Grace notes and arpeggio signs decorate an adjacent sounding event;
@@ -604,9 +680,12 @@ export function inferSlashMeter(
   braceMode: SlashBraceMode,
   noteDivision: SlashDurationDivision | null = null,
   bracketMode: SlashGroupMode = "triplet",
+  kind?: SlashScoreKind,
 ): SlashMeterSuggestion {
-  const lines = sourceLines(text);
   const directive = readDirectives(text);
+  const allLines = sourceLines(text);
+  const selectedKind = kind ?? detectKind(text, allLines, directive);
+  const lines = sourceLines(text, selectedKind);
   const mappings = effectiveMappings({ symbolDurations, spaceDivision });
   const groupCounts = lines.score.map((line) => splitGroups(line).length).filter((count) => count > 0);
   const groupsPerMeasure = mode(groupCounts, 4);
@@ -646,8 +725,10 @@ export function inferSlashMeter(
 }
 
 export function analyzeSlashScore(text: string): SlashScoreAnalysis {
-  const lines = sourceLines(text);
   const directive = readDirectives(text);
+  const allLines = sourceLines(text);
+  const detectedKind = detectKind(text, allLines, directive);
+  const lines = sourceLines(text, detectedKind);
   const observed = observedSymbols(lines.score);
   const suggestedMappings: Record<string, SlashDurationDivision> = {};
   for (const symbol of observed.symbols) {
@@ -659,7 +740,15 @@ export function analyzeSlashScore(text: string): SlashScoreAnalysis {
   const noteDivision = directive.noteDivision ?? null;
   const braceMode = directive.braceMode ?? "grace";
   const bracketMode = directive.bracketMode ?? "triplet";
-  let meter = inferSlashMeter(text, suggestedMappings, spaceDivision, braceMode, noteDivision, bracketMode);
+  let meter = inferSlashMeter(
+    text,
+    suggestedMappings,
+    spaceDivision,
+    braceMode,
+    noteDivision,
+    bracketMode,
+    detectedKind,
+  );
   const rawGroupCount = lines.score.length === 1 ? splitGroups(lines.score[0]).length : 0;
   // A single unbroken run that would imply an unusually long simple meter is
   // more likely several measures without line/bar separators. Ask for a meter
@@ -680,9 +769,9 @@ export function analyzeSlashScore(text: string): SlashScoreAnalysis {
   const measureCount = wholeMeasureGroups
     ? lines.score.reduce((sum, line) => sum + splitGroups(line).length, 0)
     : continuous ? Math.ceil(firstGroupCount / expectedGroups) : lines.score.length;
-  const voiceCount = directive.voiceCount ?? inferSlashVoiceCount(text);
+  const voiceCount = directive.voiceCount ?? inferSlashVoiceCount(text, detectedKind);
   return {
-    detectedKind: detectKind(text, lines, directive),
+    detectedKind,
     voiceCount,
     measureCount,
     commentCount: lines.comments.length,
@@ -789,6 +878,10 @@ export function slashPitchSources(text: string, baseOptions: SlashScoreOptions):
   const options = optionsWithDirectives(text, baseOptions);
   const mappings = effectiveMappings(options);
   const result: SlashPitchSource[] = [];
+  const lineRecords = sourceLineRecords(text);
+  const selectedLineStarts = new Set(lineRecords
+    .filter((_record, index) => selectedScoreLine(lineRecords, index, options.kind))
+    .map((record) => record.from));
   let eventIndex = 0;
   let lineFrom = text.startsWith("\uFEFF") ? 1 : 0;
 
@@ -796,8 +889,7 @@ export function slashPitchSources(text: string, baseOptions: SlashScoreOptions):
     let lineTo = lineFrom;
     while (lineTo < text.length && text[lineTo] !== "\r" && text[lineTo] !== "\n") lineTo++;
     const raw = text.slice(lineFrom, lineTo);
-    const stripped = stripLineTags(raw);
-    if (looksLikeScoreLine(stripped.text)) {
+    if (selectedLineStarts.has(lineFrom)) {
       const tagRanges = [...raw.matchAll(/\[(?:line|end)\s*\d+\s*\]/gi)]
         .map((match) => [match.index ?? 0, (match.index ?? 0) + match[0].length] as const);
       const tagAt = (index: number): readonly [number, number] | undefined =>
@@ -1252,7 +1344,10 @@ function optionsWithDirectives(text: string, base: SlashScoreOptions): SlashScor
     // supply a meter for a continuous score with no measure separators.
     kind: base.kind ?? directive.kind ?? "number",
     voiceCount: clamp(
-      Math.round(base.voiceCount ?? directive.voiceCount ?? inferSlashVoiceCount(text)),
+      Math.round(base.voiceCount ?? directive.voiceCount ?? inferSlashVoiceCount(
+        text,
+        base.kind ?? directive.kind ?? undefined,
+      )),
       1,
       MAX_SLASH_VOICES,
     ),
@@ -1671,7 +1766,7 @@ function applyOpeningPickup(
 
 export function parseSlashScore(text: string, baseOptions: SlashScoreOptions): SlashScoreResult {
   const options = optionsWithDirectives(text, baseOptions);
-  const lines = sourceLines(text);
+  const lines = sourceLines(text, options.kind);
   if (lines.score.length === 0) throw new Error("没有找到斜杠谱小节；每个有效小节需单独一行并包含 / 分隔");
   const measureLength = options.beats * 4 / options.beatType;
   const inferred = inferSlashMeter(
@@ -1681,6 +1776,7 @@ export function parseSlashScore(text: string, baseOptions: SlashScoreOptions): S
     options.braceMode,
     options.noteDivision,
     options.bracketMode ?? "triplet",
+    options.kind,
   );
   const expectedGroups = groupsForMeter({ ...inferred, beats: options.beats, beatType: options.beatType });
   const groupDuration = measureLength / Math.max(1, expectedGroups);
@@ -1767,7 +1863,7 @@ export function parseSlashScore(text: string, baseOptions: SlashScoreOptions): S
   if (maxMarkerCount >= options.voiceCount) {
     warnings.push(`发现 ${maxMarkerCount} 个连续声部标记，但当前仅启用 ${options.voiceCount} 个声部；超出部分已并入默认声部`);
   }
-  const strayMarkers = straySlashVoiceMarkerCount(text);
+  const strayMarkers = straySlashVoiceMarkerCount(text, options.kind);
   if (strayMarkers > 0) warnings.push(`${strayMarkers} 个后面没有音高的声部标记已忽略`);
 
   if (!wholeMeasureGroups && lines.score.length === 1 && logicalMeasures.length > 1) warnings.push(`原文没有小节换行，已按 ${options.beats}/${options.beatType} 自动分成 ${logicalMeasures.length} 小节`);
@@ -2170,7 +2266,9 @@ function keyName(fifths: number): string {
 }
 
 function slashGroupDirective(label: "花括号" | "方括号", mode: SlashGroupMode): string {
-  const description = mode === "grace"
+  const description = mode === "none"
+    ? "留空（不指定特殊功能，内部按普通音符读取）"
+    : mode === "grace"
     ? "倚音（装饰音不增加小节拍长）"
     : mode === "arpeggio"
       ? "琶音（括号内三个及以上音按滚奏和弦处理）"
@@ -2319,7 +2417,7 @@ export function slashScoreTemplate(kind: SlashScoreKind): string {
 
 /** Persist dialog choices inside a normal ignored TXT comment without deleting any user text. */
 export function embedSlashScoreOptions(text: string, options: SlashScoreOptions): string {
-  const clean = text.replace(/^\s*\/\/\s*@jpeditor\s+\{[^\n]*\}\s*\r?\n?/gm, "");
+  const clean = stripSlashScoreOptions(text);
   const stored: Record<string, unknown> = {
     v: 2,
     vc: clamp(Math.round(options.voiceCount), 1, MAX_SLASH_VOICES),
@@ -2348,6 +2446,16 @@ export function embedSlashScoreOptions(text: string, options: SlashScoreOptions)
   const header = lines.findIndex((item) => /^\s*(?:键盘谱|数字谱)\s*$/.test(item));
   lines.splice(header >= 0 ? header + 1 : 0, 0, line);
   return lines.join("\n");
+}
+
+/** Remove only the persisted editor settings comment and keep every score/comment line unchanged. */
+export function stripSlashScoreOptions(text: string): string {
+  const bom = text.startsWith("\uFEFF") ? "\uFEFF" : "";
+  const body = bom ? text.slice(1) : text;
+  return bom + body.replace(
+    /^[ \t]*\/\/[ \t]*@jpeditor[ \t]+\{[^\r\n]*\}[ \t]*(?:\r?\n|$)/gm,
+    "",
+  );
 }
 
 export interface SlashVoiceMigration {
@@ -2422,8 +2530,9 @@ export function stripSlashVoiceMarkers(text: string, options?: SlashScoreOptions
     );
 }
 
-function compactSlashGroupMode(mode: SlashGroupMode): "g" | "s" | "a" | "t" {
-  return mode === "grace" ? "g"
+function compactSlashGroupMode(mode: SlashGroupMode): "n" | "g" | "s" | "a" | "t" {
+  return mode === "none" ? "n"
+    : mode === "grace" ? "g"
     : mode === "subdivide" ? "s"
       : mode === "arpeggio" ? "a"
         : "t";

@@ -6,6 +6,7 @@ import {
   type TempoBeatUnit,
 } from "../score/score";
 import {
+  analyzeSlashScore,
   defaultSlashScoreOptions,
   inferSlashMeter,
   parseSlashScore,
@@ -51,6 +52,7 @@ function selectedDivision(select: HTMLSelectElement): SlashDurationDivision | nu
 function groupModeSelect(value: SlashGroupMode): HTMLSelectElement {
   const select = document.createElement("select");
   select.append(
+    option("none", "留空（不指定特殊功能）", value === "none"),
     option("grace", "倚音：装饰音借用后方间隔，不增加小节拍长", value === "grace"),
     option("arpeggio", "琶音：括号内三个及以上音作为滚奏和弦", value === "arpeggio"),
     option("triplet", "三连音：括号内三个时值按 3:2 压缩", value === "triplet"),
@@ -70,6 +72,8 @@ interface SymbolRow {
   division: HTMLSelectElement;
 }
 
+type SlashDialogPurpose = "import" | "settings";
+
 function collectMappings(rows: SymbolRow[]): Record<string, SlashDurationDivision> {
   const mappings: Record<string, SlashDurationDivision> = {};
   for (const item of rows) {
@@ -86,6 +90,7 @@ export function showSlashScoreImportDialog(
   analysis: SlashScoreAnalysis,
   fileName: string,
   seed?: Partial<SlashScoreOptions>,
+  purpose: SlashDialogPurpose = "import",
 ): Promise<SlashScoreOptions | null> {
   return new Promise((resolve) => {
     const defaults = defaultSlashScoreOptions(analysis.detectedKind, analysis);
@@ -102,19 +107,26 @@ export function showSlashScoreImportDialog(
     box.className = "modal-box slash-import-box";
     const heading = document.createElement("div");
     heading.className = "modal-title";
-    heading.textContent = fileName.startsWith("新建") ? "创建斜杠谱" : "导入键盘谱 / 数字谱";
+    heading.textContent = purpose === "settings"
+      ? "乐谱设置"
+      : fileName.startsWith("新建") ? "创建斜杠谱" : "导入键盘谱 / 数字谱";
 
     const info = document.createElement("div");
     info.className = "midi-import-info";
-    info.textContent = `识别为${analysis.detectedKind === "keyboard" ? "键盘谱" : "数字谱"} · ${analysis.measureCount} 小节 · ` +
-      `${analysis.commentCount} 行说明作为注释保留 · 忽略 ${analysis.ignoredTagCount} 个 line/end 标签` +
-      (analysis.continuous ? " · 未发现小节换行，将按下方拍号自动分割" : "");
+    info.textContent = purpose === "settings"
+      ? `正在设置当前${initial.kind === "keyboard" ? "键盘谱" : "数字谱"} · ${analysis.measureCount} 小节；应用后会立即重新解析、排版并用于播放。`
+      : `识别为${analysis.detectedKind === "keyboard" ? "键盘谱" : "数字谱"} · ${analysis.measureCount} 小节 · ` +
+        `${analysis.commentCount} 行说明作为注释保留 · 忽略 ${analysis.ignoredTagCount} 个 line/end 标签` +
+        (analysis.continuous ? " · 未发现小节换行，将按下方拍号自动分割" : "");
 
     const kind = document.createElement("select");
     kind.append(
       option("keyboard", "键盘谱（A–Z）", initial.kind === "keyboard"),
       option("number", "数字谱（1–7、+/- 八度）", initial.kind === "number"),
     );
+    const kindHint = document.createElement("div");
+    kindHint.className = "modal-hint";
+    kindHint.textContent = "文本同时含键盘谱和数字谱时，两种正文都会原样保留；当前只解析这里选择的谱型，另一种谱行不参与小节、休止、播放和右侧排版。";
     const voiceCount = document.createElement("input");
     voiceCount.type = "number";
     voiceCount.min = "1";
@@ -246,7 +258,9 @@ export function showSlashScoreImportDialog(
     const warning = document.createElement("div");
     warning.className = "midi-import-warning";
     warning.hidden = true;
-    let meterTouched = false;
+    // Import may seed an inferred meter. Editing an existing document must
+    // preserve its stored meter unless the user explicitly changes it.
+    let meterTouched = purpose === "settings";
 
     const currentMappings = () => collectMappings(symbolRows);
     const updateRecommendation = () => {
@@ -257,6 +271,7 @@ export function showSlashScoreImportDialog(
         braceMode.value as SlashBraceMode,
         selectedDivision(noteDivision),
         bracketMode.value as SlashGroupMode,
+        kind.value as SlashScoreKind,
       );
       meterHint.textContent = `按当前符号推荐：${suggestion.beats}/${suggestion.beatType}；` +
         `典型每小节 ${suggestion.groupsPerMeasure} 个斜杠拍组，每组约 ${suggestion.groupQuarterNotes.toFixed(3)} 个四分音符。` +
@@ -286,6 +301,7 @@ export function showSlashScoreImportDialog(
     noteDivision.onchange = updateRecommendation;
     braceMode.onchange = updateRecommendation;
     bracketMode.onchange = updateRecommendation;
+    kind.onchange = updateRecommendation;
 
     const metadata = document.createElement("details");
     const metadataSummary = document.createElement("summary");
@@ -334,6 +350,10 @@ export function showSlashScoreImportDialog(
     cancel.textContent = "取消";
     const confirm = document.createElement("button");
     const updateConfirmLabel = () => {
+      if (purpose === "settings") {
+        confirm.textContent = "应用到当前乐谱";
+        return;
+      }
       const count = clampInt(voiceCount.value, 1, 9, initial.voiceCount);
       confirm.textContent = count === 1 ? "导入为单行简谱" : `导入为 ${count} 声部简谱`;
     };
@@ -344,6 +364,7 @@ export function showSlashScoreImportDialog(
       heading,
       info,
       row("谱子类型", kind),
+      kindHint,
       row("声部数量（1–9）", voiceCount),
       row("多声部乐器名称", instrumentName),
       row("速度（BPM）", tempo),
@@ -391,6 +412,7 @@ export function showSlashScoreImportDialog(
       noteDivision: selectedDivision(noteDivision),
       braceMode: braceMode.value as SlashBraceMode,
       bracketMode: bracketMode.value as SlashGroupMode,
+      tempoMarks: initial.tempoMarks?.map((mark) => ({ ...mark })) ?? [],
     });
 
     const close = (value: SlashScoreOptions | null) => { overlay.remove(); resolve(value); };
@@ -411,6 +433,21 @@ export function showSlashScoreImportDialog(
     updateVoiceHint();
     kind.focus();
   });
+}
+
+/** Reuse the complete import configuration as an editor for the current slash-score document. */
+export function showSlashScoreSettingsDialog(
+  text: string,
+  current: SlashScoreOptions,
+): Promise<SlashScoreOptions | null> {
+  const analysis = analyzeSlashScore(text);
+  return showSlashScoreImportDialog(
+    text,
+    { ...analysis, detectedKind: current.kind },
+    `${current.title.trim() || "当前乐谱"}.txt`,
+    current,
+    "settings",
+  );
 }
 
 export function showCreateScoreDialog(): Promise<"jpw" | SlashScoreKind | null> {

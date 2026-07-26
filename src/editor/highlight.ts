@@ -96,6 +96,7 @@ export interface SlashVoiceHighlightRange {
   markerFrom: number;
   voiceIndex: number;
   color: string;
+  decorateText: boolean;
   showMarker: boolean;
 }
 
@@ -107,7 +108,7 @@ function voiceHighlightDecorations(ranges: readonly SlashVoiceHighlightRange[]):
   const items: Array<{ from: number; to: number; decoration: Decoration }> = [];
   for (const range of ranges) {
     const color = /^#[\da-f]{6}$/i.test(range.color) ? range.color : "#dc2626";
-    if (range.to > range.from) {
+    if (range.decorateText && range.to > range.from) {
       items.push({
         from: range.from,
         to: range.to,

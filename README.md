@@ -8,6 +8,7 @@
 An open-source jianpu editor, MIDI converter, and score typesetter for Genshin musicians
 
 [![在线使用](https://img.shields.io/badge/在线使用-GitHub%20Pages-2f81f7?logo=github)](https://starrycosmospiano.github.io/genshin-jianpu-editor/)
+[![下载桌面版](https://img.shields.io/github/v/release/StarryCosmosPiano/genshin-jianpu-editor?label=下载桌面版&color=2ea44f)](https://github.com/StarryCosmosPiano/genshin-jianpu-editor/releases/latest)
 [![Platform](https://img.shields.io/badge/platform-Web%20%7C%20Windows%20%7C%20macOS-555)](#快速开始)
 [![License: MIT](https://img.shields.io/badge/license-MIT-f2c744.svg)](LICENSE)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.x-3178c6?logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
@@ -34,7 +35,8 @@ An open-source jianpu editor, MIDI converter, and score typesetter for Genshin m
 - **MIDI 智能转简谱**：自动分析节拍、调号、BPM 和量化精度，支持 4 / 8 / 16 /
   32 / 64 分音符、三连音、和弦、倚音、琶音、延音与跨小节长音。
 - **原琴常用文本谱**：支持键盘谱 TXT 和数字斜杠谱 TXT，可自定义键位、时值字符、
-  括号和弦、多个同步声部，并在文本与谱面之间双向定位。
+  括号和弦、多个同步声部，并在文本与谱面之间双向定位。混合 TXT 可随时切换当前识别谱型，
+  未选择的谱文会原样保留，不参与排版、播放或小节计算。
 - **钢琴双手与多轨总谱**：支持 `.Voice.RH` / `.Voice.LH` 双行简谱，以及多乐器、多声部
   的同步排版、播放和分轨 MIDI 导出。
 - **多格式导入**：支持 `.jpwabc`、MIDI、MusicXML、ABC、键盘谱、数字谱以及 PNG / JPG /
@@ -58,6 +60,19 @@ An open-source jianpu editor, MIDI converter, and score typesetter for Genshin m
 
 从源码构建网页端时，也可以把自备的 `.sf2` 文件放入
 `src/assets/soundfonts/` 后重新构建；该目录中的 SF2 文件已被 Git 忽略。
+
+### 下载桌面版
+
+不需要安装 Node.js、Rust 或其他开发工具，直接前往
+[GitHub Releases](https://github.com/StarryCosmosPiano/genshin-jianpu-editor/releases/latest)
+下载对应安装包：
+
+- **Windows x64**：下载名称以 `-setup.exe` 结尾的安装程序。包内包含离线 WebView2
+  安装程序和应用运行资源，安装时无需再下载运行环境。
+- **macOS Apple Silicon**：下载 `.dmg` 文件后拖入“应用程序”。
+
+安装包不包含 SF2 音源。当前发布包未使用商业代码签名证书，首次运行时 Windows
+SmartScreen 或 macOS Gatekeeper 可能显示安全提示。
 
 ### 快速开始
 
@@ -133,7 +148,9 @@ sync. Notes can also be selected and edited directly on the rendered score.
 - **Smart MIDI-to-jianpu conversion** with beat, key, tempo, quantization,
   triplet, chord, grace-note, arpeggio, tie, and cross-measure note handling.
 - **Keyboard and slash-number TXT formats** with configurable key mappings,
-  duration symbols, chords, and synchronized voices.
+  duration symbols, chords, and synchronized voices. Mixed TXT files can switch
+  the active notation type without deleting the other notation; ignored lines
+  do not affect layout, playback, measures, or rests.
 - **Paired right/left-hand and multi-track scores** with synchronized layout,
   playback, and multi-track MIDI export.
 - **Imports** `.jpwabc`, MIDI, MusicXML, ABC, keyboard TXT, numbered TXT, and
@@ -158,6 +175,21 @@ files:
 
 For a local web build, authorized `.sf2` files may be placed in
 `src/assets/soundfonts/` before building. They are ignored by Git.
+
+### Desktop downloads
+
+No Node.js, Rust, or other development tools are required. Open
+[GitHub Releases](https://github.com/StarryCosmosPiano/genshin-jianpu-editor/releases/latest)
+and download the package for your platform:
+
+- **Windows x64:** use the installer ending in `-setup.exe`. It includes the
+  offline WebView2 installer and all application runtime assets.
+- **macOS Apple Silicon:** download the `.dmg` and drag the app into
+  Applications.
+
+Release packages do not contain SF2 SoundFonts. The current builds are not
+commercially code-signed, so Windows SmartScreen or macOS Gatekeeper may show
+a warning on first launch.
 
 ### Getting started
 
