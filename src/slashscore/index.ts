@@ -14,6 +14,11 @@ import {
 import { midiToScore } from "../midi/importer";
 import { detectMidiSlashGestures, type MidiSlashGesture } from "../midi/gestures";
 import type { MidiImportOptions, MidiQuantizeDivision, ParsedMidi, ParsedMidiNote } from "../midi/types";
+import {
+  applyNoteTimingEdits,
+  normalizeNoteTimingEdits,
+  type NoteTimingEditData,
+} from "../score/note-timing";
 
 export type SlashScoreKind = "keyboard" | "number";
 export type SlashDurationDivision = 4 | 8 | 16 | 32 | 64;
@@ -57,6 +62,8 @@ export interface SlashScoreOptions {
   bracketMode?: SlashGroupMode;
   /** MIDI tempo annotations retained inside the editable TXT settings comment. */
   tempoMarks?: SlashTempoMark[];
+  /** Direct score-pane rhythmic edits retained inside the TXT settings comment. */
+  noteTimingEdits?: NoteTimingEditData[];
 }
 
 export interface SlashMeterSuggestion {
@@ -90,6 +97,7 @@ export interface SlashScoreAnalysis {
   suggestedBraceMode: SlashBraceMode;
   suggestedBracketMode: SlashGroupMode;
   tempoMarks: SlashTempoMark[];
+  noteTimingEdits: NoteTimingEditData[];
   /** One long score line contains several measures and must be split from the chosen meter. */
   continuous: boolean;
 }
@@ -161,6 +169,7 @@ interface Directives {
   braceMode: SlashBraceMode | null;
   bracketMode: SlashGroupMode | null;
   tempoMarks: SlashTempoMark[];
+  noteTimingEdits: NoteTimingEditData[];
 }
 
 interface TimedEvent {
@@ -393,6 +402,7 @@ function readDirectives(text: string): Directives {
     braceMode: null,
     bracketMode: null,
     tempoMarks: [],
+    noteTimingEdits: [],
   };
   const meter = /(?:^|\n)\s*(\d{1,2})\s*\/\s*(2|4|8|16)\s*拍?/m.exec(text);
   if (meter) {
@@ -469,6 +479,7 @@ function readDirectives(text: string): Directives {
         sp?: SlashDurationDivision | null; nd?: SlashDurationDivision | null;
         b?: "n" | "g" | "s" | "a" | "t"; q?: "n" | "g" | "s" | "a" | "t";
         tm?: SlashTempoMark[];
+        ne?: NoteTimingEditData[];
       };
       const value = JSON.parse(stored[1]) as Stored;
       const storedKind = value.kind ?? (value.k === "k" ? "keyboard" : value.k === "n" ? "number" : undefined);
@@ -544,6 +555,7 @@ function readDirectives(text: string): Directives {
           return [{ measure, offset, kind, bpm }];
         });
       }
+      result.noteTimingEdits = normalizeNoteTimingEdits(value.noteTimingEdits ?? value.ne);
     } catch {
       // A damaged settings comment is ordinary ignored text; natural-language directives still work.
     }
@@ -793,6 +805,7 @@ export function analyzeSlashScore(text: string): SlashScoreAnalysis {
     suggestedBraceMode: braceMode,
     suggestedBracketMode: bracketMode,
     tempoMarks: directive.tempoMarks,
+    noteTimingEdits: directive.noteTimingEdits,
     continuous,
   };
 }
@@ -818,6 +831,7 @@ export function defaultSlashScoreOptions(kind: SlashScoreKind, analysis?: SlashS
     braceMode: analysis?.suggestedBraceMode ?? "grace",
     bracketMode: analysis?.suggestedBracketMode ?? "triplet",
     tempoMarks: analysis?.tempoMarks.map((mark) => ({ ...mark })) ?? [],
+    noteTimingEdits: analysis?.noteTimingEdits.map((edit) => ({ ...edit })) ?? [],
   };
 }
 
@@ -1372,6 +1386,9 @@ function optionsWithDirectives(text: string, base: SlashScoreOptions): SlashScor
     braceMode: base.braceMode,
     bracketMode: base.bracketMode ?? directive.bracketMode ?? "triplet",
     tempoMarks: base.tempoMarks ?? directive.tempoMarks,
+    noteTimingEdits: base.noteTimingEdits?.length
+      ? base.noteTimingEdits
+      : directive.noteTimingEdits,
   };
 }
 
@@ -2025,6 +2042,7 @@ export function parseSlashScore(text: string, baseOptions: SlashScoreOptions): S
     // can pull following systems back into usable space on the previous page.
     measure.newPage = false;
   }));
+  applyNoteTimingEdits(imported.score, options.noteTimingEdits ?? [], "slash");
   return {
     score: imported.score,
     summary: {
@@ -2568,6 +2586,9 @@ export function embedSlashScoreOptions(text: string, options: SlashScoreOptions)
   if (options.lyricist) stored.l = options.lyricist;
   if (options.tempoMarks?.length) {
     stored.tm = options.tempoMarks.map((mark) => ({ ...mark }));
+  }
+  if (options.noteTimingEdits?.length) {
+    stored.ne = normalizeNoteTimingEdits(options.noteTimingEdits).map((edit) => ({ ...edit }));
   }
   const line = `// @jpeditor ${JSON.stringify(stored)}`;
   const lines = clean.replace(/^\uFEFF/, "").split(/\r?\n/);

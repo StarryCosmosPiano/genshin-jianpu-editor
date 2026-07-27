@@ -72,7 +72,7 @@ function check(value: unknown, message: string): asserts value {
   if (!value) throw new Error(message);
 }
 
-const [{ JpwFile }, { fromJpw }, { scoreToJpwabc }, { buildTimeline }, { scoreToMidi }, layoutMod, scoreMod, painterMod, musicXmlMod, smuflMod, slashMod, selectionMod] =
+const [{ JpwFile }, { fromJpw }, { scoreToJpwabc }, { buildTimeline }, { scoreToMidi }, layoutMod, scoreMod, painterMod, musicXmlMod, smuflMod, slashMod, selectionMod, timingMod] =
   await Promise.all([
     import("./src/jpword/jpwfile"),
     import("./src/score/jpwimport"),
@@ -86,6 +86,7 @@ const [{ JpwFile }, { fromJpw }, { scoreToJpwabc }, { buildTimeline }, { scoreTo
     import("./src/smufl/smufl"),
     import("./src/slashscore"),
     import("./src/editor/note-selection"),
+    import("./src/score/note-timing"),
   ]);
 
 const smuflMeta = smuflMod.MetaData.fromJson(JSON.parse(await readFile("public/redist/bravura_metadata.json", "utf-8")));
@@ -167,6 +168,66 @@ check(selectionMod.editJpwPitch("6,", { kind: "octave", delta: 1 }) === "6"
   && selectionMod.editJpwPitch("6", { kind: "octave", delta: 1 }) === "6'"
   && selectionMod.editJpwPitch("2", { kind: "octave", delta: -1 }) === "2,",
 "arrow-key octave editing did not cross lower/normal/upper octaves correctly");
+
+const timingText = `.Title
+KeyAndMeters = {1=C,4/4}
+NoteTimingEdits = {1:2@2,0;1:4@0,1/4}
+.Voice
+1 2 3 4 | 5 6 7 1' |]
+`;
+const timingFile = JpwFile.fromString(timingText);
+check(timingFile, "direct timing-edit fixture did not parse");
+const timingScore = fromJpw(timingFile);
+check(timingScore, "direct timing-edit fixture did not import");
+const timingSources = selectionMod.buildJpwSourceNotes(timingText, timingScore);
+check(timingSources.map((source) => timingText.slice(source.from, source.to)).join(" ") === "1 2 3 4 5 6 7 1'",
+  "moving a chord across its neighbours broke source-note identity");
+const timingChords = timingScore.parts[0].measures.flatMap((measure) =>
+  measure.entries.filter((entry): entry is InstanceType<typeof scoreMod.Chord> =>
+    entry instanceof scoreMod.Chord));
+const movedSecond = timingSources.find((source) => source.chordIndex === 1)?.chord;
+check(movedSecond?.position.equals(new Fraction(3)),
+  "right-arrow timing delta did not move the selected chord by the persisted grid amount");
+const generatedAcrossBar = timingChords.find((chord) =>
+  chord.generatedTimingContinuation && chord.measure.index === 1 && chord.position.equals(0));
+check(generatedAcrossBar?.duration?.equals(new Fraction(1, 4))
+  && generatedAcrossBar.notes.every((note) => note.tieEnd),
+"JPW duration growth was not split into a tied continuation across the barline");
+check(timingScore.parts[0].measures[0].duration.equals(new Fraction(4)),
+  "moving a final attack changed the fixed written measure span");
+const parsedTiming = timingMod.parseJpwNoteTimingEdits(
+  timingMod.serializeJpwNoteTimingEdits(timingScore.noteTimingEdits),
+);
+check(parsedTiming.length === 2
+  && parsedTiming[0].move === "2"
+  && parsedTiming[1].duration === "1/4",
+"timing-edit metadata did not round-trip exactly");
+const serializedTimingText = scoreToJpwabc(timingScore);
+const serializedTimingFile = JpwFile.fromString(serializedTimingText);
+check(serializedTimingFile, "serialized timing-edit fixture did not parse");
+const serializedTimingScore = fromJpw(serializedTimingFile);
+check(serializedTimingScore, "serialized timing-edit fixture did not import");
+const serializedTimingSources = selectionMod.buildJpwSourceNotes(
+  serializedTimingText,
+  serializedTimingScore,
+);
+check(serializedTimingSources
+  .map((source) => serializedTimingText.slice(source.from, source.to)).join(" ")
+  === "1 2 3 4 5 6 7 1'",
+"serializing an edited score baked its moved order into the JPW source");
+const serializedMovedSecond = serializedTimingSources
+  .find((source) => source.chordIndex === 1)?.chord;
+const serializedContinuation = serializedTimingScore.parts[0].measures
+  .flatMap((measure) => measure.entries)
+  .find((entry): entry is InstanceType<typeof scoreMod.Chord> =>
+    entry instanceof scoreMod.Chord
+    && entry.generatedTimingContinuation
+    && entry.measure.index === 1
+    && entry.position.equals(0));
+check(serializedMovedSecond?.position.equals(new Fraction(3))
+  && serializedContinuation?.duration?.equals(new Fraction(1, 4)),
+"serializing and reopening a timing overlay applied its move or duration twice");
+
 const graceSelectionText = `.Title
 KeyAndMeters = {1=C,4/4}
 .Voice

@@ -1,4 +1,4 @@
-export type RhythmGuideDivision = 4 | 8 | 16 | 32 | 64;
+export type RhythmGuideDivision = 1 | 2 | 4 | 8 | 16 | 32 | 64;
 export type RhythmGuideMode = "auto" | "manual";
 
 /** Global engraving controls shared by every numbered-notation document. */
@@ -177,7 +177,7 @@ export function normalizeEngravingStyle(value?: Partial<EngravingStyle> | null):
     ? source.rhythmGuideMode
     : DEFAULT_ENGRAVING_STYLE.rhythmGuideMode;
   const guideDivision = finiteOr(source.rhythmGuideDivision, DEFAULT_ENGRAVING_STYLE.rhythmGuideDivision);
-  result.rhythmGuideDivision = ([4, 8, 16, 32, 64] as const).includes(guideDivision as RhythmGuideDivision)
+  result.rhythmGuideDivision = ([1, 2, 4, 8, 16, 32, 64] as const).includes(guideDivision as RhythmGuideDivision)
     ? guideDivision as RhythmGuideDivision
     : DEFAULT_ENGRAVING_STYLE.rhythmGuideDivision;
   return result;

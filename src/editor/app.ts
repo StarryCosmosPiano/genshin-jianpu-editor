@@ -13,11 +13,16 @@ import {
 } from "./highlight";
 import { JpwFile, LayoutSection } from "../jpword/jpwfile";
 import { fromJpw } from "../score/jpwimport";
-import { Note as ScoreNote, PlayItem, TempoMark } from "../score/score";
+import { Chord, Note as ScoreNote, PlayItem, TempoMark } from "../score/score";
 import { JinpuPainter } from "../layout/painter";
 import { JpNumber, JpOctaveDot, Lyric as LayoutLyric, NoteEntry, TextFrame, type PageItem } from "../layout/layout";
-import { normalizeEngravingStyle, type EngravingStyle } from "../layout/style";
+import {
+  normalizeEngravingStyle,
+  type EngravingStyle,
+  type RhythmGuideDivision,
+} from "../layout/style";
 import { Point } from "../common/geom";
+import { Fraction } from "../common/fraction";
 import { MetaData } from "../smufl/smufl";
 import { isPianoMusicXml, loadMusicXml } from "../score/musicxml";
 import { abcToMusicXml } from "../abc/abc2xml";
@@ -58,6 +63,15 @@ import {
   type JpwSourceNote,
   type PitchEdit,
 } from "./note-selection";
+import {
+  normalizeNoteTimingEdits,
+  noteTimingEditKey,
+  noteTimingStep,
+  parseJpwNoteTimingEdits,
+  serializeJpwNoteTimingEdits,
+  type NoteTimingDivision,
+  type NoteTimingEditData,
+} from "../score/note-timing";
 
 interface SelectedScoreNote {
   source: JpwSourceNote;
@@ -73,6 +87,10 @@ interface SelectedScoreObject {
 interface SelectionAnchor {
   position: number;
   verse: number;
+  partIndex?: number;
+  chordIndex?: number;
+  grace?: boolean;
+  toneIndex?: number;
 }
 
 interface ScoreDeleteAction {
@@ -256,8 +274,39 @@ export class App {
   setEngravingStyle(style: Partial<EngravingStyle>, persist = true): void {
     this.engravingStyle = normalizeEngravingStyle(style);
     this.painter.layout.options.applyEngravingStyle(this.engravingStyle);
+    this.syncRhythmGridToolbar();
     if (persist) this.saveSettings();
     if (this.view && this.mode === "jp") this.reload(this.getText());
+  }
+
+  /** Select one direct-edit grid; selecting the active value again restores auto. */
+  setRhythmEditDivision(division: NoteTimingDivision | null): void {
+    const next = division === null
+      ? { ...this.engravingStyle, rhythmGuideMode: "auto" as const }
+      : {
+        ...this.engravingStyle,
+        rhythmGuideMode: "manual" as const,
+        rhythmGuideDivision: division as RhythmGuideDivision,
+      };
+    this.setEngravingStyle(next, true);
+    this.setStatus(division === null
+      ? "节奏编辑刻度已恢复自动；方向键会采用所选音符所在小节的最短网格"
+      : `节奏编辑刻度已设为${division === 1 ? "全音符" : `${division} 分音符`}；左右方向键按此步长移动`);
+  }
+
+  syncRhythmGridToolbar(): void {
+    const control = document.getElementById("rhythm-grid-control");
+    if (!control) return;
+    const selected = this.engravingStyle.rhythmGuideMode === "manual"
+      ? this.engravingStyle.rhythmGuideDivision
+      : null;
+    control.dataset.mode = selected === null ? "auto" : "manual";
+    control.querySelectorAll<HTMLButtonElement>("button[data-rhythm-division]").forEach((button) => {
+      const active = selected !== null
+        && parseInt(button.dataset.rhythmDivision ?? "", 10) === selected;
+      button.classList.toggle("active", active);
+      button.setAttribute("aria-pressed", String(active));
+    });
   }
 
   /** Restore persisted render settings; call before mountEditor() so first render uses them. */
@@ -332,6 +381,7 @@ export class App {
         this.painter.score = score;
       }
       this.configurePainter(this.painter);
+      this.syncRhythmGridToolbar();
     } catch {
       // corrupt storage — ignore
     }
@@ -391,8 +441,8 @@ export class App {
         if (this._recogMeta) this._recogMeta = mapMeta(this._recogMeta, u.changes);
         if (this._selectedNotes.length > 0) {
           this._pendingSelectionAnchors = this._selectedNotes.map((selection) => ({
+            ...this.selectionAnchor(selection),
             position: u.changes.mapPos(selection.source.from, -1),
-            verse: selection.verse,
           }));
         }
         if (this._rangeAnchorPosition !== null) {
@@ -467,10 +517,8 @@ export class App {
     // 混排/识别模式：谱面区显示各自专属视图，编辑文本不重排冲掉它。
     if (this.mode !== "jp") return true;
     if (this._pendingSelectionAnchors === null && this._selectedNotes.length > 0) {
-      this._pendingSelectionAnchors = this._selectedNotes.map((selection) => ({
-        position: selection.source.from,
-        verse: selection.verse,
-      }));
+      this._pendingSelectionAnchors = this._selectedNotes.map((selection) =>
+        this.selectionAnchor(selection));
     }
     let score;
     let breakDesc: string | null = null;
@@ -493,6 +541,13 @@ export class App {
     } else {
       if (!this.slashOptions) return false;
       try {
+        // The settings comment is the undoable source of truth for direct
+        // timing edits. Re-read it before every parse so Ctrl+Z also restores
+        // the previous rhythmic positions and lengths.
+        this.slashOptions = {
+          ...this.slashOptions,
+          noteTimingEdits: analyzeSlashScore(text).noteTimingEdits.map((edit) => ({ ...edit })),
+        };
         score = parseSlashScore(text, this.slashOptions).score;
       } catch (e) {
         console.error("slash-score import failed", e);
@@ -713,6 +768,22 @@ export class App {
   }
 
   // ---------------- picking / selection ----------------
+  private selectionAnchor(selection: SelectedScoreNote): SelectionAnchor {
+    const source = selection.source;
+    const tones = this._sourceNotes.filter((candidate) =>
+      candidate.partIndex === source.partIndex
+      && candidate.chordIndex === source.chordIndex
+      && candidate.grace === source.grace);
+    return {
+      position: source.from,
+      verse: selection.verse,
+      partIndex: source.partIndex,
+      chordIndex: source.chordIndex,
+      grace: source.grace,
+      toneIndex: Math.max(0, tones.indexOf(source)),
+    };
+  }
+
   private onPageClick(pageIndex: number, svg: SVGSVGElement, ev: MouseEvent): void {
     if (this._suppressPageClick) {
       this._suppressPageClick = false;
@@ -1189,12 +1260,18 @@ export class App {
 
   private restoreScoreSelections(): void {
     const anchors = this._pendingSelectionAnchors
-      ?? this._selectedNotes.map((selection) => ({ position: selection.source.from, verse: selection.verse }));
+      ?? this._selectedNotes.map((selection) => this.selectionAnchor(selection));
     this._selectedNotes = [];
     this._selectedObjects = [];
     this._pendingSelectionAnchors = null;
     for (const anchor of anchors) {
-      const source = this._sourceNotes.find((candidate) =>
+      const semantic = anchor.partIndex === undefined || anchor.chordIndex === undefined
+        ? []
+        : this._sourceNotes.filter((candidate) =>
+          candidate.partIndex === anchor.partIndex
+          && candidate.chordIndex === anchor.chordIndex
+          && candidate.grace === anchor.grace);
+      const source = semantic[anchor.toneIndex ?? 0] ?? this._sourceNotes.find((candidate) =>
         anchor.position === candidate.from
         || (anchor.position >= candidate.from && anchor.position < candidate.to));
       if (source) this.addScoreSelection(source, anchor.verse);
@@ -1290,6 +1367,16 @@ export class App {
       return;
     }
     if (this._selectedNotes.length === 0) return;
+    if ((event.key === "ArrowLeft" || event.key === "ArrowRight")
+      && !event.altKey && !event.shiftKey) {
+      event.preventDefault();
+      event.stopPropagation();
+      this.editSelectedTiming(
+        event.key === "ArrowRight" ? 1 : -1,
+        event.ctrlKey || event.metaKey,
+      );
+      return;
+    }
     if (event.ctrlKey || event.metaKey || event.altKey) return;
     let edit: PitchEdit | null = null;
     let label = "";
@@ -1327,6 +1414,187 @@ export class App {
     clearTimeout(this.debounceTimer);
     const ok = this.reload(this.getText());
     this.setStatus(ok ? `已修改 ${changes.length} 个音符：${label}` : "修改后的谱面暂时无法解析");
+  }
+
+  private selectedTimingSources(): JpwSourceNote[] {
+    return [...new Map(this._selectedNotes.map(({ source }) => [
+      noteTimingEditKey(source.partIndex, source.chordIndex),
+      source,
+    ])).values()].sort((left, right) =>
+      left.partIndex - right.partIndex || left.chordIndex - right.chordIndex);
+  }
+
+  private timingEditsFromDocument(): NoteTimingEditData[] {
+    if (this.documentFormat !== "jpw") {
+      return normalizeNoteTimingEdits(this.slashOptions?.noteTimingEdits ?? []);
+    }
+    try {
+      const file = JpwFile.fromString(this.getText());
+      return parseJpwNoteTimingEdits(file?.getTitle()?.noteTimingEdits);
+    } catch {
+      return [];
+    }
+  }
+
+  private automaticTimingDivision(): NoteTimingDivision {
+    const source = this._selectedNotes[this._selectedNotes.length - 1]?.source;
+    const measure = source?.chord.measure;
+    if (!measure) return 16;
+    let division = Math.max(4, measure.time.beatType);
+    for (const entry of measure.entries) {
+      if (!(entry instanceof Chord) || entry.generatedTimingContinuation) continue;
+      division = Math.max(division, 4 * (1 << Math.max(0, entry.beams)));
+    }
+    const allowed: NoteTimingDivision[] = [1, 2, 4, 8, 16, 32, 64];
+    return allowed.find((value) => value >= Math.min(64, division)) ?? 64;
+  }
+
+  private activeTimingDivision(): NoteTimingDivision {
+    if (this.engravingStyle.rhythmGuideMode === "manual") {
+      return this.engravingStyle.rhythmGuideDivision;
+    }
+    return this.automaticTimingDivision();
+  }
+
+  private currentEditedDuration(source: JpwSourceNote): Fraction {
+    let result = source.chord.duration ?? noteTimingStep(64);
+    const visited = new Set<Chord>([source.chord]);
+    let cursor = source.chord.notes.find((note) => !note.rest)?.tieNext?.chord ?? null;
+    while (cursor?.generatedTimingContinuation && !visited.has(cursor)) {
+      visited.add(cursor);
+      result = result.plus(cursor.duration ?? new Fraction(0));
+      cursor = cursor.notes.find((note) => !note.rest)?.tieNext?.chord ?? null;
+    }
+    return result;
+  }
+
+  private replaceDocumentText(next: string): boolean {
+    const before = this.getText();
+    if (before === next) return true;
+    let prefix = 0;
+    const shared = Math.min(before.length, next.length);
+    while (prefix < shared && before[prefix] === next[prefix]) prefix++;
+    let suffix = 0;
+    while (suffix < shared - prefix
+      && before[before.length - 1 - suffix] === next[next.length - 1 - suffix]) suffix++;
+    this.view.dispatch({
+      changes: {
+        from: prefix,
+        to: before.length - suffix,
+        insert: next.slice(prefix, next.length - suffix),
+      },
+    });
+    clearTimeout(this.debounceTimer);
+    return this.reload(this.getText());
+  }
+
+  private writeTimingEdits(edits: readonly NoteTimingEditData[]): boolean {
+    const normalized = normalizeNoteTimingEdits(edits);
+    if (this.documentFormat === "jpw") {
+      const value = serializeJpwNoteTimingEdits(normalized);
+      return this.replaceDocumentText(upsertOptionalTitleField(
+        this.getText(),
+        "NoteTimingEdits",
+        value,
+      ));
+    }
+    if (!this.slashOptions) return false;
+    this.slashOptions = {
+      ...this.slashOptions,
+      noteTimingEdits: normalized.map((edit) => ({ ...edit })),
+    };
+    return this.replaceDocumentText(embedSlashScoreOptions(this.getText(), this.slashOptions));
+  }
+
+  /**
+   * TXT timing edits are overlays on the compact source timeline. Convert the
+   * unedited source first, then carry the overlay into JPW metadata; serializing
+   * the already shifted render score would otherwise bake and reapply it.
+   */
+  private slashDocumentAsJpw(): string {
+    if (!this.slashOptions) return scoreToJpwabc(this.painter.score);
+    const edits = normalizeNoteTimingEdits(this.slashOptions.noteTimingEdits ?? []);
+    if (edits.length === 0) return scoreToJpwabc(this.painter.score);
+    const baseOptions: SlashScoreOptions = {
+      ...this.slashOptions,
+      symbolDurations: { ...this.slashOptions.symbolDurations },
+      noteTimingEdits: [],
+    };
+    const baseText = stripSlashScoreOptions(this.getText());
+    const baseScore = parseSlashScore(baseText, baseOptions).score;
+    return upsertOptionalTitleField(
+      scoreToJpwabc(baseScore),
+      "NoteTimingEdits",
+      serializeJpwNoteTimingEdits(edits),
+    );
+  }
+
+  private editSelectedTiming(direction: -1 | 1, resize: boolean): void {
+    const sources = this.selectedTimingSources();
+    if (sources.length === 0) return;
+    if (resize && this.documentFormat !== "jpw") {
+      this.setStatus("键盘谱和数字谱只支持左右方向键移动起音；Ctrl+左右调整时值仅用于 JPW 简谱");
+      return;
+    }
+    const division = this.activeTimingDivision();
+    const step = noteTimingStep(division);
+    const signedStep = step.timesInt(direction);
+    const edits = this.timingEditsFromDocument();
+    const byKey = new Map(edits.map((edit) => [
+      noteTimingEditKey(edit.part, edit.chord),
+      { ...edit },
+    ]));
+    let changed = 0;
+    let skippedTuplets = 0;
+
+    for (const source of sources) {
+      const key = noteTimingEditKey(source.partIndex, source.chordIndex);
+      const current = byKey.get(key) ?? {
+        part: source.partIndex,
+        chord: source.chordIndex,
+        move: "0",
+        duration: "0",
+      };
+      if (resize) {
+        if (source.chord.notes.some((note) =>
+          note.tuplet !== null || note.tupletBegin || note.tupletEnd)) {
+          skippedTuplets++;
+          continue;
+        }
+        const nextDuration = this.currentEditedDuration(source).plus(signedStep);
+        if (nextDuration.compareTo(step) < 0) continue;
+        current.duration = Fraction.fromString(current.duration).plus(signedStep).toString();
+      } else {
+        const part = this.painter.score.parts[source.partIndex];
+        const first = part?.measures[0];
+        const last = part?.measures[part.measures.length - 1];
+        if (!first || !last) continue;
+        const start = source.chord.measure.position.plus(source.chord.position);
+        const target = start.plus(signedStep);
+        const scoreStart = first.position;
+        const scoreEnd = last.position.plus(last.duration);
+        if (target.compareTo(scoreStart) < 0 || target.compareTo(scoreEnd) >= 0) continue;
+        current.move = Fraction.fromString(current.move).plus(signedStep).toString();
+      }
+      if (current.move === "0" && current.duration === "0") byKey.delete(key);
+      else byKey.set(key, current);
+      changed++;
+    }
+
+    if (changed === 0) {
+      this.setStatus(skippedTuplets > 0
+        ? "三连音内部时值需保持等分，当前未修改；仍可用左右方向键整体移动"
+        : "已到达当前乐谱或所选刻度允许的边界");
+      return;
+    }
+    const ok = this.writeTimingEdits([...byKey.values()]);
+    const grid = division === 1 ? "全音符" : `${division} 分音符`;
+    const action = resize
+      ? direction > 0 ? "延长" : "缩短"
+      : direction > 0 ? "右移" : "左移";
+    this.setStatus(ok
+      ? `已将 ${changed} 个起音按${grid}刻度${action}一步${skippedTuplets ? `；跳过 ${skippedTuplets} 个三连音` : ""}`
+      : "节奏修改后的谱面暂时无法解析");
   }
 
   private setStatus(s: string): void {
@@ -1470,9 +1738,10 @@ export class App {
     }
     const score = this.painter.score;
     if (target === "jpw") {
+      const text = this.slashDocumentAsJpw();
       this.documentFormat = "jpw";
       this.slashOptions = null;
-      this.setText(scoreToJpwabc(score));
+      this.setText(text);
     } else {
       const current = this.slashOptions;
       const voiceCount = current?.voiceCount
@@ -1522,7 +1791,7 @@ export class App {
     if (target === "jpw") {
       const text = this.documentFormat === "jpw"
         ? this.getText()
-        : scoreToJpwabc(this.painter.score);
+        : this.slashDocumentAsJpw();
       return {
         bytes: encodeJpwabc(text),
         name: `${title}.jpwabc`,
@@ -2631,6 +2900,22 @@ function upsertTitleField(doc: string, field: string, value: string): string {
   const existing = lines.findIndex((line, index) => index > titleAt && index < end && line.split("=", 1)[0].trim().toLowerCase() === key);
   if (existing >= 0) lines[existing] = nextLine;
   else lines.splice(end, 0, nextLine);
+  return lines.join("\n");
+}
+
+function upsertOptionalTitleField(doc: string, field: string, value: string): string {
+  if (value) return upsertTitleField(doc, field, value);
+  const lines = doc.split("\n");
+  const titleAt = lines.findIndex((line) => line.trim().toLowerCase() === ".title");
+  if (titleAt < 0) return doc;
+  let end = titleAt + 1;
+  while (end < lines.length && !lines[end].trimStart().startsWith(".")) end++;
+  const key = field.toLowerCase();
+  const existing = lines.findIndex((line, index) =>
+    index > titleAt && index < end
+    && line.split("=", 1)[0].trim().toLowerCase() === key);
+  if (existing < 0) return doc;
+  lines.splice(existing, 1);
   return lines.join("\n");
 }
 

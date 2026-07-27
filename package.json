@@ -1,7 +1,7 @@
 {
   "name": "genshin-jianpu-editor",
   "private": true,
-  "version": "0.1.3",
+  "version": "0.1.4",
   "type": "module",
   "description": "面向原神琴谱制作的开源简谱编辑器、MIDI 转谱与 SVG 排版工具 · An open-source jianpu editor and MIDI converter for Genshin musicians.",
   "homepage": "https://starrycosmospiano.github.io/genshin-jianpu-editor/",

@@ -40,6 +40,7 @@ body.file-drag-active #app::after {
   padding: 6px 10px;
   background: var(--panel);
   border-bottom: 1px solid var(--border);
+  overflow-x: auto;
 }
 #toolbar button { padding: 4px 10px; cursor: pointer; }
 #toolbar button.format-unavailable {
@@ -54,6 +55,51 @@ body.file-drag-active #app::after {
   background: #e7e7e7;
 }
 #toolbar .sep { width: 1px; height: 20px; background: var(--border); margin: 0 6px; }
+
+#rhythm-grid-control {
+  display: inline-flex;
+  align-items: stretch;
+  flex: 0 0 auto;
+  height: 29px;
+  border: 1px solid #b9b9b9;
+  border-radius: 5px;
+  overflow: hidden;
+  background: #fff;
+}
+#rhythm-grid-control .rhythm-grid-label {
+  display: inline-flex;
+  align-items: center;
+  padding: 0 7px;
+  color: #555;
+  background: #f4f4f4;
+  border-right: 1px solid #ccc;
+  font-size: 12px;
+  white-space: nowrap;
+}
+#toolbar #rhythm-grid-control button {
+  width: 29px;
+  min-width: 29px;
+  padding: 0;
+  border: 0;
+  border-right: 1px solid #ddd;
+  border-radius: 0;
+  background: #fff;
+  color: #222;
+  font-family: "Bravura", "Segoe UI Symbol", serif;
+  font-size: 20px;
+  line-height: 1;
+}
+#toolbar #rhythm-grid-control button:last-child { border-right: 0; }
+#toolbar #rhythm-grid-control button:hover { background: #edf5ff; }
+#toolbar #rhythm-grid-control button.active {
+  color: #fff;
+  background: #1769cf;
+}
+#rhythm-grid-control[data-mode="auto"] .rhythm-grid-label::after {
+  content: "·自动";
+  margin-left: 2px;
+  color: #777;
+}
 
 .toolbar-notice {
   position: fixed;

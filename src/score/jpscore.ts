@@ -4,6 +4,7 @@ import {
   BarlineEntry,
   BarStyle,
   Chord,
+  Entry,
   formatTempoBpm,
   LineBreak,
   Measure,
@@ -12,6 +13,7 @@ import {
   Score,
 } from "./score";
 import { computePhraseBreaks, type PhraseBreaks } from "./phrase";
+import { serializeJpwNoteTimingEdits } from "./note-timing";
 
 function escape(s: string): string {
   return s.replace(/\n/g, "\\n");
@@ -22,6 +24,44 @@ function ensembleVoiceSection(part: Part, partIndex: number): string {
     .replace(/[\r\n]+/g, " ")
     .replace(/^\.+/, "") || `乐器 ${partIndex + 1}`;
   return `.Voice.${instrument}.V${Math.max(1, Math.round(part.voiceIndex))}`;
+}
+
+function serializationPosition(entry: Entry): import("../common/fraction").Fraction {
+  return entry instanceof Chord && entry.timingOriginal
+    ? entry.timingOriginal.position
+    : entry.position;
+}
+
+/**
+ * A timing overlay may move its source chord to another measure and append
+ * synthetic tie segments. JPW text keeps the original notation plus the
+ * overlay metadata, so serialize those source chords at their pre-edit slots.
+ */
+function serializationEntries(part: Part, measure: Measure): Entry[] {
+  const ordinary = measure.entries.filter((entry) =>
+    !(entry instanceof Chord
+      && (entry.generatedTimingContinuation || entry.timingOriginal !== null)));
+  const restored = part.measures.flatMap((candidate) =>
+    candidate.entries.filter((entry): entry is Chord =>
+      entry instanceof Chord
+      && !entry.generatedTimingContinuation
+      && entry.timingOriginal?.measureIndex === measure.index));
+  return [...ordinary, ...restored]
+    .map((entry, order) => ({ entry, order }))
+    .sort((left, right) => {
+      const position = serializationPosition(left.entry).compareTo(
+        serializationPosition(right.entry),
+      );
+      if (position !== 0) return position;
+      if (left.entry instanceof Chord && right.entry instanceof Chord) {
+        return (left.entry.timingSourceIndex ?? left.order)
+          - (right.entry.timingSourceIndex ?? right.order);
+      }
+      if (left.entry instanceof Chord) return -1;
+      if (right.entry instanceof Chord) return 1;
+      return left.order - right.order;
+    })
+    .map(({ entry }) => entry);
 }
 
 /** 编辑器文本里的一段字符区间（点选定位用）。 */
@@ -150,7 +190,7 @@ class LyricProcessor {
     for (const m of this.part.measures) {
       this.mid++;
       this.nid = 0;
-      for (const ch of m.entries) {
+      for (const ch of serializationEntries(this.part, m)) {
         if (ch instanceof LineBreak) { this.mid++; this.nid = 0; continue; }
         if (!(ch instanceof Chord)) continue;
         this.nid++;
@@ -257,13 +297,17 @@ class JpScore {
     const arpeggios: string[] = [];
     scr.parts.forEach((part, partIndex) => {
       for (const measure of part.measures) {
-        for (const entry of measure.entries) {
+        for (const entry of serializationEntries(part, measure)) {
           if (!(entry instanceof Chord) || !entry.arpeggio) continue;
-          arpeggios.push(`${partIndex + 1}:${measure.index + 1}@${entry.position.toString()}`);
+          arpeggios.push(
+            `${partIndex + 1}:${measure.index + 1}@${serializationPosition(entry).toString()}`,
+          );
         }
       }
     });
     if (arpeggios.length > 0) this.lines.push(`Arpeggios = {${arpeggios.join(";")}}`);
+    const timingEdits = serializeJpwNoteTimingEdits(scr.noteTimingEdits);
+    if (timingEdits) this.lines.push(`NoteTimingEdits = {${timingEdits}}`);
     const authors: string[] = [];
     for (const it of scr.credit) {
       if (it.type === "title") continue;
@@ -318,9 +362,12 @@ class JpScore {
     if (ch.graceNotes.length > 0) {
       str = `{${ch.graceNotes.map((note) => this.pitchVoice(note)).join("")}}${str}`;
     }
-    if (ch.dot === 1 && ch.beats <= 1) str += ".";
-    for (let i = 0; i < ch.beams; i++) str += "_";
-    for (let i = 1; i < ch.beats; i++) str += "-";
+    const dot = ch.timingOriginal?.dot ?? ch.dot;
+    const beats = ch.timingOriginal?.beats ?? ch.beats;
+    const beams = ch.timingOriginal?.beams ?? ch.beams;
+    if (dot === 1 && beats <= 1) str += ".";
+    for (let i = 0; i < beams; i++) str += "_";
+    for (let i = 1; i < beats; i++) str += "-";
     return str;
   }
 
@@ -387,9 +434,10 @@ class JpScore {
         }
       }
       let hasBarline = false;
-      m.entries.forEach((ch, idx) => {
+      const entries = serializationEntries(part, m);
+      entries.forEach((ch, idx) => {
         if (ch instanceof LineBreak) {
-          if (!hasBarline && idx === m.entries.length - 1) {
+          if (!hasBarline && idx === entries.length - 1) {
             l += this.makeBarline(m);
             hasBarline = true;
           }
@@ -398,7 +446,7 @@ class JpScore {
           l = "";
         } else if (ch instanceof Chord) {
           const nt = ch.notes[0];
-          if (nt.tieStart) l += "(";
+          if (ch.timingOriginal?.tieStart ?? nt.tieStart) l += "(";
           if (ch.slurStart) l += "(";
           if (nt.tupletBegin) l += "{(3}";
           l += this.makeNotations(ch);
@@ -406,7 +454,7 @@ class JpScore {
           const colStart = l.length;
           l += this.chordVoice(ch);
           this.noteRecs.push({ line: this.lines.length, colStart, colEnd: l.length });
-          if (nt.tieEnd) l += ")";
+          if (ch.timingOriginal?.tieEnd ?? nt.tieEnd) l += ")";
           if (nt.tupletEnd) l += ")";
           if (ch.slurEnd) l += ")";
           l += " ";
