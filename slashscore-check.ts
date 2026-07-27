@@ -775,37 +775,6 @@ const twoVoiceScore = parseSlashScore(twoVoiceText, twoVoiceOptions).score;
 check(twoVoiceScore.piano && !twoVoiceScore.ensemble && twoVoiceScore.parts.length === 2,
   "two TXT voices did not reuse the paired piano layout");
 
-const timingMoveText = "数字谱\n4/4拍：\n1../2../3../4../\n";
-const timingMoveOptions: SlashScoreOptions = {
-  ...defaultSlashScoreOptions("number", analyzeSlashScore(timingMoveText)),
-  noteTimingEdits: [{ part: 0, chord: 0, move: "1/4", duration: "0" }],
-};
-const timingMoveScore = parseSlashScore(timingMoveText, timingMoveOptions).score;
-const timingMoveSources = buildSlashSourceNotes(
-  timingMoveText,
-  timingMoveOptions,
-  timingMoveScore,
-);
-const movedFirstSource = timingMoveSources.find((source) =>
-  timingMoveText.slice(source.from, source.to) === "1");
-check(movedFirstSource?.chord.timingSourceIndex === 0
-  && Math.abs(
-    movedFirstSource.chord.measure.position
-      .plus(movedFirstSource.chord.position).toFloat() - 0.25,
-  ) < 1e-9,
-"TXT timing edit did not move the first source note by one sixteenth note");
-check(timingMoveSources.map((source) => timingMoveText.slice(source.from, source.to)).join("")
-  === "1234",
-"moving TXT attacks changed source-to-score note mapping");
-const embeddedTimingMove = embedSlashScoreOptions(timingMoveText, timingMoveOptions);
-const restoredTimingMove = analyzeSlashScore(embeddedTimingMove).noteTimingEdits;
-check(restoredTimingMove.length === 1
-  && restoredTimingMove[0].part === 0
-  && restoredTimingMove[0].chord === 0
-  && restoredTimingMove[0].move === "1/4"
-  && restoredTimingMove[0].duration === "0",
-"TXT @jpeditor metadata did not preserve rhythmic position edits");
-
 const fullKeyboard = readFileSync("examples/所念皆星河 - 键盘谱.txt", "utf8");
 const fullNumber = readFileSync("examples/所念皆星河 - 数字谱.txt", "utf8");
 const fullKeyboardResult = parseSlashScore(fullKeyboard, defaultSlashScoreOptions("keyboard", analyzeSlashScore(fullKeyboard)));

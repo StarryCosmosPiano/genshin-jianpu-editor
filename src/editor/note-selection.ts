@@ -8,8 +8,6 @@ export interface JpwSourceNote {
   /** Non-metrical pitch printed before the chord's main sounding notes. */
   grace: boolean;
   partIndex: number;
-  /** Stable editable chord order within this source part. */
-  chordIndex: number;
   tokenFrom: number;
   tokenTo: number;
   /** Exact editable pitch span, including accidental and octave markers. */
@@ -133,11 +131,7 @@ export function buildJpwSourceNotes(text: string, score: Score): JpwSourceNote[]
   const result: JpwSourceNote[] = [];
   score.parts.forEach((part, partIndex) => {
     const chords = part.measures.flatMap((measure) =>
-      measure.entries.filter((entry): entry is Chord =>
-        entry instanceof Chord && !entry.generatedTimingContinuation))
-      .sort((left, right) =>
-        (left.timingSourceIndex ?? Number.MAX_SAFE_INTEGER)
-        - (right.timingSourceIndex ?? Number.MAX_SAFE_INTEGER));
+      measure.entries.filter((entry): entry is Chord => entry instanceof Chord));
     const tokens = voiceTokens[partIndex] ?? [];
     for (let chordIndex = 0; chordIndex < Math.min(chords.length, tokens.length); chordIndex++) {
       const chord = chords[chordIndex];
@@ -157,7 +151,6 @@ export function buildJpwSourceNotes(text: string, score: Score): JpwSourceNote[]
             note,
             grace,
             partIndex,
-            chordIndex,
             tokenFrom: token.from,
             tokenTo: token.to,
             from: span.from,
@@ -183,50 +176,38 @@ export function buildSlashSourceNotes(text: string, options: SlashScoreOptions, 
     events.set(key, group);
   }
 
-  const candidates = score.parts.flatMap((part, partIndex) => {
-    let chordIndex = 0;
-    return part.measures.flatMap((measure) =>
-      measure.entries
-      .filter((entry): entry is Chord =>
-        entry instanceof Chord
-        && !entry.generatedTimingContinuation
-        && !entry.rest
-        && !entry.transparentContinuation)
-      .map((chord) => {
-        const fallbackIndex = chordIndex++;
-        return {
-          chord,
-          partIndex,
-          chordIndex: chord.timingSourceIndex ?? fallbackIndex,
-          time: measure.position.plus(chord.position).toFloat(),
-          pitches: [...new Set(chord.notes.filter((note) => !note.rest).map((note) => note.pitch))].sort((a, b) => a - b),
-        };
-      }),
-    );
-  }).sort((a, b) =>
-    a.partIndex - b.partIndex || a.chordIndex - b.chordIndex || a.time - b.time);
+  const candidates = score.parts.flatMap((part, partIndex) => part.measures.flatMap((measure) =>
+    measure.entries
+      .filter((entry): entry is Chord => entry instanceof Chord && !entry.rest && !entry.transparentContinuation)
+      .map((chord) => ({
+        chord,
+        partIndex,
+        time: measure.position.plus(chord.position).toFloat(),
+        pitches: [...new Set(chord.notes.filter((note) => !note.rest).map((note) => note.pitch))].sort((a, b) => a - b),
+      })),
+  )).sort((a, b) => a.time - b.time || a.partIndex - b.partIndex);
 
   const result: JpwSourceNote[] = [];
   const usedCandidates = new Set<number>();
-  const lastSourceIndexByPart = new Map<number, number>();
+  const lastTimeByPart = new Map<number, number>();
   for (const event of events.values()) {
     const mainEvent = event.filter((source) => !source.grace);
     const graceEvent = event.filter((source) => source.grace);
     if (mainEvent.length === 0) continue;
     const expected = [...new Set(mainEvent.map((source) => source.pitch))].sort((a, b) => a - b);
     const preferredPart = Math.max(0, (mainEvent[0]?.voiceIndex ?? 1) - 1);
-    const minimumSourceIndex = lastSourceIndexByPart.get(preferredPart) ?? -1;
+    const minimumTime = lastTimeByPart.get(preferredPart) ?? -Infinity;
     let candidateIndex = candidates.findIndex((candidate, index) =>
       !usedCandidates.has(index) &&
       candidate.partIndex === preferredPart &&
-      candidate.chordIndex >= minimumSourceIndex &&
+      candidate.time >= minimumTime - 1e-8 &&
       candidate.pitches.length === expected.length &&
       candidate.pitches.every((pitch, pitchIndex) => pitch === expected[pitchIndex]));
     if (candidateIndex < 0) {
       candidateIndex = candidates.findIndex((candidate, index) =>
         !usedCandidates.has(index) &&
         candidate.partIndex === preferredPart &&
-        candidate.chordIndex >= minimumSourceIndex &&
+        candidate.time >= minimumTime - 1e-8 &&
         expected.every((pitch) => candidate.pitches.includes(pitch)));
     }
     // A rolled subset and a simultaneous chord can be merged into one model
@@ -261,7 +242,6 @@ export function buildSlashSourceNotes(text: string, options: SlashScoreOptions, 
           note: notes[noteIndex],
           grace,
           partIndex: candidate.partIndex,
-          chordIndex: candidate.chordIndex,
           tokenFrom,
           tokenTo,
           from: source.from,
@@ -275,7 +255,7 @@ export function buildSlashSourceNotes(text: string, options: SlashScoreOptions, 
     append(graceEvent, candidate.chord.graceNotes, true);
     append(mainEvent, candidate.chord.notes, false);
     usedCandidates.add(candidateIndex);
-    lastSourceIndexByPart.set(preferredPart, candidate.chordIndex);
+    lastTimeByPart.set(preferredPart, candidate.time);
   }
   return result.sort((a, b) => a.from - b.from || a.to - b.to);
 }

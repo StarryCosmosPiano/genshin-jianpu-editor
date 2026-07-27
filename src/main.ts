@@ -11,7 +11,6 @@ import { MixedPainter } from "./mixed/painter";
 import { showCreateScoreDialog } from "./editor/slash-dialog";
 import { analyzeMidi, midiToScore, parseMidi } from "./midi";
 import { scoreToJpwabc } from "./score/jpscore";
-import type { NoteTimingDivision } from "./score/note-timing";
 import avidMidiUrl from "../examples/Avid - 86 -不存在的战区.mid?url";
 
 const AVID_FALLBACK = `// ************** JPW-ABC File Ver 1.0 (for JP-Word v5.50m) **************
@@ -146,18 +145,6 @@ async function boot() {
     app.setStopBtn(stopBtn);
     stopBtn.addEventListener("click", () => app.stopPlayback());
   }
-  const timingDivisions: NoteTimingDivision[] = [1, 2, 4, 8, 16, 32, 64];
-  document.querySelectorAll<HTMLButtonElement>("#rhythm-grid-control button[data-rhythm-division]")
-    .forEach((button) => {
-      button.addEventListener("click", () => {
-        const division = parseInt(button.dataset.rhythmDivision ?? "", 10) as NoteTimingDivision;
-        if (!timingDivisions.includes(division)) return;
-        const active = button.classList.contains("active");
-        app.setRhythmEditDivision(active ? null : division);
-        scorePane.focus({ preventScroll: true });
-      });
-    });
-  app.syncRhythmGridToolbar();
   const addOpen = document.getElementById("btn-open");
   addOpen?.addEventListener("click", () => void app.openFile());
 

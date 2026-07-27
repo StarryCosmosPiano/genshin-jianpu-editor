@@ -719,10 +719,10 @@ export function showEngravingStyleDialog(app: App): void {
   const rhythmGuideDivision = document.createElement("select");
   rhythmGuideDivision.name = "rhythmGuideDivision";
   rhythmGuideDivision.setAttribute("aria-label", "手动最短时值");
-  for (const division of [1, 2, 4, 8, 16, 32, 64] as const) {
+  for (const division of [4, 8, 16, 32, 64] as const) {
     const option = document.createElement("option");
     option.value = String(division);
-    option.textContent = division === 1 ? "全音符" : `${division} 分音符`;
+    option.textContent = `${division} 分音符`;
     rhythmGuideDivision.append(option);
   }
   rhythmGuideDivision.value = String(original.rhythmGuideDivision);
@@ -730,7 +730,7 @@ export function showEngravingStyleDialog(app: App): void {
   rhythmSection.append(labeled("手动最短时值", rhythmGuideDivision));
   const rhythmHint = document.createElement("div");
   rhythmHint.className = "modal-hint";
-  rhythmHint.textContent = "长刻度始终落在拍号的每一拍。自动模式按各小节实际最短时值补短刻度；手动模式固定使用指定的全音符至 64 分音符网格。顶部快速刻度与这里保持同步。";
+  rhythmHint.textContent = "长刻度始终落在拍号的每一拍。自动模式按各小节实际最短时值补短刻度；手动模式固定使用指定的 4 / 8 / 16 / 32 / 64 分网格。";
   rhythmSection.append(rhythmHint);
 
   const headerSection = section("标题与谱首信息");

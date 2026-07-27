@@ -30,7 +30,6 @@ import {
   TempoMark,
   Time,
 } from "./score";
-import { applyNoteTimingEdits, parseJpwNoteTimingEdits } from "./note-timing";
 
 class JpState {
   inTuplet = false;
@@ -409,7 +408,6 @@ export function fromJpw(f: JpwFile): Score | null {
       for (const it of lrc.segments) pass = Math.max(pass, it.passLast);
     }
     normalizeOpeningPickup(res);
-    applyNoteTimingEdits(res, parseJpwNoteTimingEdits(title?.noteTimingEdits), "jpw");
     processRepeat(res, primary, pass, f.getSection(RepeatSection));
     return res;
   }
@@ -435,7 +433,6 @@ export function fromJpw(f: JpwFile): Score | null {
   }
   applyTitleAnnotations(res, title?.tempoMarks ?? null, title?.arpeggios ?? null);
   normalizeOpeningPickup(res);
-  applyNoteTimingEdits(res, parseJpwNoteTimingEdits(title?.noteTimingEdits), "jpw");
   processRepeat(res, part, pass, f.getSection(RepeatSection));
   return res;
 }

@@ -284,9 +284,6 @@ export class TitleSection extends Section {
   get arpeggios(): string | null {
     return this.getValue("Arpeggios");
   }
-  get noteTimingEdits(): string | null {
-    return this.getValue("NoteTimingEdits");
-  }
   get key(): string | null {
     const km = this.keyAndMeters;
     if (km === null) return null;

@@ -149,77 +149,6 @@ try {
     throw new Error(`single score selection did not sync to the editor: ${JSON.stringify(state)}`);
   }
 
-  const sixteenthGrid = page.locator('#rhythm-grid-control button[data-rhythm-division="16"]');
-  await sixteenthGrid.click();
-  await page.waitForFunction(() =>
-    window.__app.engravingStyle.rhythmGuideMode === "manual"
-    && window.__app.engravingStyle.rhythmGuideDivision === 16);
-  await page.evaluate(() => window.__app.setEngravingStyle({
-    ...window.__app.engravingStyle,
-    rhythmGuideEnabled: false,
-  }, false));
-  await page.keyboard.press("ArrowRight");
-  await page.waitForFunction(() =>
-    /NoteTimingEdits\s*=\s*\{1:1@1\/4,0\}/.test(window.__app.getText()));
-  let timingState = await page.evaluate(() => {
-    const source = window.__app._selectedNotes.at(-1)?.source;
-    return {
-      selected: window.__app._selectedNotes.length,
-      start: source
-        ? source.chord.measure.position.plus(source.chord.position).toString()
-        : null,
-      guideEnabled: window.__app.engravingStyle.rhythmGuideEnabled,
-      activeGrid: document.querySelector(
-        '#rhythm-grid-control button[data-rhythm-division="16"]',
-      )?.classList.contains("active"),
-    };
-  });
-  if (timingState.selected !== 1 || timingState.start !== "1/4"
-    || timingState.guideEnabled || !timingState.activeGrid) {
-    throw new Error(`right-arrow grid movement failed with the ruler hidden: ${JSON.stringify(timingState)}`);
-  }
-
-  await page.keyboard.press("Control+ArrowRight");
-  await page.waitForFunction(() =>
-    /NoteTimingEdits\s*=\s*\{1:1@1\/4,1\/4\}/.test(window.__app.getText()));
-  timingState = await page.evaluate(() => {
-    const source = window.__app._selectedNotes.at(-1)?.source;
-    const generated = window.__app.painter.score.parts[0].measures
-      .flatMap((measure) => measure.entries)
-      .filter((entry) => entry.generatedTimingContinuation);
-    return {
-      duration: source?.chord.duration?.toString() ?? null,
-      generated: generated.length,
-      tied: Boolean(source?.note.tieNext),
-    };
-  });
-  if (timingState.duration !== "1" || timingState.generated < 1 || !timingState.tied) {
-    throw new Error(`Ctrl+right did not create an exact tied JPW duration extension: ${JSON.stringify(timingState)}`);
-  }
-  await page.keyboard.press("Control+Z");
-  await page.waitForFunction(() =>
-    /NoteTimingEdits\s*=\s*\{1:1@1\/4,0\}/.test(window.__app.getText()));
-  await page.keyboard.press("ArrowLeft");
-  await page.waitForFunction(() => !/NoteTimingEdits\s*=/.test(window.__app.getText()));
-  await sixteenthGrid.click();
-  await page.waitForFunction(() =>
-    window.__app.engravingStyle.rhythmGuideMode === "auto");
-  await page.evaluate(() => window.__app.setEngravingStyle({
-    ...window.__app.engravingStyle,
-    rhythmGuideEnabled: true,
-  }, false));
-  const restoredTimingSelection = await page.evaluate(() => ({
-    selected: window.__app._selectedNotes.length,
-    focused: document.activeElement?.id,
-    source: window.__app.view.state.selection.ranges.map((range) =>
-      window.__app.view.state.doc.sliceString(range.from, range.to)),
-  }));
-  if (restoredTimingSelection.selected !== 1
-    || restoredTimingSelection.focused !== "score-pane"
-    || restoredTimingSelection.source.join("|") !== "1") {
-    throw new Error(`timing edit did not restore the selected source note: ${JSON.stringify(restoredTimingSelection)}`);
-  }
-
   await page.keyboard.press("5");
   await page.waitForFunction(() => /\.Voice\s+5 2/.test(window.__app.getText()));
   await page.keyboard.press("ArrowUp");
@@ -469,40 +398,6 @@ KeyAndMeters = {1=C,4/4}
   await page.waitForFunction(() => /\{\+7\}5\.\/2\./.test(window.__app.getText()));
   await page.keyboard.press("ArrowUp");
   await page.waitForFunction(() => /\{\+7\}\+5\.\/2\./.test(window.__app.getText()));
-  await sixteenthGrid.click();
-  await page.keyboard.press("ArrowRight");
-  await page.waitForFunction(() =>
-    /"ne":\[\{"part":0,"chord":0,"move":"1\/4","duration":"0"\}\]/.test(
-      window.__app.getText(),
-    ));
-  const slashMoveState = await page.evaluate(() => {
-    const source = window.__app._selectedNotes.at(-1)?.source;
-    return {
-      selectedText: source
-        ? window.__app.getText().slice(source.from, source.to)
-        : null,
-      start: source
-        ? source.chord.measure.position.plus(source.chord.position).toString()
-        : null,
-      beforeCtrl: window.__app.getText(),
-    };
-  });
-  await page.keyboard.press("Control+ArrowRight");
-  const slashCtrlState = await page.evaluate((beforeCtrl) => ({
-    unchanged: window.__app.getText() === beforeCtrl,
-    status: document.querySelector("#status")?.textContent ?? "",
-  }), slashMoveState.beforeCtrl);
-  if (slashMoveState.selectedText !== "+5" || slashMoveState.start !== "1/4"
-    || !slashCtrlState.unchanged
-    || !slashCtrlState.status.includes("Ctrl+左右调整时值仅用于 JPW")) {
-    throw new Error(`TXT arrow timing rules failed: ${JSON.stringify({
-      slashMoveState,
-      slashCtrlState,
-    })}`);
-  }
-  await page.keyboard.press("ArrowLeft");
-  await page.waitForFunction(() => !/"ne":/.test(window.__app.getText()));
-  await sixteenthGrid.click();
   const slashPlayback = await page.evaluate(async () => {
     let start;
     const app = window.__app;
