@@ -627,12 +627,12 @@ export class NoteEntry extends Entry {
   }
   get beginOfSlurTied(): boolean {
     if (this.chord.slurStart) return true;
-    if (this.chord.notes[0].tieStart) return true;
+    if (this.chord.notes.some((note) => note.tieStart)) return true;
     return false;
   }
   get endOfSlurTied(): boolean {
     if (this.chord.slurEnd) return true;
-    if (this.chord.notes[0].tieEnd) return true;
+    if (this.chord.notes.some((note) => note.tieEnd)) return true;
     return false;
   }
 
@@ -1633,6 +1633,7 @@ export class Line {
     const ena = this.chordEntry.get(a.chord);
     const enb = this.chordEntry.get(b.chord);
     const grp = new Tie();
+    grp.classes.add("tie-span");
     let pl = new Point(ena!.cx, ypos);
     let pr = new Point(enb!.cx, ypos);
     const dx = ena!.number!.font.size / 14;
@@ -1646,12 +1647,49 @@ export class Line {
     this.group.add(grp);
   }
 
+  private addSystemTieFragment(
+    pl: Point,
+    pr: Point,
+    thickness: number,
+    clr: number,
+    side: "incoming" | "outgoing",
+  ): void {
+    if (pr.x <= pl.x + 1e-6) return;
+    const grp = new Tie();
+    grp.classes.add("tie-span");
+    grp.classes.add(`tie-system-${side}`);
+    grp.init(pl, pr, thickness, clr);
+    this.group.add(grp);
+  }
+
   private addTie(opt: LayoutOptions): void {
     const thickness = opt.slurTieThickness;
-    for (const e of this.entries) {
-      if (!(e instanceof NoteEntry)) continue;
-      const nt = e.chord.notes[0];
-      if (!nt.tieStart) continue;
+    const noteEntries = this.entries.filter((entry): entry is NoteEntry =>
+      entry instanceof NoteEntry && this.chordEntry.get(entry.chord) === entry);
+    if (noteEntries.length === 0) return;
+    const firstNote = noteEntries[0];
+    const lastNote = noteEntries[noteEntries.length - 1];
+    const firstCenter = firstNote.group.x + firstNote.cx;
+    const lastCenter = lastNote.group.x + lastNote.cx;
+    const finalBarline = [...this.entries].reverse().find((entry): entry is Barline =>
+      entry instanceof Barline);
+    const finalBarlineItem = finalBarline?.entryItem();
+    const finalBarlineCenter = finalBarline && finalBarlineItem
+      ? finalBarline.group.x + finalBarlineItem.x + finalBarlineItem.width / 2
+      : lastCenter + opt.numberSize * 0.62;
+    // Piano/ensemble systems reserve roughly 0.62 number-heights between the
+    // brace-side line and the first rhythmic anchor.  Starting half a number
+    // to the left of that anchor keeps an incoming tie inside this reserved
+    // strip instead of crossing the brace.
+    const leftBoundary = firstCenter - opt.numberSize * 0.5;
+    const rightBoundary = Math.max(
+      lastCenter + opt.numberSize * 0.42,
+      finalBarlineCenter - opt.numberSize * 0.1,
+    );
+
+    for (const e of noteEntries) {
+      const nt = e.chord.notes.find((note) => note.tieStart && note.tieNext !== null);
+      if (!nt) continue;
       const ent = this.chordEntry.get(nt.chord);
       if (!ent) {
         console.error("no entry for tied");
@@ -1659,9 +1697,42 @@ export class Line {
       }
       const endCh = nt.tieNext?.chord;
       const endEntry = endCh ? this.chordEntry.get(endCh) : undefined;
-      if (!endEntry) continue;
-      const ypos = Math.min(this.tiedTop(e, opt, true), this.tiedTop(endEntry, opt, false));
-      this.addSlurTie(nt, nt.tieNext!, ypos, thickness, opt.color);
+      if (endEntry) {
+        const ypos = Math.min(this.tiedTop(e, opt, true), this.tiedTop(endEntry, opt, false));
+        this.addSlurTie(nt, nt.tieNext!, ypos, thickness, opt.color);
+      } else if (nt.tieNext) {
+        const dx = e.number!.font.size / 14;
+        const startX = e.group.x + e.cx + (nt.tiePrev !== null ? dx : 0);
+        const ypos = this.tiedTop(e, opt, true);
+        this.addSystemTieFragment(
+          new Point(startX, ypos),
+          new Point(Math.max(rightBoundary, startX + opt.numberSize * 0.42), ypos),
+          thickness,
+          opt.color,
+          "outgoing",
+        );
+      }
+    }
+
+    // The source note of a tie can live on the previous system or page.  Draw
+    // the second fragment independently on the destination line; otherwise the
+    // continuation is correctly grey and silent but appears to have no tie.
+    for (const e of noteEntries) {
+      const nt = e.chord.notes.find((note) =>
+        note.tieEnd &&
+        note.tiePrev !== null &&
+        !this.chordEntry.has(note.tiePrev.chord));
+      if (!nt || !nt.tiePrev) continue;
+      const dx = e.number!.font.size / 14;
+      const endX = e.group.x + e.cx - (nt.tieNext !== null ? dx : 0);
+      const ypos = this.tiedTop(e, opt, false);
+      this.addSystemTieFragment(
+        new Point(Math.min(leftBoundary, endX - opt.numberSize * 0.42), ypos),
+        new Point(endX, ypos),
+        thickness,
+        opt.color,
+        "incoming",
+      );
     }
   }
   private tiedTop(ent: NoteEntry, opt: LayoutOptions, left: boolean): number {
@@ -1676,13 +1747,14 @@ export class Line {
   }
   private slurTop(ent: NoteEntry, opt: LayoutOptions, left: boolean): number {
     let res = ent.entryTop(opt);
-    const nt = ent.chord.notes[0];
     if (left) {
-      if (nt.tieStart) res -= opt.numberSize / 8;
+      if (ent.chord.notes.some((note) => note.tieStart)) res -= opt.numberSize / 8;
     } else {
-      if (nt.tieEnd) res -= opt.numberSize / 8;
+      if (ent.chord.notes.some((note) => note.tieEnd)) res -= opt.numberSize / 8;
     }
-    if (nt.tupletEnd || nt.tupletBegin) res -= opt.numberSize / 2;
+    if (ent.chord.notes.some((note) => note.tupletEnd || note.tupletBegin)) {
+      res -= opt.numberSize / 2;
+    }
     return res;
   }
   private addSlur(opt: LayoutOptions): void {

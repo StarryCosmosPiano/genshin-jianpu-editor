@@ -720,6 +720,63 @@ Tempo = {90}
     );
   }
 
+  const crossSystemContinuationText = `键盘谱
+4/4拍：
+点=八分音符
+-/-/-/(\u2063Q Z)../
+../../\u2063W../X../
+`;
+  await page.evaluate((text) => {
+    const app = window.__app;
+    app.documentFormat = "keyboard";
+    app.slashOptions = {
+      kind: "keyboard", voiceCount: 2, instrumentName: "钢琴",
+      title: "", subtitle: "", composer: "", arranger: "", lyricist: "",
+      tempoBpm: 90, fifths: 0, beats: 4, beatType: 4,
+      symbolDurations: { ".": 8 }, spaceDivision: null, noteDivision: null,
+      braceMode: "none", bracketMode: "none",
+    };
+    app.setText(text);
+    app.setEngravingStyle({ ...app.engravingStyle, measuresPerSystem: 1 }, false);
+  }, crossSystemContinuationText);
+  await page.waitForFunction(() =>
+    document.querySelectorAll("#score-pane .tie-system-incoming").length >= 2
+    && document.querySelectorAll("#score-pane .tie-system-outgoing").length >= 2);
+  const crossSystemContinuation = await page.evaluate(() => {
+    const app = window.__app;
+    const continuations = app.painter.score.parts.map((part) =>
+      part.measures[1]?.entries.find((entry) =>
+        entry.transparentContinuation
+        && Math.abs(entry.position.toFloat()) < 1e-8));
+    const fills = continuations.flatMap((chord) =>
+      chord?.notes.map((note) =>
+        app.painter.noteGroupEl(chord, note)?.querySelector("text")?.getAttribute("fill")) ?? []);
+    return {
+      incoming: document.querySelectorAll("#score-pane .tie-system-incoming").length,
+      outgoing: document.querySelectorAll("#score-pane .tie-system-outgoing").length,
+      tied: continuations.length === 2 && continuations.every((chord) =>
+        chord?.notes.every((note) =>
+          note.tieEnd && note.tiePrev && note.tiePrev.tieNext === note)),
+      transparent: continuations.every((chord) => chord?.transparentContinuation),
+      fills,
+    };
+  });
+  if (crossSystemContinuation.incoming < 2
+    || crossSystemContinuation.outgoing < 2
+    || !crossSystemContinuation.tied
+    || !crossSystemContinuation.transparent
+    || crossSystemContinuation.fills.length < 2
+    || crossSystemContinuation.fills.some((fill) => !fill || fill === "#000000")) {
+    throw new Error(
+      `cross-system multi-voice continuation lost its tie or grey rendering: ${
+        JSON.stringify(crossSystemContinuation)
+      }`,
+    );
+  }
+  if (process.argv[5]) {
+    await page.locator("#score-pane .score-page").first().screenshot({ path: process.argv[5] });
+  }
+
   if (errors.filter((error) => !/favicon/.test(error)).length > 0) {
     throw new Error(`browser errors: ${errors.join("\n")}`);
   }
@@ -738,6 +795,7 @@ Tempo = {90}
     textVoiceColorToggle: true,
     arpeggioHighlighting: true,
     crossMeasureChordHeight: true,
+    crossSystemContinuation: true,
     selectedPlayback,
     slashPlayback,
     clearedPlayback,

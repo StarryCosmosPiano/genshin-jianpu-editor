@@ -661,6 +661,39 @@ const firstSoundingDuration = multiVoiceScore.parts.map((part) => {
 });
 check(JSON.stringify(firstSoundingDuration) === JSON.stringify([1, 2, 3]),
   "each TXT voice did not sustain independently until its own next attack");
+
+const twoVoiceContinuationText = `键盘谱
+4/4拍：
+点=八分音符
+(${v1}Q Z)../../${v1}W../X../
+`;
+const twoVoiceContinuationOptions: SlashScoreOptions = {
+  ...defaultSlashScoreOptions("keyboard", analyzeSlashScore(twoVoiceContinuationText)),
+  voiceCount: 2,
+  instrumentName: "钢琴",
+};
+const twoVoiceContinuationScore = parseSlashScore(
+  twoVoiceContinuationText,
+  twoVoiceContinuationOptions,
+).score;
+const explicitContinuations = twoVoiceContinuationScore.parts.map((part) =>
+  part.measures.flatMap((measure) => measure.entries)
+    .find((entry): entry is Chord =>
+      entry instanceof Chord &&
+      entry.transparentContinuation &&
+      Math.abs(entry.position.toFloat() - 1) < 1e-8));
+check(explicitContinuations.length === 2 && explicitContinuations.every((chord) =>
+  chord !== undefined &&
+  chord.notes.every((note) =>
+    note.tieEnd &&
+    note.tiePrev !== null &&
+    note.tiePrev.tieStart &&
+    note.tiePrev.tieNext === note)),
+"a common duration-only slash group did not remain a grey tied continuation in every TXT voice");
+check(buildTimeline(twoVoiceContinuationScore).notes.every((note) =>
+  Math.abs(note.t0 - 1) > 1e-8),
+"multi-voice transparent continuations retriggered during playback");
+
 const multiSources = buildSlashSourceNotes(multiVoiceText, multiVoiceOptions, multiVoiceScore);
 check(multiSources.map((source) => source.voiceIndex).join(",") === "1,2,3,1,2,3",
   "voice-marked chord pitches were not mapped back to their own rendered rows");

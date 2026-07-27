@@ -1381,7 +1381,18 @@ function splitTimedEventsByVoice(
   events: readonly TimedEvent[],
 ): TimedEvent[] {
   if (options.voiceCount <= 1) {
-    return events.map((event) => ({ ...event, voiceIndex: 0 }));
+    const clones = new Map<TimedEvent, TimedEvent>();
+    const result = events.map((event) => {
+      const clone: TimedEvent = { ...event, voiceIndex: 0, continuationOf: undefined };
+      clones.set(event, clone);
+      return clone;
+    });
+    events.forEach((event, index) => {
+      if (event.continuationOf) {
+        result[index].continuationOf = clones.get(event.continuationOf);
+      }
+    });
+    return result;
   }
   const sourceGroups = new Map<number, SlashPitchSource[]>();
   for (const source of slashPitchSources(text, options)) {
@@ -1391,6 +1402,12 @@ function splitTimedEventsByVoice(
   }
   const consumed = new Set<number>();
   const result: TimedEvent[] = [];
+  const splitBySource = new Map<TimedEvent, Map<number, TimedEvent>>();
+  const remember = (source: TimedEvent, voice: number, clone: TimedEvent): void => {
+    const voices = splitBySource.get(source) ?? new Map<number, TimedEvent>();
+    voices.set(voice, clone);
+    splitBySource.set(source, voices);
+  };
   let cursor = 0;
   for (const sources of sourceGroups.values()) {
     const main = sources.filter((source) => !source.grace);
@@ -1423,7 +1440,7 @@ function splitTimedEventsByVoice(
         .filter((source) => source.grace && source.voiceIndex === voice)
         .map((source) => [source.pitch]);
       const arpeggioPitches = sourceEvent.arpeggioPitches?.filter((pitch) => pitches.includes(pitch));
-      result.push({
+      const clone: TimedEvent = {
         ...sourceEvent,
         pitches,
         voiceIndex: voice - 1,
@@ -1431,16 +1448,50 @@ function splitTimedEventsByVoice(
         gracePitches: gracePitches.length > 0 ? gracePitches : undefined,
         arpeggioPitches: arpeggioPitches?.length ? arpeggioPitches : undefined,
         arpeggio: Boolean(sourceEvent.arpeggio && arpeggioPitches?.length),
-      });
+      };
+      result.push(clone);
+      remember(sourceEvent, voice - 1, clone);
     }
   }
   events.forEach((event, index) => {
     if (!consumed.has(index) && !event.continuationOf) {
-      result.push({ ...event, voiceIndex: options.voiceCount - 1, continuationOf: undefined });
+      const voice = options.voiceCount - 1;
+      const clone: TimedEvent = { ...event, voiceIndex: voice, continuationOf: undefined };
+      result.push(clone);
+      remember(event, voice, clone);
     }
   });
+
+  // A duration marker at the start of a slash group is an explicit visual
+  // continuation.  It has no pitch token of its own, so copy the per-voice
+  // pitches and ownership from the event it continues.  The previous
+  // implementation dropped these events after splitting the common TXT
+  // timeline, which made multi-voice conversions lose either the faint
+  // continuation chord or its tie.
+  for (const event of events) {
+    if (!event.continuationOf) continue;
+    const parents = splitBySource.get(event.continuationOf);
+    if (!parents) continue;
+    const continuations = new Map<number, TimedEvent>();
+    for (const [voice, parent] of parents) {
+      const clone: TimedEvent = {
+        ...event,
+        pitches: [...parent.pitches],
+        voiceIndex: voice,
+        continuationOf: parent,
+        gracePitches: undefined,
+        arpeggioPitches: undefined,
+        arpeggio: false,
+      };
+      result.push(clone);
+      continuations.set(voice, clone);
+    }
+    splitBySource.set(event, continuations);
+  }
   return result.sort((left, right) =>
-    left.start - right.start || (left.voiceIndex ?? 0) - (right.voiceIndex ?? 0));
+    left.start - right.start ||
+    (left.voiceIndex ?? 0) - (right.voiceIndex ?? 0) ||
+    Number(Boolean(left.continuationOf)) - Number(Boolean(right.continuationOf)));
 }
 
 function parsedMidiFromEvents(events: TimedEvent[], measures: number, options: SlashScoreOptions): ParsedMidi {
@@ -1465,23 +1516,40 @@ function parsedMidiFromEvents(events: TimedEvent[], measures: number, options: S
       const attacks = new Map<number, { start: number; pitches: Set<number> }>();
       for (const event of events) {
         if ((event.voiceIndex ?? options.voiceCount - 1) !== voice) continue;
+        if (event.continuationOf) continue;
         const key = Math.round(event.start * 192);
         const attack = attacks.get(key) ?? { start: event.start, pitches: new Set<number>() };
         for (const pitch of event.pitches) attack.pitches.add(pitch);
         attacks.set(key, attack);
       }
+      const continuationStarts = [...new Set(events
+        .filter((event) =>
+          (event.voiceIndex ?? options.voiceCount - 1) === voice &&
+          event.continuationOf)
+        .map((event) => event.start))]
+        .sort((left, right) => left - right);
       const ordered = [...attacks.values()].sort((left, right) => left.start - right.start);
       ordered.forEach((attack, index) => {
         const end = ordered[index + 1]?.start ?? endQuarter;
-        for (const pitch of attack.pitches) {
-          notes.push({
-            startTick: Math.round(attack.start * ppq),
-            endTick: Math.max(Math.round(attack.start * ppq) + 1, Math.round(end * ppq)),
-            pitch,
-            velocity: 88,
-            channel: voice,
-            track: voice,
-          });
+        const boundaries = [
+          attack.start,
+          ...continuationStarts.filter((start) =>
+            start > attack.start + 1e-8 && start < end - 1e-8),
+          end,
+        ];
+        for (let segment = 0; segment + 1 < boundaries.length; segment++) {
+          const startTick = Math.round(boundaries[segment] * ppq);
+          const endTick = Math.max(startTick + 1, Math.round(boundaries[segment + 1] * ppq));
+          for (const pitch of attack.pitches) {
+            notes.push({
+              startTick,
+              endTick,
+              pitch,
+              velocity: 88,
+              channel: voice,
+              track: voice,
+            });
+          }
         }
       });
     }
@@ -1560,17 +1628,33 @@ function applySlashContinuations(score: Score, events: readonly TimedEvent[]): v
   const eventLastChord = new Map<TimedEvent, Chord>();
   for (const event of events) {
     const pitches = [...event.pitches].sort((a, b) => a - b);
-    const matching = chords.filter((item) =>
+    const voice = clamp(event.voiceIndex ?? 0, 0, Math.max(0, score.parts.length - 1));
+    let matching = chords.filter((item) =>
+      item.partIndex === voice &&
       item.start >= event.start - 1e-8 &&
       item.start < event.end - 1e-8 &&
       item.end <= event.end + 1e-8 &&
       equalPitches(item.pitches, pitches));
+    if (matching.length === 0) {
+      // Multi-voice TXT lets one voice sustain while another attacks.  Its
+      // common source event can therefore end before the rebuilt per-voice MIDI
+      // note does; keep the chord at the attack position as the tie-chain
+      // anchor even when its reconstructed duration is longer.  The same rule
+      // applies to an explicit continuation column whose voice remains active
+      // after the common slash group ends.
+      matching = chords.filter((item) =>
+        item.partIndex === voice &&
+        Math.abs(item.start - event.start) <= 1e-8 &&
+        equalPitches(item.pitches, pitches));
+    }
     if (matching.length === 0) continue;
 
     if (event.continuationOf) {
       let previous = eventLastChord.get(event.continuationOf) ??
         [...chords].reverse().find((item) =>
-          Math.abs(item.end - event.start) <= 1e-8 && equalPitches(item.pitches, pitches))?.chord ?? null;
+          item.partIndex === voice &&
+          Math.abs(item.end - event.start) <= 1e-8 &&
+          equalPitches(item.pitches, pitches))?.chord ?? null;
       for (const item of matching) {
         item.chord.transparentContinuation = true;
         // A continuation split into several notated values is one tie chain,
@@ -1910,7 +1994,7 @@ export function parseSlashScore(text: string, baseOptions: SlashScoreOptions): S
     imported.score.piano = false;
     imported.score.instrumentName = "";
   }
-  if (options.voiceCount <= 1) applySlashContinuations(imported.score, voicedEvents);
+  applySlashContinuations(imported.score, voicedEvents);
   applySlashOrnaments(imported.score, voicedEvents);
   applySlashTempoMarks(imported.score, options.tempoMarks ?? []);
   const pickupRestDivision = (options.noteDivision ?? Math.min(
