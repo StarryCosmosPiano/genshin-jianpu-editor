@@ -255,41 +255,79 @@ async function boot() {
     else if (e.key === "End" && e.ctrlKey) app.goToPage(1e9);
   });
 
-  await wireDragDrop(app, scorePane);
+  await wireDragDrop(app);
 
   // 自动加载上次打开的文件（仅 Tauri；失败则保持示例文本）
   await app.tryRestoreLastFile();
 }
 
 const RECOG_EXT_RE = /\.(png|jpe?g|webp|bmp|gif|pdf)$/i;
+const SCORE_IMPORT_EXT_RE = /\.(jpwabc|txt|keyscore|numscore|kps|nps|mid|midi|xml|musicxml|abc)$/i;
 
-async function wireDragDrop(app: App, dropTarget: HTMLElement): Promise<void> {
+function isSupportedDrop(name: string, mime = ""): boolean {
+  return RECOG_EXT_RE.test(name)
+    || SCORE_IMPORT_EXT_RE.test(name)
+    || mime.startsWith("image/");
+}
+
+function showFileDropTarget(active: boolean): void {
+  document.body.classList.toggle("file-drag-active", active);
+}
+
+async function wireDragDrop(app: App): Promise<void> {
   if (isTauriRuntime()) {
     const { getCurrentWebview } = await import("@tauri-apps/api/webview");
     const { readFile } = await import("@tauri-apps/plugin-fs");
     await getCurrentWebview().onDragDropEvent(async (event) => {
-      if (event.payload.type === "drop") {
-        const path = event.payload.paths[0];
-        if (!path) return;
-        if (RECOG_EXT_RE.test(path)) {
-          // 拖入图片 → 本地 OMR 识别并自动进识别模式叠加核对。
-          const bytes = await readFile(path);
-          await app.recognizeBytes("musicpp", { bytes, path });
-          app.setImportedFileSource(path);
-          return;
-        }
-        if (!/\.(jpwabc|txt|keyscore|numscore|kps|nps|mid|midi|xml|musicxml|abc)$/i.test(path)) return;
-        const bytes = await readFile(path);
-        await app.importBytes(bytes, path);
-        app.setImportedFileSource(path);
-        if (!/\.(mid|midi)$/i.test(path)) app.rememberLastFile(path);
+      if (event.payload.type === "enter" || event.payload.type === "over") {
+        showFileDropTarget(true);
+        return;
       }
+      if (event.payload.type === "leave") {
+        showFileDropTarget(false);
+        return;
+      }
+      if (event.payload.type !== "drop") return;
+      showFileDropTarget(false);
+      const path = event.payload.paths.find((candidate) => isSupportedDrop(candidate));
+      if (!path) return;
+      const bytes = await readFile(path);
+      if (RECOG_EXT_RE.test(path)) {
+        // 拖入图片/PDF → 本地 OMR 识别并自动进识别模式叠加核对。
+        await app.recognizeBytes("musicpp", { bytes, path });
+        app.setImportedFileSource(path);
+        return;
+      }
+      await app.importBytes(bytes, path);
+      app.setImportedFileSource(path);
+      if (!/\.(mid|midi)$/i.test(path)) app.rememberLastFile(path);
     });
   } else {
-    dropTarget.addEventListener("dragover", (e) => e.preventDefault());
+    const dropTarget = document.documentElement;
+    const hasFiles = (event: DragEvent): boolean =>
+      Array.from(event.dataTransfer?.types ?? []).includes("Files");
+    dropTarget.addEventListener("dragenter", (event) => {
+      if (!hasFiles(event)) return;
+      event.preventDefault();
+      showFileDropTarget(true);
+    }, true);
+    dropTarget.addEventListener("dragover", (event) => {
+      if (!hasFiles(event)) return;
+      event.preventDefault();
+      if (event.dataTransfer) event.dataTransfer.dropEffect = "copy";
+      showFileDropTarget(true);
+    }, true);
+    dropTarget.addEventListener("dragleave", (event) => {
+      const next = event.relatedTarget;
+      if (!(next instanceof Node) || !dropTarget.contains(next)) showFileDropTarget(false);
+    }, true);
     dropTarget.addEventListener("drop", async (e) => {
+      const files = Array.from(e.dataTransfer?.files ?? []);
+      if (files.length === 0) return;
       e.preventDefault();
-      const file = e.dataTransfer?.files?.[0];
+      e.stopPropagation();
+      showFileDropTarget(false);
+      const file = files.find((candidate) => isSupportedDrop(candidate.name, candidate.type));
       if (!file) return;
       const buf = new Uint8Array(await file.arrayBuffer());
       if (RECOG_EXT_RE.test(file.name) || file.type.startsWith("image/")) {
@@ -299,7 +337,7 @@ async function wireDragDrop(app: App, dropTarget: HTMLElement): Promise<void> {
       }
       await app.importBytes(buf, file.name);
       app.setImportedFileSource(file.name);
-    });
+    }, true);
   }
 }
 

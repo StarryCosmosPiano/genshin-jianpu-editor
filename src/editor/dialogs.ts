@@ -598,11 +598,11 @@ export function showEngravingStyleDialog(app: App): void {
 
   const hint = document.createElement("div");
   hint.className = "modal-hint engraving-hint";
-  hint.textContent = "拖动时会同时更新这里的样张和当前谱面；点击“应用到整个软件”后，所有现有和以后打开的简谱都会使用这套样式。";
+  hint.textContent = "拖动时只更新这里的独立样张，不会改动当前谱面或总谱；点击“应用到整个软件”后才会保存并重新排版所有简谱。";
   const preview = document.createElement("div");
   preview.className = "engraving-preview";
   const previewSvg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
-  previewSvg.setAttribute("aria-label", "全局简谱排版实时预览");
+  previewSvg.setAttribute("aria-label", "全局简谱排版独立实时预览");
   preview.append(previewSvg);
 
   const controls = document.createElement("div");
@@ -733,7 +733,24 @@ export function showEngravingStyleDialog(app: App): void {
   rhythmHint.textContent = "长刻度始终落在拍号的每一拍。自动模式按各小节实际最短时值补短刻度；手动模式固定使用指定的 4 / 8 / 16 / 32 / 64 分网格。";
   rhythmSection.append(rhythmHint);
 
+  const headerSection = section("标题与谱首信息");
+  headerSection.classList.add("engraving-section-wide");
+  addStyleRange(headerSection, "标题字号", "publicationTitleScale", (v) => `${v.toFixed(2)}×`);
+  addStyleRange(headerSection, "标题水平位置", "publicationTitleX", (v) => `${Math.round(v * 100)}%`);
+  addStyleRange(headerSection, "标题垂直微调", "publicationTitleYOffset", (v) => `${v >= 0 ? "+" : ""}${v.toFixed(1)} 行`);
+  addStyleRange(headerSection, "副标题字号", "publicationSubtitleScale", (v) => `${v.toFixed(2)}×`);
+  addStyleRange(headerSection, "副标题水平位置", "publicationSubtitleX", (v) => `${Math.round(v * 100)}%`);
+  addStyleRange(headerSection, "副标题垂直微调", "publicationSubtitleYOffset", (v) => `${v >= 0 ? "+" : ""}${v.toFixed(1)} 行`);
+  addStyleRange(headerSection, "调号拍号速度字号", "publicationMetaScale", (v) => `${v.toFixed(2)}×`);
+  addStyleRange(headerSection, "调号拍号速度水平位置", "publicationMetaX", (v) => `${Math.round(v * 100)}%`);
+  addStyleRange(headerSection, "调号拍号速度垂直位置", "publicationMetaYOffset", (v) => `${v >= 0 ? "+" : ""}${v.toFixed(1)} 行`);
+  addStyleRange(headerSection, "第一谱行与调拍速度距离", "publicationFirstSystemGap", (v) => `${v.toFixed(2)} 行`);
+  addStyleRange(headerSection, "作词作曲字号", "publicationCreditScale", (v) => `${v.toFixed(2)}×`);
+  addStyleRange(headerSection, "作词作曲水平位置", "publicationCreditX", (v) => `${Math.round(v * 100)}%`);
+  addStyleRange(headerSection, "作词作曲垂直微调", "publicationCreditYOffset", (v) => `${v >= 0 ? "+" : ""}${v.toFixed(1)} 行`);
+
   const pianoSection = section("钢琴双手系统（仅双行谱）");
+  pianoSection.classList.add("engraving-section-double");
   addStyleRange(pianoSection, "左右手行距", "pianoHandGap", (v) => `${v.toFixed(2)}×`);
   addStyleRange(pianoSection, "花括号宽度", "braceWidthScale", (v) => `${v.toFixed(2)}×`);
   addStyleRange(pianoSection, "花括号粗细", "braceStrokeWidth", (v) => `${v.toFixed(1)} px`);
@@ -782,7 +799,6 @@ export function showEngravingStyleDialog(app: App): void {
     }
   };
 
-  let previewTimer: ReturnType<typeof setTimeout> | undefined;
   const refresh = (): void => {
     const style = readStyle();
     const spacingExponent = numericInputs.get("rhythmicSpacingExponent");
@@ -790,8 +806,6 @@ export function showEngravingStyleDialog(app: App): void {
     rhythmGuideDivision.disabled = style.rhythmGuideMode !== "manual";
     updateOutputs(style);
     renderEngravingPreview(previewSvg, style, instrumentName, app);
-    clearTimeout(previewTimer);
-    previewTimer = setTimeout(() => app.setEngravingStyle(style, false), 80);
   };
   for (const input of numericInputs.values()) input.addEventListener("input", refresh);
   bold.addEventListener("change", refresh);
@@ -806,14 +820,9 @@ export function showEngravingStyleDialog(app: App): void {
   renderEngravingPreview(previewSvg, original, instrumentName, app);
 
   modal("全局排版样式", body, () => {
-    clearTimeout(previewTimer);
     app.setEngravingStyle(readStyle(), true);
   }, {
     okText: "应用到整个软件",
     boxClass: "engraving-box",
-    onCancel: () => {
-      clearTimeout(previewTimer);
-      app.setEngravingStyle(original, false);
-    },
   });
 }

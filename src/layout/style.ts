@@ -26,6 +26,21 @@ export interface EngravingStyle {
   justifyLastSystem: boolean;
   /** Preferred vertical distance between adjacent notation systems. */
   systemGapScale: number;
+  /** Publication-header typography and relative placement. X values are content-width ratios. */
+  publicationTitleScale: number;
+  publicationTitleX: number;
+  publicationTitleYOffset: number;
+  publicationSubtitleScale: number;
+  publicationSubtitleX: number;
+  publicationSubtitleYOffset: number;
+  publicationMetaScale: number;
+  publicationMetaX: number;
+  publicationMetaYOffset: number;
+  publicationCreditScale: number;
+  publicationCreditX: number;
+  publicationCreditYOffset: number;
+  /** Minimum vertical distance from the key/meter/tempo baseline to the first system. */
+  publicationFirstSystemGap: number;
   /** Optional rhythm ruler below numbered notation. */
   rhythmGuideEnabled: boolean;
   /** Auto detects the shortest local value; manual uses rhythmGuideDivision. */
@@ -61,6 +76,19 @@ export const DEFAULT_ENGRAVING_STYLE: Readonly<EngravingStyle> = Object.freeze({
   measuresPerSystem: 4,
   justifyLastSystem: true,
   systemGapScale: 1,
+  publicationTitleScale: 1,
+  publicationTitleX: 0.5,
+  publicationTitleYOffset: 0,
+  publicationSubtitleScale: 1,
+  publicationSubtitleX: 0.5,
+  publicationSubtitleYOffset: 0,
+  publicationMetaScale: 1,
+  publicationMetaX: 0,
+  publicationMetaYOffset: 0,
+  publicationCreditScale: 1,
+  publicationCreditX: 1,
+  publicationCreditYOffset: 0,
+  publicationFirstSystemGap: 0.88,
   rhythmGuideEnabled: true,
   rhythmGuideMode: "auto",
   rhythmGuideDivision: 4,
@@ -93,6 +121,19 @@ export const ENGRAVING_STYLE_RANGES: Readonly<Record<NumericEngravingStyleKey, r
   rhythmicSpacingExponent: [0.2, 1.5, 0.05],
   measuresPerSystem: [1, 16, 1],
   systemGapScale: [0.2, 4, 0.05],
+  publicationTitleScale: [0.4, 2.5, 0.05],
+  publicationTitleX: [0, 1, 0.01],
+  publicationTitleYOffset: [-6, 8, 0.1],
+  publicationSubtitleScale: [0.4, 2.5, 0.05],
+  publicationSubtitleX: [0, 1, 0.01],
+  publicationSubtitleYOffset: [-6, 8, 0.1],
+  publicationMetaScale: [0.4, 2.5, 0.05],
+  publicationMetaX: [0, 1, 0.01],
+  publicationMetaYOffset: [-6, 8, 0.1],
+  publicationCreditScale: [0.4, 2.5, 0.05],
+  publicationCreditX: [0, 1, 0.01],
+  publicationCreditYOffset: [-6, 8, 0.1],
+  publicationFirstSystemGap: [0.2, 6, 0.05],
   pianoHandGap: [0.5, 4, 0.05],
   braceWidthScale: [0.25, 3, 0.05],
   braceStrokeWidth: [0.2, 8, 0.1],

@@ -482,6 +482,56 @@ check(metaFrame && Math.abs(metaFrame.font.size - layout.options.numberSize * 0.
   "key/meter/tempo metadata was not reduced by the requested 1.2x");
 check(creditFrame && Math.abs(creditFrame.font.size - layout.options.numberSize * 0.52) < 0.01, "credits changed size with the enlarged metadata");
 check(pageNumberFrame && Math.abs(pageNumberFrame.font.size - layout.options.lrcFont.size * 0.8 / 3) < 0.01, "page number was not reduced to one third");
+
+const headerControlLayout = new layoutMod.Layout(28);
+headerControlLayout.options.smuflMeta = smuflMeta;
+headerControlLayout.options.applyEngravingStyle({
+  publicationTitleScale: 1.4,
+  publicationTitleX: 0.28,
+  publicationTitleYOffset: 1.2,
+  publicationMetaScale: 1.3,
+  publicationMetaX: 0.18,
+  publicationMetaYOffset: 0.7,
+  publicationCreditScale: 0.8,
+  publicationCreditX: 0.72,
+  publicationCreditYOffset: -0.5,
+  publicationFirstSystemGap: 2.3,
+});
+headerControlLayout.fromScore(score, null, 960, 540);
+const headerControlPage = headerControlLayout.pages[0];
+const headerControlFrames: InstanceType<typeof layoutMod.TextFrame>[] = [];
+const collectHeaderControlFrames = (item: InstanceType<typeof layoutMod.PageItem>): void => {
+  if (item instanceof layoutMod.TextFrame && item.classes.has("publication-header")) {
+    headerControlFrames.push(item);
+  }
+  for (const child of item.children) {
+    collectHeaderControlFrames(child as InstanceType<typeof layoutMod.PageItem>);
+  }
+};
+collectHeaderControlFrames(headerControlPage);
+const controlledTitle = headerControlFrames.find((item) => item.classes.has("publication-title"));
+const controlledMeta = headerControlFrames.find((item) => item.classes.has("publication-meta"));
+const controlledCredit = headerControlFrames.find((item) => item.classes.has("publication-credit"));
+const controlledFirstSystem = headerControlPage.children.find((item) => item.classes.has("piano-system"));
+const controlledContentWidth = 960 - headerControlLayout.options.marginLeft * 2;
+check(controlledTitle && controlledMeta && controlledCredit && controlledFirstSystem,
+  "publication header controls lost a title, metadata, credit, or first system");
+check(Math.abs(controlledTitle.x + controlledTitle.width / 2 - controlledContentWidth * 0.28) < 0.01,
+  "title horizontal-position control was not applied to production layout");
+check(Math.abs(controlledMeta.x - controlledContentWidth * 0.18) < 0.01,
+  "key/meter/tempo horizontal-position control was not applied to production layout");
+check(Math.abs(controlledCredit.x + controlledCredit.width - controlledContentWidth * 0.72) < 0.01,
+  "credit horizontal-position control was not applied to production layout");
+check(Math.abs(controlledTitle.font.size - publicationTitleSize * 1.4) < 0.01
+  && Math.abs(controlledMeta.font.size - headerControlLayout.options.numberSize * 0.87 * 1.3) < 0.01
+  && Math.abs(controlledCredit.font.size - headerControlLayout.options.numberSize * 0.52 * 0.8) < 0.01,
+"publication header font-size controls were not applied to production layout");
+check(controlledTitle.y > titleFrame.y + headerControlLayout.options.numberSize,
+  "title vertical-position control was not applied to production layout");
+check(Math.abs(controlledFirstSystem.y - controlledMeta.y
+  - headerControlLayout.options.numberSize * 2.3) < 0.01,
+"first-system distance from key/meter/tempo metadata does not match the selected control");
+
 const braceGlyphOf = (system: InstanceType<typeof layoutMod.Group>): InstanceType<typeof layoutMod.TextFrame> | null => {
   let found: InstanceType<typeof layoutMod.TextFrame> | null = null;
   const find = (item: InstanceType<typeof layoutMod.PageItem>): void => {

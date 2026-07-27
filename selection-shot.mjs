@@ -63,8 +63,79 @@ try {
     document.querySelector("#toolbar-notice.visible")?.textContent
       === "JPW 格式不支持乐谱设置");
 
-  await page.evaluate((text) => window.__app.setText(text), fixture);
+  const dropped = await page.evaluate((text) => {
+    const file = new File([text], "drag-import.jpwabc", {
+      type: "application/octet-stream",
+    });
+    const transfer = new DataTransfer();
+    transfer.items.add(file);
+    const target = document.querySelector("#code-pane");
+    target.dispatchEvent(new DragEvent("dragenter", {
+      bubbles: true,
+      cancelable: true,
+      dataTransfer: transfer,
+    }));
+    const overlayVisible = document.body.classList.contains("file-drag-active");
+    target.dispatchEvent(new DragEvent("drop", {
+      bubbles: true,
+      cancelable: true,
+      dataTransfer: transfer,
+    }));
+    return overlayVisible;
+  }, fixture);
+  if (!dropped) throw new Error("whole-editor file drag did not expose its direct-import target");
+  await page.waitForFunction((text) => window.__app.getText() === text, fixture);
   await page.waitForFunction(() => document.querySelectorAll("#score-pane g.entry").length >= 8);
+
+  const liveStyleBefore = await page.evaluate(() => ({
+    metaX: window.__app.engravingStyle.publicationMetaX,
+    scoreHtml: document.querySelector("#score-pane")?.innerHTML ?? "",
+  }));
+  await page.locator("#btn-layout-style").click();
+  const previewBefore = await page.locator(".engraving-preview svg").evaluate((svg) => svg.innerHTML);
+  await page.locator('input[name="publicationMetaX"]').evaluate((input) => {
+    input.value = "0.25";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  const draftState = await page.evaluate((expectedMetaX) => ({
+    metaX: window.__app.engravingStyle.publicationMetaX,
+    scoreHtml: document.querySelector("#score-pane")?.innerHTML ?? "",
+    previewHtml: document.querySelector(".engraving-preview svg")?.innerHTML ?? "",
+    hasNewControls: [
+      "publicationTitleX",
+      "publicationTitleYOffset",
+      "publicationMetaX",
+      "publicationMetaYOffset",
+      "publicationFirstSystemGap",
+      "publicationCreditX",
+    ].every((name) => document.querySelector(`input[name="${name}"]`)),
+    expectedMetaX,
+  }), liveStyleBefore.metaX);
+  if (draftState.metaX !== liveStyleBefore.metaX
+    || draftState.scoreHtml !== liveStyleBefore.scoreHtml
+    || draftState.previewHtml === previewBefore
+    || !draftState.hasNewControls) {
+    throw new Error(`engraving draft leaked into the live score: ${JSON.stringify({
+      liveMetaBefore: liveStyleBefore.metaX,
+      draftMeta: draftState.metaX,
+      scoreChanged: draftState.scoreHtml !== liveStyleBefore.scoreHtml,
+      previewChanged: draftState.previewHtml !== previewBefore,
+      hasNewControls: draftState.hasNewControls,
+    })}`);
+  }
+  await page.getByRole("button", { name: "应用到整个软件" }).click();
+  await page.waitForFunction(() =>
+    Math.abs(window.__app.engravingStyle.publicationMetaX - 0.25) < 1e-8);
+  const appliedStyle = await page.evaluate((beforeHtml) => ({
+    scoreChanged: (document.querySelector("#score-pane")?.innerHTML ?? "") !== beforeHtml,
+    metaX: window.__app.engravingStyle.publicationMetaX,
+    publicationMetaCount: document.querySelectorAll("#score-pane .publication-meta").length,
+  }), liveStyleBefore.scoreHtml);
+  if (!appliedStyle.scoreChanged
+    || appliedStyle.metaX !== 0.25
+    || appliedStyle.publicationMetaCount === 0) {
+    throw new Error(`engraving draft was not applied on confirmation: ${JSON.stringify(appliedStyle)}`);
+  }
 
   const noteText = (value) => page.locator("#score-pane g.entry text").filter({ hasText: new RegExp(`^${value}$`) }).first();
   await noteText("1").click();
@@ -777,6 +848,53 @@ Tempo = {90}
     await page.locator("#score-pane .score-page").first().screenshot({ path: process.argv[5] });
   }
 
+  const ensembleDraftFixture = `.Title
+Title = {总谱排版草稿隔离}
+KeyAndMeters = {1=C,4/4}
+Tempo = {90}
+.Voice.钢琴.V1
+1 2 3 4 |]
+.Voice.钢琴.V2
+1, 2, 3, 4, |]
+.Voice.小提琴.V1
+5' 6' 7' 1'' |]
+`;
+  await page.evaluate((text) => {
+    const app = window.__app;
+    app.documentFormat = "jpw";
+    app.slashOptions = null;
+    app.setText(text);
+  }, ensembleDraftFixture);
+  await page.waitForFunction(() =>
+    document.querySelectorAll("#score-pane .ensemble-system").length > 0);
+  const ensembleBefore = await page.evaluate(() => ({
+    html: document.querySelector("#score-pane")?.innerHTML ?? "",
+    metaY: window.__app.engravingStyle.publicationMetaYOffset,
+  }));
+  await page.locator("#btn-layout-style").click();
+  await page.locator('input[name="publicationMetaYOffset"]').evaluate((input) => {
+    input.value = "2.4";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  const ensembleDraftIsolation = await page.evaluate((before) => ({
+    liveUnchanged: (document.querySelector("#score-pane")?.innerHTML ?? "") === before.html,
+    styleUnchanged: window.__app.engravingStyle.publicationMetaYOffset === before.metaY,
+    previewHasEnsemble: document.querySelectorAll(".engraving-preview .piano-system").length > 0,
+  }), ensembleBefore);
+  if (process.argv[6]) {
+    await page.locator(".modal-box.engraving-box").screenshot({ path: process.argv[6] });
+  }
+  await page.getByRole("button", { name: "取消" }).click();
+  if (!ensembleDraftIsolation.liveUnchanged
+    || !ensembleDraftIsolation.styleUnchanged
+    || !ensembleDraftIsolation.previewHasEnsemble) {
+    throw new Error(
+      `engraving draft changed the live ensemble before confirmation: ${
+        JSON.stringify(ensembleDraftIsolation)
+      }`,
+    );
+  }
+
   if (errors.filter((error) => !/favicon/.test(error)).length > 0) {
     throw new Error(`browser errors: ${errors.join("\n")}`);
   }
@@ -796,6 +914,7 @@ Tempo = {90}
     arpeggioHighlighting: true,
     crossMeasureChordHeight: true,
     crossSystemContinuation: true,
+    ensembleDraftIsolation: true,
     selectedPlayback,
     slashPlayback,
     clearedPlayback,

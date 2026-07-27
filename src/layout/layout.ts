@@ -3197,15 +3197,26 @@ export class Layout {
   private publicationHeaderReserve(scr: S.Score): number {
     const hasTitleText = Boolean(scr.title.trim() || scr.subtitle.trim());
     const hasTitleBlock = Boolean(scr.title.trim() || scr.subtitle.trim() || scr.composer.trim() || scr.arranger.trim() || scr.lyricist.trim());
-    const titleFontSize = Math.min(this.options.titleSize, this.options.numberSize * 1.25);
+    const style = this.options.engravingStyle;
+    const titleFontSize = Math.min(this.options.titleSize, this.options.numberSize * 1.25)
+      * style.publicationTitleScale;
     const titleShift = hasTitleText ? titleFontSize : 0;
-    return this.options.numberSize * (hasTitleBlock ? 3.85 : 2.35)
+    const baseReserve = this.options.numberSize * (hasTitleBlock ? 3.85 : 2.35)
       + titleShift
       + this.options.numberSize * 0.35;
+    // Keep metadata vertical movement and the requested metadata→first-system
+    // gap independent. Defaults reproduce the historical 0.88-number gap.
+    return Math.max(
+      this.options.numberSize * 0.5,
+      baseReserve
+        + this.options.numberSize * style.publicationMetaYOffset
+        + this.options.numberSize * (style.publicationFirstSystemGap - 0.88),
+    );
   }
 
   private addPublicationHeader(page: Group, scr: S.Score, width: number, reserve: number): void {
     const opt = this.options;
+    const style = opt.engravingStyle;
     // paginatePiano normalizes each page group and stores the first system's
     // absolute y in page.y. Move that offset back into the music children so
     // header items and systems share one page-local coordinate system.
@@ -3213,12 +3224,21 @@ export class Layout {
       for (const child of page.children) child.y += page.y;
       page.y = 0;
     }
-    const addText = (text: string, font: Font, x: number, y: number, align: "left" | "center" | "right" = "left"): void => {
+    const addText = (
+      text: string,
+      font: Font,
+      x: number,
+      y: number,
+      align: "left" | "center" | "right" = "left",
+      className = "",
+    ): void => {
       if (!text.trim()) return;
       const tf = new TextFrame();
       tf.text = text;
       tf.font = font;
       tf.color = opt.color;
+      tf.classes.add("publication-header");
+      if (className) tf.classes.add(className);
       const measured = tf.measureText();
       tf.x = align === "center" ? x - measured / 2 : align === "right" ? x - measured : x;
       tf.y = y;
@@ -3226,17 +3246,44 @@ export class Layout {
       page.add(tf);
     };
 
-    const titleFont = opt.lrcFont.makeWithSize(Math.min(opt.titleSize, opt.numberSize * 1.25));
-    const subtitleFont = opt.lrcFont.makeWithSize(opt.numberSize * 0.62);
-    const metaFont = opt.lrcFont.makeWithSize(opt.numberSize * 0.87);
-    const creditFont = opt.lrcFont.makeWithSize(opt.numberSize * 0.52);
+    const titleFont = opt.lrcFont.makeWithSize(
+      Math.min(opt.titleSize, opt.numberSize * 1.25) * style.publicationTitleScale,
+    );
+    const subtitleFont = opt.lrcFont.makeWithSize(
+      opt.numberSize * 0.62 * style.publicationSubtitleScale,
+    );
+    const metaFont = opt.lrcFont.makeWithSize(
+      opt.numberSize * 0.87 * style.publicationMetaScale,
+    );
+    const creditFont = opt.lrcFont.makeWithSize(
+      opt.numberSize * 0.52 * style.publicationCreditScale,
+    );
     // Use the title font's own ascent, not the number size, to keep larger
     // publication titles fully inside the page instead of clipping their top.
-    const titleY = titleFont.size * 2.2 + opt.numberSize * 0.35;
-    addText(scr.title, titleFont, width / 2, titleY, "center");
-    addText(scr.subtitle, subtitleFont, width / 2, titleY + opt.numberSize * 0.9, "center");
+    const titleY = titleFont.size * 2.2
+      + opt.numberSize * (0.35 + style.publicationTitleYOffset);
+    const subtitleY = titleY
+      + opt.numberSize * (0.9 + style.publicationSubtitleYOffset);
+    addText(
+      scr.title,
+      titleFont,
+      width * style.publicationTitleX,
+      titleY,
+      "center",
+      "publication-title",
+    );
+    addText(
+      scr.subtitle,
+      subtitleFont,
+      width * style.publicationSubtitleX,
+      subtitleY,
+      "center",
+      "publication-subtitle",
+    );
 
     const first = scr.parts[0]?.measures[0];
+    const metaY = opt.marginTop + reserve
+      - opt.numberSize * style.publicationFirstSystemGap;
     if (first) {
       const rawKey = first.key.name;
       const displayKey = rawKey.startsWith("#") ? `${rawKey.slice(1)}♯` : rawKey.startsWith("b") ? `${rawKey.slice(1)}♭` : rawKey;
@@ -3245,10 +3292,14 @@ export class Layout {
         : scr.tempoBeatUnit === "dotted-quarter" ? "♩." : "♩";
       const displayTempo = S.tempoBpmForUnit(scr.tempoBpm, scr.tempoBeatUnit);
       const meta = `1=${displayKey}   ${first.time.beats}/${first.time.beatType}   ${tempoSymbol}=${S.formatTempoBpm(displayTempo)}`;
-      // Measure numbers float just above systems without consuming pagination
-      // height. Keep the publication metadata one small-number row higher so
-      // the first system's label cannot collide with key/meter/tempo text.
-      addText(meta, metaFont, 0, opt.marginTop + reserve - opt.numberSize * 0.88, "left");
+      addText(
+        meta,
+        metaFont,
+        width * style.publicationMetaX,
+        metaY,
+        "left",
+        "publication-meta",
+      );
     }
 
     const explicitCredits = [
@@ -3260,10 +3311,17 @@ export class Layout {
       ? explicitCredits
       : scr.credit.filter((x) => x.type !== "title").flatMap((x) => x.text.split("\n").map((s) => s.trim()).filter(Boolean));
     const creditGap = creditFont.size * 1.18;
-    const creditBottom = opt.marginTop + reserve - opt.numberSize * 0.88;
+    const creditBottom = metaY + opt.numberSize * style.publicationCreditYOffset;
     credits.forEach((text, index) => {
       const y = creditBottom - (credits.length - 1 - index) * creditGap;
-      addText(text, creditFont, width, y, "right");
+      addText(
+        text,
+        creditFont,
+        width * style.publicationCreditX,
+        y,
+        "right",
+        "publication-credit",
+      );
     });
   }
 
