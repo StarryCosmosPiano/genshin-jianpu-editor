@@ -43,6 +43,26 @@ TempoMarks = {1@1=tempo:108}
 
 try {
   await page.goto(`http://127.0.0.1:${port}/`, { waitUntil: "networkidle" });
+  const scoreSettingsButton = page.locator("#btn-score-settings");
+  const unavailableScoreSettings = await scoreSettingsButton.evaluate((button) => ({
+    unavailable: button.classList.contains("format-unavailable"),
+    ariaDisabled: button.getAttribute("aria-disabled"),
+    title: button.getAttribute("title"),
+  }));
+  if (!unavailableScoreSettings.unavailable
+    || unavailableScoreSettings.ariaDisabled !== "true"
+    || unavailableScoreSettings.title !== "JPW 格式不支持乐谱设置") {
+    throw new Error(
+      `JPW score settings button did not expose its unavailable state: ${
+        JSON.stringify(unavailableScoreSettings)
+      }`,
+    );
+  }
+  await scoreSettingsButton.click({ force: true });
+  await page.waitForFunction(() =>
+    document.querySelector("#toolbar-notice.visible")?.textContent
+      === "JPW 格式不支持乐谱设置");
+
   await page.evaluate((text) => window.__app.setText(text), fixture);
   await page.waitForFunction(() => document.querySelectorAll("#score-pane g.entry").length >= 8);
 
@@ -359,6 +379,41 @@ KeyAndMeters = {1=C,4/4}
   await page.keyboard.press("ArrowUp");
   await page.waitForFunction(() => /\{D\}E\.\/S\./.test(window.__app.getText()));
 
+  const jpwFormatFixture = `.Title
+Title = {格式转换测试}
+KeyAndMeters = {1=A,4/4}
+.Voice
+1 2 3 4 |5 6 7 1' |]
+`;
+  const jpwFormatConversion = await page.evaluate(async (text) => {
+    const app = window.__app;
+    app.documentFormat = "jpw";
+    app.slashOptions = null;
+    app.setText(text);
+    await app.changeDocumentFormat("number");
+    const numberText = app.getText();
+    const numberSources = app._sourceNotes.map((source) =>
+      app.view.state.doc.sliceString(source.from, source.to));
+    app.documentFormat = "jpw";
+    app.slashOptions = null;
+    app.setText(text);
+    await app.changeDocumentFormat("keyboard");
+    return {
+      numberText,
+      numberSources,
+      keyboardText: app.getText(),
+      keyboardSources: app._sourceNotes.map((source) =>
+        app.view.state.doc.sliceString(source.from, source.to)),
+    };
+  }, jpwFormatFixture);
+  if (!jpwFormatConversion.numberText.includes("\n1..../2..../3..../4..../")
+    || jpwFormatConversion.numberText.includes("\n-1..../")
+    || jpwFormatConversion.numberSources.join("|") !== "1|2|3|4|5|6|7|+1"
+    || !jpwFormatConversion.keyboardText.includes("\nA..../S..../D..../F..../")
+    || jpwFormatConversion.keyboardSources.join("|") !== "A|S|D|F|G|H|J|Q") {
+    throw new Error(`JPW keyboard/number conversion is inaccurate: ${JSON.stringify(jpwFormatConversion)}`);
+  }
+
   const mixedRecognitionText = `键盘谱
 4/4拍：
 点=八分音符
@@ -416,7 +471,16 @@ A../S../D../F../
     );
   }
 
-  await page.locator("#btn-score-settings").click();
+  const availableScoreSettings = await scoreSettingsButton.evaluate((button) => ({
+    unavailable: button.classList.contains("format-unavailable"),
+    ariaDisabled: button.getAttribute("aria-disabled"),
+  }));
+  if (availableScoreSettings.unavailable || availableScoreSettings.ariaDisabled !== "false") {
+    throw new Error(
+      `keyboard score settings button remained unavailable: ${JSON.stringify(availableScoreSettings)}`,
+    );
+  }
+  await scoreSettingsButton.click();
   const scoreSettingsBox = page.locator(".slash-import-box");
   await scoreSettingsBox.waitFor();
   const settingsTitle = await scoreSettingsBox.locator(".modal-title").textContent();
@@ -666,7 +730,9 @@ Tempo = {90}
     keyboardPitchEdit: true,
     numberSlashPitchEdit: true,
     keyboardSlashPitchEdit: true,
+    jpwFormatConversion: true,
     mixedRecognitionSwitch: true,
+    scoreSettingsAvailability: true,
     scoreSettingsApplied: true,
     optionalMetadataExport: true,
     textVoiceColorToggle: true,

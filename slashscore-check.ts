@@ -1,5 +1,7 @@
 import { Chord } from "./src/score/score";
 import { buildTimeline } from "./src/score/timeline";
+import { fromJpw } from "./src/score/jpwimport";
+import { JpwFile } from "./src/jpword/jpwfile";
 import { buildSlashSourceNotes, editSlashPitch } from "./src/editor/note-selection";
 import { readFileSync } from "node:fs";
 import {
@@ -576,6 +578,64 @@ const regeneratedKeyboard = scoreToSlashScore(keyboardResult.score, "keyboard", 
 check(analyzeSlashScore(regeneratedNumber).detectedKind === "number", "number serialization");
 check(analyzeSlashScore(regeneratedKeyboard).detectedKind === "keyboard", "keyboard serialization");
 check(!parseSlashScore(regeneratedNumber, defaultSlashScoreOptions("number", analyzeSlashScore(regeneratedNumber))).score.piano, "round-trip stays single staff");
+
+for (const tonic of ["A", "B", "bA", "bB"]) {
+  const upperTonicJpw = fromJpw(JpwFile.fromString(`.Title
+KeyAndMeters = {1=${tonic},4/4}
+.Voice
+1 2 3 4 |5 6 7 1' |]
+`)!);
+  check(upperTonicJpw, `${tonic} JPW conversion fixture did not parse`);
+  const upperTonicNumber = scoreToSlashScore(upperTonicJpw, "number", 16);
+  const upperTonicKeyboard = scoreToSlashScore(upperTonicJpw, "keyboard", 16);
+  check(upperTonicNumber.includes("\n1..../2..../3..../4..../")
+    && !upperTonicNumber.includes("\n-1..../"),
+  `JPW tonic ${tonic} was translated one octave too low in number TXT`);
+  check(upperTonicKeyboard.includes("\nA..../S..../D..../F..../"),
+    `JPW tonic ${tonic} was translated to the wrong keyboard row`);
+}
+
+const overlappingVoicesJpw = fromJpw(JpwFile.fromString(`.Title
+Instrument = {钢琴}
+KeyAndMeters = {1=C,4/4}
+.Voice.RH
+1__ 2__ 3__ 4_ 5__ 6__ 7__ 1'__ 2'__ 3'__ 4'__ 5'__ 6'__ 7'__ 1''__ |]
+.Voice.LH
+1,--- |]
+`)!);
+check(overlappingVoicesJpw, "overlapping-voice JPW conversion fixture did not parse");
+const attackSignature = (score: typeof overlappingVoicesJpw): string[] =>
+  score.parts.map((part) => part.measures[0].entries
+    .filter((entry): entry is Chord =>
+      entry instanceof Chord
+      && !entry.rest
+      && !entry.transparentContinuation
+      && entry.notes.some((note) => !note.rest && !note.tieEnd))
+    .map((entry) => `${entry.position.toFloat()}:${
+      entry.notes.filter((note) => !note.rest && !note.tieEnd)
+        .map((note) => note.pitch).sort((left, right) => left - right).join(",")
+    }`)
+    .join("|"));
+const overlappingNumber = scoreToSlashScore(overlappingVoicesJpw, "number", 16, ".", undefined, 2);
+const overlappingOptions = defaultSlashScoreOptions("number", analyzeSlashScore(overlappingNumber));
+const overlappingRoundTrip = parseSlashScore(overlappingNumber, overlappingOptions).score;
+check(JSON.stringify(attackSignature(overlappingRoundTrip))
+  === JSON.stringify(attackSignature(overlappingVoicesJpw)),
+"overlapping JPW voices duplicated duration cells and shifted following TXT attacks");
+
+const tiedJpw = fromJpw(JpwFile.fromString(`.Title
+KeyAndMeters = {1=C,4/4}
+.Voice
+(6 6) 0 0 |]
+`)!);
+check(tiedJpw, "tied JPW conversion fixture did not parse");
+const tiedNumber = scoreToSlashScore(tiedJpw, "number", 16);
+const tiedRoundTrip = parseSlashScore(
+  tiedNumber,
+  defaultSlashScoreOptions("number", analyzeSlashScore(tiedNumber)),
+).score;
+check(attackSignature(tiedRoundTrip)[0] === attackSignature(tiedJpw)[0],
+  "JPW tie continuation became a repeated TXT attack");
 
 const v1 = SLASH_VOICE_SEPARATOR;
 const v2 = SLASH_VOICE_SEPARATOR.repeat(2);

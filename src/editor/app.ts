@@ -463,6 +463,7 @@ export class App {
 
   /** parse -> import -> layout -> render. Returns false on parse failure (text kept). */
   reload(text: string): boolean {
+    this.syncScoreSettingsButton();
     // 混排/识别模式：谱面区显示各自专属视图，编辑文本不重排冲掉它。
     if (this.mode !== "jp") return true;
     if (this._pendingSelectionAnchors === null && this._selectedNotes.length > 0) {
@@ -1333,13 +1334,51 @@ export class App {
     if (this.statusEl) this.statusEl.textContent = s;
   }
 
+  private syncScoreSettingsButton(): void {
+    const button = document.getElementById("btn-score-settings");
+    if (!button) return;
+    const available = this.mode === "jp"
+      && this.documentFormat !== "jpw"
+      && this.slashOptions !== null;
+    button.classList.toggle("format-unavailable", !available);
+    button.setAttribute("aria-disabled", String(!available));
+    button.title = available
+      ? "修改当前键盘谱或数字谱的识别、节奏、拍号、速度与标题设置"
+      : this.documentFormat === "jpw"
+        ? "JPW 格式不支持乐谱设置"
+        : "当前视图不支持乐谱设置";
+  }
+
+  private showToolbarNotice(message: string): void {
+    this.setStatus(message);
+    document.getElementById("toolbar-notice")?.remove();
+    const notice = document.createElement("div");
+    notice.id = "toolbar-notice";
+    notice.className = "toolbar-notice";
+    notice.setAttribute("role", "status");
+    notice.textContent = message;
+    const button = document.getElementById("btn-score-settings");
+    const rect = button?.getBoundingClientRect();
+    notice.style.left = `${Math.max(12, rect?.left ?? 12)}px`;
+    notice.style.top = `${(rect?.bottom ?? 36) + 8}px`;
+    document.body.append(notice);
+    requestAnimationFrame(() => notice.classList.add("visible"));
+    window.setTimeout(() => {
+      notice.classList.remove("visible");
+      window.setTimeout(() => notice.remove(), 160);
+    }, 2400);
+  }
+
   getSlashVoiceCount(): number {
     return this.documentFormat === "jpw" ? 1 : this.slashOptions?.voiceCount ?? 1;
   }
 
   async showScoreSettings(): Promise<void> {
     if (this.mode !== "jp" || this.documentFormat === "jpw" || !this.slashOptions) {
-      this.setStatus("“乐谱设置”用于当前键盘谱或数字谱；JPW 简谱请使用“选项”和“排版”");
+      this.syncScoreSettingsButton();
+      this.showToolbarNotice(this.documentFormat === "jpw"
+        ? "JPW 格式不支持乐谱设置"
+        : "当前视图不支持乐谱设置");
       return;
     }
     const current: SlashScoreOptions = {

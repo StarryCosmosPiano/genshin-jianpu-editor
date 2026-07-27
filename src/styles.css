@@ -25,7 +25,39 @@ html, body { margin: 0; height: 100%; }
   border-bottom: 1px solid var(--border);
 }
 #toolbar button { padding: 4px 10px; cursor: pointer; }
+#toolbar button.format-unavailable {
+  color: #777;
+  background: #ededed;
+  border-color: #c9c9c9;
+  cursor: not-allowed;
+  filter: grayscale(1);
+  opacity: 0.62;
+}
+#toolbar button.format-unavailable:hover {
+  background: #e7e7e7;
+}
 #toolbar .sep { width: 1px; height: 20px; background: var(--border); margin: 0 6px; }
+
+.toolbar-notice {
+  position: fixed;
+  z-index: 10020;
+  max-width: min(420px, calc(100vw - 24px));
+  padding: 8px 12px;
+  border: 1px solid #b9b9b9;
+  border-radius: 6px;
+  color: #333;
+  background: rgba(255, 255, 255, 0.98);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.18);
+  font-size: 14px;
+  pointer-events: none;
+  opacity: 0;
+  transform: translateY(-4px);
+  transition: opacity 140ms ease, transform 140ms ease;
+}
+.toolbar-notice.visible {
+  opacity: 1;
+  transform: translateY(0);
+}
 
 #body { flex: 1 1 auto; display: flex; min-height: 0; }
 

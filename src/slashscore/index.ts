@@ -822,8 +822,12 @@ export function defaultSlashScoreOptions(kind: SlashScoreKind, analysis?: SlashS
 }
 
 function tonicPitch(fifths: number): number {
-  const pitchClass = ((7 * fifths) % 12 + 12) % 12;
-  return 60 + pitchClass;
+  // JPW deliberately places tonic A/B (and their flat spellings) below
+  // middle C, so one octave of numbered notation remains centred around C4.
+  // Using only the pitch class here made `1=A` serialize as `-1`, even though
+  // the source JPW pitch and the generated preview sounded the same.
+  const key = MusicCommon.keys[clamp(Math.round(fifths) + 7, 0, MusicCommon.keys.length - 1)];
+  return MusicCommon.getBasePitch(key);
 }
 
 function keyboardPitchAt(text: string, at: number, fifths: number): PitchToken | null {
@@ -2011,31 +2015,61 @@ interface OutputEvent {
 }
 
 function measureEvents(score: Score, measureIndex: number): OutputEvent[] {
-  const grouped = new Map<number, { start: number; ends: number[]; chords: Chord[]; voiceIndexes: number[] }>();
+  const grouped = new Map<number, {
+    start: number;
+    attackEnds: number[];
+    continuationEnds: number[];
+    chords: Chord[];
+    voiceIndexes: number[];
+  }>();
   for (let partIndex = 0; partIndex < score.parts.length; partIndex++) {
     const part = score.parts[partIndex];
     const measure = part.measures[measureIndex];
     if (!measure) continue;
     for (const entry of measure.entries) {
-      if (!(entry instanceof Chord) || entry.rest || entry.transparentContinuation
-        || entry.notes.every((note) => note.rest)) continue;
+      if (!(entry instanceof Chord) || entry.rest || entry.notes.every((note) => note.rest)) continue;
+      const sounding = entry.notes.filter((note) => !note.rest);
+      // A transparent slash continuation or an explicit JPW tie-stop advances
+      // the common time axis but must not become a new keyboard/number attack.
+      const continuation = entry.transparentContinuation
+        || (entry.graceNotes.every((note) => note.rest)
+          && !entry.arpeggio
+          && sounding.length > 0
+          && sounding.every((note) => note.tieEnd));
       const start = entry.position.toFloat();
       const duration = entry.duration?.toFloat() ?? 0.25;
       const key = Math.round(start * 192);
-      const item = grouped.get(key) ?? { start, ends: [], chords: [], voiceIndexes: [] };
-      item.ends.push(start + duration);
-      item.chords.push(entry);
-      item.voiceIndexes.push(partIndex + 1);
+      const item = grouped.get(key) ?? {
+        start,
+        attackEnds: [],
+        continuationEnds: [],
+        chords: [],
+        voiceIndexes: [],
+      };
+      if (continuation) {
+        item.continuationEnds.push(start + duration);
+      } else {
+        item.attackEnds.push(start + duration);
+        item.chords.push(entry);
+        item.voiceIndexes.push(partIndex + 1);
+      }
       grouped.set(key, item);
     }
   }
   return [...grouped.values()]
-    .map((item) => ({
-      start: item.start,
-      end: median(item.ends),
-      chords: item.chords,
-      voiceIndexes: item.voiceIndexes,
-    }))
+    .map((item): OutputEvent => {
+      const ends = [...item.attackEnds, ...item.continuationEnds];
+      return {
+        start: item.start,
+        // Multiple voices can overlap for different lengths. The slash text
+        // needs one common cursor, so retain the longest active span and emit
+        // at most one continuation marker at a following group boundary.
+        end: Math.max(item.start + 1 / 192, ...ends),
+        chords: item.chords,
+        voiceIndexes: item.voiceIndexes,
+        specialToken: item.chords.length === 0 ? "" : undefined,
+      };
+    })
     .sort((a, b) => a.start - b.start);
 }
 
@@ -2355,14 +2389,24 @@ export function scoreToSlashScore(
     for (let groupIndex = 0; groupIndex < groups; groupIndex++) {
       const start = groupIndex * groupDuration;
       const end = start + groupDuration;
-      const inGroup: OutputEvent[] = events
-        .filter((item) => item.end > start + 1e-8 && item.start < end - 1e-8)
-        .map((item) => ({
-          ...item,
-          continued: item.start < start - 1e-8,
-          start: Math.max(start, item.start),
-        }))
-        .sort((a, b) => a.start - b.start);
+      const attacks = events
+        .filter((item) => item.start >= start - 1e-8 && item.start < end - 1e-8)
+        .map((item): OutputEvent => ({ ...item, continued: false }));
+      const activeBeforeGroup = events
+        .filter((item) => item.start < start - 1e-8 && item.end > start + 1e-8);
+      const inGroup: OutputEvent[] = [...attacks];
+      if (activeBeforeGroup.length > 0
+        && (attacks[0]?.start ?? end) > start + 1e-8) {
+        const latest = activeBeforeGroup.reduce((left, right) =>
+          right.start > left.start ? right : left);
+        inGroup.push({
+          ...latest,
+          start,
+          end: Math.max(...activeBeforeGroup.map((item) => item.end)),
+          continued: true,
+        });
+      }
+      inGroup.sort((a, b) => a.start - b.start || Number(Boolean(b.continued)) - Number(Boolean(a.continued)));
       if (inGroup.length === 0) { segments.push("-"); continue; }
       let cursor = start;
       let out = "";
