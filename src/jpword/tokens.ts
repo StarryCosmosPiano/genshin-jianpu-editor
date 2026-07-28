@@ -24,6 +24,19 @@ export interface TokenInfo {
   text: string;
 }
 
+// A slash-score timing group may legitimately start with one or more dots,
+// for example `..../..../(GW...)./`.  Treating every line that starts with
+// "." as a JPW section header makes that group an "unknown section" and
+// colours the remainder of the document red.  Keep this list aligned with
+// Section.create() in jpwfile.ts so only real JPW section lines change the
+// tokenizer's section state.
+const JPW_SECTION_HEADER =
+  /^\.(?:voice(?:\.(?:rh|lh|right|left|.+\.v\d+))?|words|attachments|page|title|fonts|options|layout|repeat)\s*$/i;
+
+function isJpwSectionHeader(line: string): boolean {
+  return JPW_SECTION_HEADER.test(line);
+}
+
 export class TokenData {
   tokens: TokenInfo[] = [];
 
@@ -47,7 +60,7 @@ export class TokenData {
         res.add({ type: JpwabcLexer.LINE_COMMENT, text: l });
         res.newLine();
         lid++;
-      } else if (l.startsWith(".")) {
+      } else if (isJpwSectionHeader(l)) {
         res.add({ type: TokType.SectionName, text: l });
         res.newLine();
 
@@ -55,7 +68,7 @@ export class TokenData {
         const first = lid + 1;
         let end = lid + 1;
         while (end < lines.length) {
-          if (lines[end].startsWith(".")) break;
+          if (isJpwSectionHeader(lines[end])) break;
           end++;
         }
         const arr: string[] = [];

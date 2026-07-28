@@ -6,10 +6,13 @@ import {
   Decoration,
   type DecorationSet,
   EditorView,
+  GutterMarker,
   ViewPlugin,
   type ViewUpdate,
+  WidgetType,
+  lineNumberMarkers,
 } from "@codemirror/view";
-import { RangeSetBuilder, StateEffect, StateField } from "@codemirror/state";
+import { type RangeSet, RangeSetBuilder, StateEffect, StateField } from "@codemirror/state";
 import { TokenData, tokenClass } from "../jpword/tokens";
 
 const markCache = new Map<string, Decoration>();
@@ -154,3 +157,107 @@ export const slashVoiceHighlighter = StateField.define<DecorationSet>({
   },
   provide: (field) => EditorView.decorations.from(field),
 });
+
+export interface SlashTimingDiagnosticRange {
+  severity: "error" | "incomplete";
+  line: number;
+  from: number;
+  to: number;
+  message: string;
+}
+
+export const setSlashTimingDiagnostics =
+  StateEffect.define<readonly SlashTimingDiagnosticRange[]>();
+
+class SlashTimingDiagnosticWidget extends WidgetType {
+  constructor(readonly message: string) {
+    super();
+  }
+
+  eq(other: SlashTimingDiagnosticWidget): boolean {
+    return other.message === this.message;
+  }
+
+  toDOM(): HTMLElement {
+    const element = document.createElement("span");
+    element.className = "cm-slash-timing-message";
+    element.textContent = `  ⚠ ${this.message}`;
+    element.title = this.message;
+    element.setAttribute("role", "alert");
+    return element;
+  }
+}
+
+class SlashTimingGutterMarker extends GutterMarker {
+  readonly elementClass: string;
+
+  constructor(
+    readonly severity: SlashTimingDiagnosticRange["severity"],
+    readonly message: string,
+  ) {
+    super();
+    this.elementClass = severity === "error"
+      ? "cm-slash-timing-error-number"
+      : "cm-slash-timing-incomplete-number";
+  }
+
+  eq(other: SlashTimingGutterMarker): boolean {
+    return other.severity === this.severity && other.message === this.message;
+  }
+}
+
+function timingDiagnosticDecorations(
+  diagnostics: readonly SlashTimingDiagnosticRange[],
+): DecorationSet {
+  const ranges = diagnostics.flatMap((diagnostic) => {
+    if (diagnostic.severity !== "error") return [];
+    return [
+      Decoration.line({
+        class: "cm-slash-timing-error-line",
+        attributes: {
+          title: diagnostic.message,
+          "data-line": String(diagnostic.line),
+        },
+      }).range(diagnostic.from),
+      Decoration.widget({
+        widget: new SlashTimingDiagnosticWidget(diagnostic.message),
+        side: 1,
+      }).range(diagnostic.to),
+    ];
+  });
+  return Decoration.set(ranges, true);
+}
+
+function timingDiagnosticGutterMarkers(
+  diagnostics: readonly SlashTimingDiagnosticRange[],
+): RangeSet<GutterMarker> {
+  const builder = new RangeSetBuilder<GutterMarker>();
+  for (const diagnostic of [...diagnostics].sort((left, right) => left.from - right.from)) {
+    builder.add(
+      diagnostic.from,
+      diagnostic.from,
+      new SlashTimingGutterMarker(diagnostic.severity, diagnostic.message),
+    );
+  }
+  return builder.finish();
+}
+
+export const slashTimingDiagnosticHighlighter =
+  StateField.define<readonly SlashTimingDiagnosticRange[]>({
+    create: () => [],
+    update(value, transaction) {
+      let next = value.map((diagnostic) => ({
+        ...diagnostic,
+        from: transaction.changes.mapPos(diagnostic.from, -1),
+        to: transaction.changes.mapPos(diagnostic.to, 1),
+      }));
+      for (const effect of transaction.effects) {
+        if (effect.is(setSlashTimingDiagnostics)) next = [...effect.value];
+      }
+      return next;
+    },
+    provide: (field) => [
+      EditorView.decorations.from(field, timingDiagnosticDecorations),
+      lineNumberMarkers.from(field, timingDiagnosticGutterMarkers),
+    ],
+  });

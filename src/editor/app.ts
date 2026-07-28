@@ -8,15 +8,21 @@ import {
   jpwHighlighter,
   scoreSourceHighlighter,
   setScoreSourceHighlights,
+  setSlashTimingDiagnostics,
   setSlashVoiceHighlights,
+  slashTimingDiagnosticHighlighter,
   slashVoiceHighlighter,
 } from "./highlight";
 import { JpwFile, LayoutSection } from "../jpword/jpwfile";
 import { fromJpw } from "../score/jpwimport";
-import { Note as ScoreNote, PlayItem, TempoMark } from "../score/score";
+import { Chord, Note as ScoreNote, PlayItem, TempoMark } from "../score/score";
 import { JinpuPainter } from "../layout/painter";
 import { JpNumber, JpOctaveDot, Lyric as LayoutLyric, NoteEntry, TextFrame, type PageItem } from "../layout/layout";
-import { normalizeEngravingStyle, type EngravingStyle } from "../layout/style";
+import {
+  normalizeEngravingStyle,
+  type EngravingStyle,
+  type RhythmGuideDivision,
+} from "../layout/style";
 import { Point } from "../common/geom";
 import { MetaData } from "../smufl/smufl";
 import { isPianoMusicXml, loadMusicXml } from "../score/musicxml";
@@ -38,14 +44,19 @@ import {
   analyzeSlashScore,
   defaultSlashScoreOptions,
   embedSlashScoreOptions,
+  hasSlashScoreLines,
   MAX_SLASH_VOICES,
   migrateSlashVoiceCount,
   parseSlashScore,
+  replaceSlashScoreLines,
+  rewriteSlashDurationDirectives,
   scoreToSlashScore,
   SLASH_VOICE_SEPARATOR,
   slashScoreTemplate,
   stripSlashScoreOptions,
   stripSlashVoiceMarkers,
+  type SlashDurationDivision,
+  type SlashScoreDiagnostic,
   type SlashScoreKind,
   type SlashScoreOptions,
 } from "../slashscore";
@@ -58,9 +69,19 @@ import {
   type JpwSourceNote,
   type PitchEdit,
 } from "./note-selection";
+import {
+  normalizeNoteTimingEdits,
+  moveScoreNotesOnTimeline,
+  noteTimingStep,
+  resizeScoreNoteSegmentsWithRests,
+  serializeJpwNoteTimingEdits,
+  type NoteTimingDivision,
+} from "../score/note-timing";
 
 interface SelectedScoreNote {
   source: JpwSourceNote;
+  /** The exact rendered segment that was clicked (it may be a gray tie continuation). */
+  visualNote: ScoreNote;
   verse: number;
   element: SVGGElement;
 }
@@ -73,6 +94,12 @@ interface SelectedScoreObject {
 interface SelectionAnchor {
   position: number;
   verse: number;
+  partIndex?: number;
+  chordIndex?: number;
+  grace?: boolean;
+  toneIndex?: number;
+  pitch?: number;
+  absoluteTick?: string;
 }
 
 interface ScoreDeleteAction {
@@ -189,6 +216,7 @@ export class App {
   private zoomSaveTimer: ReturnType<typeof setTimeout> | undefined;
   private selectedEls = new Set<SVGGElement>();
   private _sourceNotes: JpwSourceNote[] = [];
+  private _slashTimingDiagnostics: SlashScoreDiagnostic[] = [];
   private _selectedNotes: SelectedScoreNote[] = [];
   private _selectedObjects: SelectedScoreObject[] = [];
   private _pendingSelectionAnchors: SelectionAnchor[] | null = null;
@@ -256,8 +284,83 @@ export class App {
   setEngravingStyle(style: Partial<EngravingStyle>, persist = true): void {
     this.engravingStyle = normalizeEngravingStyle(style);
     this.painter.layout.options.applyEngravingStyle(this.engravingStyle);
+    this.syncRhythmGridToolbar();
     if (persist) this.saveSettings();
     if (this.view && this.mode === "jp") this.reload(this.getText());
+  }
+
+  /** Select one direct-edit grid; selecting the active value again restores auto. */
+  setRhythmEditDivision(division: NoteTimingDivision | null): void {
+    if (division !== null && this.documentFormat !== "jpw") {
+      const limits = this.slashTimingGridLimits();
+      if (division > limits.enabledMaximum) {
+        const message = limits.hasSubdivision
+          ? `当前文本谱最细只能写到 ${limits.enabledMaximum} 分音符；请把时值符号或音符自身时值设得更细`
+          : `当前文本谱最细时值是 ${limits.base} 分音符；要使用 ${division} 分音符，请先在“乐谱设置”中把花括号或方括号设为“细分”，或给符号映射 ${division} 分音符`;
+        this.showToolbarNotice(message);
+        this.syncRhythmGridToolbar();
+        return;
+      }
+    }
+    const next = division === null
+      ? { ...this.engravingStyle, rhythmGuideMode: "auto" as const }
+      : {
+        ...this.engravingStyle,
+        rhythmGuideMode: "manual" as const,
+        rhythmGuideDivision: division as RhythmGuideDivision,
+      };
+    this.setEngravingStyle(next, true);
+    this.setStatus(division === null
+      ? "节奏编辑刻度已恢复自动；方向键会采用所选音符所在小节的最短网格"
+      : `节奏编辑刻度已设为${division === 1 ? "全音符" : `${division} 分音符`}；左右方向键按此步长移动`);
+  }
+
+  syncRhythmGridToolbar(): void {
+    const control = document.getElementById("rhythm-grid-control");
+    if (!control) return;
+    const selected = this.engravingStyle.rhythmGuideMode === "manual"
+      ? this.engravingStyle.rhythmGuideDivision
+      : null;
+    control.dataset.mode = selected === null ? "auto" : "manual";
+    const limits = this.documentFormat === "jpw"
+      ? { base: 64, visibleMaximum: 64, enabledMaximum: 64, hasSubdivision: true }
+      : this.slashTimingGridLimits();
+    control.querySelectorAll<HTMLButtonElement>("button[data-rhythm-division]").forEach((button) => {
+      const division = parseInt(button.dataset.rhythmDivision ?? "", 10);
+      const active = selected !== null && division === selected;
+      const unavailable = division > limits.enabledMaximum;
+      button.hidden = division > limits.visibleMaximum;
+      button.classList.toggle("grid-unavailable", unavailable);
+      button.dataset.gridUnavailable = String(unavailable);
+      button.setAttribute("aria-disabled", "false");
+      button.classList.toggle("active", active);
+      button.setAttribute("aria-pressed", String(active));
+      if (unavailable) {
+        button.title = `${division} 分音符需要先在乐谱设置中启用细分或映射更细的时值符号`;
+      } else {
+        button.title = `${division === 1 ? "全音符" : `${division} 分音符`}刻度；再次点击恢复自动`;
+      }
+    });
+  }
+
+  private slashTimingGridLimits(): {
+    base: SlashDurationDivision;
+    visibleMaximum: SlashDurationDivision;
+    enabledMaximum: SlashDurationDivision;
+    hasSubdivision: boolean;
+  } {
+    const values = [
+      this.slashOptions?.noteDivision ?? 4,
+      this.slashOptions?.spaceDivision ?? 4,
+      ...Object.values(this.slashOptions?.symbolDurations ?? {}),
+    ];
+    const base = ([4, 8, 16, 32, 64] as SlashDurationDivision[])
+      .find((division) => division >= Math.min(64, Math.max(4, ...values))) ?? 64;
+    const hasSubdivision = this.slashOptions?.braceMode === "subdivide"
+      || this.slashOptions?.bracketMode === "subdivide";
+    const visibleMaximum = Math.min(64, base * 2) as SlashDurationDivision;
+    const enabledMaximum = (hasSubdivision ? visibleMaximum : base) as SlashDurationDivision;
+    return { base, visibleMaximum, enabledMaximum, hasSubdivision };
   }
 
   /** Restore persisted render settings; call before mountEditor() so first render uses them. */
@@ -332,6 +435,7 @@ export class App {
         this.painter.score = score;
       }
       this.configurePainter(this.painter);
+      this.syncRhythmGridToolbar();
     } catch {
       // corrupt storage — ignore
     }
@@ -391,8 +495,8 @@ export class App {
         if (this._recogMeta) this._recogMeta = mapMeta(this._recogMeta, u.changes);
         if (this._selectedNotes.length > 0) {
           this._pendingSelectionAnchors = this._selectedNotes.map((selection) => ({
+            ...this.selectionAnchor(selection),
             position: u.changes.mapPos(selection.source.from, -1),
-            verse: selection.verse,
           }));
         }
         if (this._rangeAnchorPosition !== null) {
@@ -419,6 +523,7 @@ export class App {
           EditorState.allowMultipleSelections.of(true),
           jpwHighlighter,
           scoreSourceHighlighter,
+          slashTimingDiagnosticHighlighter,
           slashVoiceHighlighter,
           EditorView.domEventHandlers({
             keydown: (event) => this.onEditorKeyDown(event),
@@ -467,12 +572,11 @@ export class App {
     // 混排/识别模式：谱面区显示各自专属视图，编辑文本不重排冲掉它。
     if (this.mode !== "jp") return true;
     if (this._pendingSelectionAnchors === null && this._selectedNotes.length > 0) {
-      this._pendingSelectionAnchors = this._selectedNotes.map((selection) => ({
-        position: selection.source.from,
-        verse: selection.verse,
-      }));
+      this._pendingSelectionAnchors = this._selectedNotes.map((selection) =>
+        this.selectionAnchor(selection));
     }
     let score;
+    let slashTimingDiagnostics: SlashScoreDiagnostic[] = [];
     let breakDesc: string | null = null;
     if (this.documentFormat === "jpw") {
       let f: JpwFile | null;
@@ -493,7 +597,16 @@ export class App {
     } else {
       if (!this.slashOptions) return false;
       try {
-        score = parseSlashScore(text, this.slashOptions).score;
+        // The settings comment is the undoable source of truth for direct
+        // timing edits. Re-read it before every parse so Ctrl+Z also restores
+        // the previous rhythmic positions and lengths.
+        this.slashOptions = {
+          ...this.slashOptions,
+          noteTimingEdits: analyzeSlashScore(text).noteTimingEdits.map((edit) => ({ ...edit })),
+        };
+        const parsed = parseSlashScore(text, this.slashOptions);
+        score = parsed.score;
+        slashTimingDiagnostics = parsed.summary.diagnostics;
       } catch (e) {
         console.error("slash-score import failed", e);
         return false;
@@ -501,9 +614,12 @@ export class App {
     }
 
     this.painter.score = score;
+    this._slashTimingDiagnostics = slashTimingDiagnostics;
     this._sourceNotes = this.documentFormat === "jpw"
       ? buildJpwSourceNotes(text, score)
       : buildSlashSourceNotes(text, this.slashOptions!, score);
+    this.syncRhythmGridToolbar();
+    this.updateSlashTimingDiagnostics();
     this.updateSlashVoiceHighlights();
     this.applySoftDeletedModelState();
     try {
@@ -514,7 +630,32 @@ export class App {
     }
     this.renderPages();
     this.applyScoreVoiceColors();
+    const timingErrors = this._slashTimingDiagnostics.filter((item) =>
+      item.severity === "error");
+    if (timingErrors.length > 0) {
+      this.setStatus(
+        `发现 ${timingErrors.length} 行小节时值错误：`
+        + `${timingErrors.map((item) => `第 ${item.line} 行`).join("、")}；`
+        + "文本行和对应谱面小节已标红，悬停行尾警告可查看原因",
+      );
+    }
     return true;
+  }
+
+  private updateSlashTimingDiagnostics(): void {
+    if (!this.view) return;
+    const diagnostics = this.documentFormat === "jpw"
+      ? []
+      : this._slashTimingDiagnostics;
+    this.view.dispatch({
+      effects: setSlashTimingDiagnostics.of(diagnostics.map((item) => ({
+        severity: item.severity,
+        line: item.line,
+        from: item.from,
+        to: item.to,
+        message: item.message,
+      }))),
+    });
   }
 
   private updateSlashVoiceHighlights(): void {
@@ -707,12 +848,211 @@ export class App {
       this.scorePane.appendChild(wrap);
       this.pageEls.push(wrap);
     }
+    this.applySlashMeasureDiagnostics();
     this.pageIndex = Math.min(this.pageIndex, Math.max(0, this.pageEls.length - 1));
     this.applySoftDeletedClasses();
     this.restoreScoreSelections();
   }
 
+  private applySlashMeasureDiagnostics(): void {
+    if (this.documentFormat === "jpw") return;
+    const invalidLocations = new Map<number, Array<{
+      beatIndex: number | null;
+      beatCount: number;
+    }>>();
+    for (const diagnostic of this._slashTimingDiagnostics) {
+      if (diagnostic.severity !== "error") continue;
+      const locations = diagnostic.beatLocations.length > 0
+        ? diagnostic.beatLocations
+        : diagnostic.measureIndices.map((measureIndex) => ({
+          measureIndex,
+          beatIndex: null,
+          beatCount: 1,
+        }));
+      for (const location of locations) {
+        const values = invalidLocations.get(location.measureIndex) ?? [];
+        if (!values.some((value) =>
+          value.beatIndex === location.beatIndex
+          && value.beatCount === location.beatCount)) {
+          values.push({
+            beatIndex: location.beatIndex,
+            beatCount: Math.max(1, location.beatCount),
+          });
+        }
+        invalidLocations.set(location.measureIndex, values);
+      }
+    }
+    if (invalidLocations.size === 0) return;
+    const namespace = "http://www.w3.org/2000/svg";
+
+    for (const wrap of this.pageEls) {
+      const svg = wrap.querySelector<SVGSVGElement>("svg");
+      if (!svg) continue;
+      const rootMatrix = svg.getCTM();
+      if (!rootMatrix) continue;
+      const rootInverse = rootMatrix.inverse();
+      const boxInPage = (element: SVGGraphicsElement): DOMRect | null => {
+        const matrix = element.getCTM();
+        if (!matrix) return null;
+        const transform = rootInverse.multiply(matrix);
+        const box = element.getBBox();
+        const points = [
+          new DOMPoint(box.x, box.y),
+          new DOMPoint(box.x + box.width, box.y),
+          new DOMPoint(box.x + box.width, box.y + box.height),
+          new DOMPoint(box.x, box.y + box.height),
+        ].map((point) => point.matrixTransform(transform));
+        const xs = points.map((point) => point.x);
+        const ys = points.map((point) => point.y);
+        const left = Math.min(...xs);
+        const top = Math.min(...ys);
+        return new DOMRect(
+          left,
+          top,
+          Math.max(...xs) - left,
+          Math.max(...ys) - top,
+        );
+      };
+
+      const overlay = document.createElementNS(namespace, "g");
+      overlay.setAttribute("class", "slash-measure-diagnostics");
+      overlay.setAttribute("pointer-events", "none");
+      for (const [measureIndex, locations] of invalidLocations) {
+        const entries = [...svg.querySelectorAll<SVGGElement>(`.measure-${measureIndex}`)];
+        const systems = new Map<SVGGElement, SVGGElement[]>();
+        for (const entry of entries) {
+          const system = entry.closest<SVGGElement>(
+            ".rhythmic-system, .piano-system, .ensemble-system",
+          );
+          if (!system) continue;
+          const group = systems.get(system) ?? [];
+          group.push(entry);
+          systems.set(system, group);
+        }
+        for (const [system, measureEntries] of systems) {
+          const entryBoxes = measureEntries
+            .map((entry) => boxInPage(entry))
+            .filter((box): box is DOMRect => box !== null);
+          if (entryBoxes.length === 0) continue;
+          let left = Math.min(...entryBoxes.map((box) => box.x));
+          let right = Math.max(...entryBoxes.map((box) => box.x + box.width));
+          const currentBars = measureEntries
+            .filter((entry) => entry.classList.contains("measure-barline"))
+            .map((entry) => boxInPage(entry))
+            .filter((box): box is DOMRect => box !== null);
+          if (currentBars.length > 0) {
+            right = Math.max(...currentBars.map((box) => box.x + box.width / 2));
+          }
+          const previousBar = system.querySelector<SVGGElement>(
+            `.measure-${measureIndex - 1}.measure-barline`,
+          );
+          const previousBox = previousBar ? boxInPage(previousBar) : null;
+          if (previousBox) left = previousBox.x + previousBox.width / 2;
+          const systemBars = [...system.querySelectorAll<SVGGElement>(".measure-barline")]
+            .map((entry) => boxInPage(entry))
+            .filter((box): box is DOMRect => box !== null);
+          const dynamicBarlineSelectors = system.classList.contains("piano-system")
+            ? [".piano-system-left"]
+            : system.classList.contains("ensemble-system")
+              ? [".ensemble-bracket", ".ensemble-group-line"]
+              : [];
+          const dynamicBars = dynamicBarlineSelectors.flatMap((selector) =>
+            [...system.querySelectorAll<SVGGraphicsElement>(selector)])
+            .map((entry) => boxInPage(entry))
+            .filter((box): box is DOMRect => box !== null);
+          // Piano/ensemble barlines are extended after every row has been
+          // normalized. Their final span follows the tallest upper chord and
+          // lowest lower chord; the hand-local Barline groups retain only the
+          // default number-row height and are therefore too short here.
+          const heightBars = dynamicBars.length > 0
+            ? dynamicBars
+            : currentBars.length > 0 ? currentBars : systemBars;
+          if (heightBars.length === 0) continue;
+          const staffTop = Math.min(...heightBars.map((box) => box.y));
+          const staffBottom = Math.max(...heightBars.map((box) => box.y + box.height));
+          const measureWidth = Math.max(1, right - left);
+          const rhythmBeatXs = [
+            ...system.querySelectorAll<SVGGraphicsElement>(
+              `.rhythm-guide-measure-${measureIndex}.rhythm-guide-major`,
+            ),
+          ]
+            .map((tick) => boxInPage(tick))
+            .filter((box): box is DOMRect => box !== null)
+            .map((box) => box.x + box.width / 2)
+            .sort((a, b) => a - b)
+            .filter((x, index, values) =>
+              index === 0 || Math.abs(x - values[index - 1]) > 0.5);
+          const numberWidths = measureEntries.flatMap((entry) =>
+            [...entry.querySelectorAll<SVGTextElement>("text")]
+              .filter((text) => /^[0-7]$/.test(text.textContent ?? ""))
+              .map((text) => boxInPage(text)?.width ?? 0))
+            .filter((width) => width > 0);
+          // Leave one full number-glyph width on either side of the exact
+          // beat span. This follows zoom/font changes because it is measured
+          // from the rendered notation rather than estimated from CSS pixels.
+          const horizontalPadding = numberWidths.length > 0
+            ? Math.max(...numberWidths)
+            : Math.max(1, this.fontSize * 0.55);
+          for (const location of locations) {
+            const beatCount = Math.max(1, location.beatCount);
+            const beatIndex = location.beatIndex;
+            const proportionalLeft = beatIndex === null
+              ? left
+              : left + measureWidth * beatIndex / beatCount;
+            const proportionalRight = beatIndex === null
+              ? right
+              : left + measureWidth * (beatIndex + 1) / beatCount;
+            const beatLeft = beatIndex === null
+              ? (rhythmBeatXs[0] ?? proportionalLeft)
+              : (rhythmBeatXs[beatIndex] ?? proportionalLeft);
+            const beatRight = beatIndex === null
+              ? right
+              : (rhythmBeatXs[beatIndex + 1]
+                ?? (beatIndex === beatCount - 1 ? right : proportionalRight));
+            const rectangle = document.createElementNS(namespace, "rect");
+            rectangle.setAttribute("class", "slash-measure-error-box");
+            rectangle.setAttribute("data-measure-index", String(measureIndex));
+            rectangle.setAttribute(
+              "data-beat-index",
+              beatIndex === null ? "all" : String(beatIndex),
+            );
+            rectangle.setAttribute("x", String(beatLeft - horizontalPadding));
+            rectangle.setAttribute("y", String(staffTop));
+            rectangle.setAttribute("width", String(Math.max(
+              horizontalPadding * 2,
+              beatRight - beatLeft + horizontalPadding * 2,
+            )));
+            // A diagnostic occupies exactly the staff/barline span. Tempo,
+            // measure numbers, headers and inter-system gaps stay outside.
+            rectangle.setAttribute("height", String(Math.max(1, staffBottom - staffTop)));
+            rectangle.setAttribute("rx", String(Math.max(2, this.fontSize * 0.08)));
+            overlay.appendChild(rectangle);
+          }
+        }
+      }
+      if (overlay.childElementCount > 0) svg.appendChild(overlay);
+    }
+  }
+
   // ---------------- picking / selection ----------------
+  private selectionAnchor(selection: SelectedScoreNote): SelectionAnchor {
+    const source = selection.source;
+    const tones = this._sourceNotes.filter((candidate) =>
+      candidate.partIndex === source.partIndex
+      && candidate.chordIndex === source.chordIndex
+      && candidate.grace === source.grace);
+    return {
+      position: source.from,
+      verse: selection.verse,
+      partIndex: source.partIndex,
+      chordIndex: source.chordIndex,
+      grace: source.grace,
+      toneIndex: Math.max(0, tones.indexOf(source)),
+      pitch: source.note.pitch,
+      absoluteTick: source.note.absoluteTick.toString(),
+    };
+  }
+
   private onPageClick(pageIndex: number, svg: SVGSVGElement, ev: MouseEvent): void {
     if (this._suppressPageClick) {
       this._suppressPageClick = false;
@@ -783,18 +1123,18 @@ export class App {
         for (const source of range) {
           if (source !== hit.source) this.addScoreSelection(source, hit.verse);
         }
-        this.addScoreSelection(hit.source, hit.verse, hit.element);
+        this.addScoreSelection(hit.source, hit.verse, hit.element, hit.visualNote);
         this._rangeAnchorPosition = anchorPosition;
       }
     } else if (additive) {
       const existing = this._selectedNotes.findIndex((selection) =>
         selection.source.from === hit.source.from && selection.source.to === hit.source.to);
       if (existing >= 0) this.removeScoreSelection(existing);
-      else this.addScoreSelection(hit.source, hit.verse, hit.element);
+      else this.addScoreSelection(hit.source, hit.verse, hit.element, hit.visualNote);
       this._rangeAnchorPosition = hit.source.from;
     } else {
       this.clearSelectedItems();
-      this.addScoreSelection(hit.source, hit.verse, hit.element);
+      this.addScoreSelection(hit.source, hit.verse, hit.element, hit.visualNote);
       this._rangeAnchorPosition = hit.source.from;
     }
     this._pendingSelectionAnchors = null;
@@ -837,12 +1177,25 @@ export class App {
     const noteIndex = number ? Math.max(0, entry.numbers.indexOf(number)) : 0;
     const note = graceNote ?? entry.chord.notes[noteIndex] ?? entry.chord.notes[0];
     if (!note) return null;
-    const source = this._sourceNotes.find((candidate) => candidate.note === note);
+    let sourceNote = note;
+    const visited = new Set<ScoreNote>();
+    while (sourceNote.tiePrev && !visited.has(sourceNote)) {
+      visited.add(sourceNote);
+      sourceNote = sourceNote.tiePrev;
+    }
+    const source = this._sourceNotes.find((candidate) => candidate.note === sourceNote)
+      ?? this._sourceNotes.find((candidate) => candidate.note === note);
     if (!source) return null;
     const visualItem = graceVisual ?? number ?? entryItem;
     const element = this.painter.nodeMap.get(visualItem)
-      ?? this.painter.noteGroupEl(entry.chord, note, entry.verse);
-    return element ? { source, verse: entry.verse, element } : null;
+      ?? this.painter.noteGroupEl(note.chord, note, entry.verse)
+      ?? this.painter.noteGroupEl(source.chord, source.note, entry.verse);
+    return element ? {
+      source,
+      visualNote: note,
+      verse: entry.verse,
+      element,
+    } : null;
   }
 
   private scoreObjectHit(picked: PageItem): SelectedScoreObject | null {
@@ -857,14 +1210,19 @@ export class App {
     return null;
   }
 
-  private addScoreSelection(source: JpwSourceNote, verse: number, element?: SVGGElement): void {
+  private addScoreSelection(
+    source: JpwSourceNote,
+    verse: number,
+    element?: SVGGElement,
+    visualNote: ScoreNote = source.note,
+  ): void {
     if (this._selectedNotes.some((selection) =>
       selection.source.from === source.from && selection.source.to === source.to)) return;
     const el = element ?? this.painter.noteGroupEl(source.chord, source.note, verse);
     if (!el) return;
     el.classList.add("selected");
     this.selectedEls.add(el);
-    this._selectedNotes.push({ source, verse, element: el });
+    this._selectedNotes.push({ source, visualNote, verse, element: el });
   }
 
   private removeScoreSelection(index: number): void {
@@ -1189,12 +1547,27 @@ export class App {
 
   private restoreScoreSelections(): void {
     const anchors = this._pendingSelectionAnchors
-      ?? this._selectedNotes.map((selection) => ({ position: selection.source.from, verse: selection.verse }));
+      ?? this._selectedNotes.map((selection) => this.selectionAnchor(selection));
     this._selectedNotes = [];
     this._selectedObjects = [];
     this._pendingSelectionAnchors = null;
     for (const anchor of anchors) {
-      const source = this._sourceNotes.find((candidate) =>
+      const temporal = anchor.partIndex === undefined
+        || anchor.pitch === undefined
+        || anchor.absoluteTick === undefined
+        ? null
+        : this._sourceNotes.find((candidate) =>
+          candidate.partIndex === anchor.partIndex
+          && candidate.note.pitch === anchor.pitch
+          && candidate.grace === anchor.grace
+          && candidate.note.absoluteTick.toString() === anchor.absoluteTick);
+      const semantic = anchor.partIndex === undefined || anchor.chordIndex === undefined
+        ? []
+        : this._sourceNotes.filter((candidate) =>
+          candidate.partIndex === anchor.partIndex
+          && candidate.chordIndex === anchor.chordIndex
+          && candidate.grace === anchor.grace);
+      const source = temporal ?? semantic[anchor.toneIndex ?? 0] ?? this._sourceNotes.find((candidate) =>
         anchor.position === candidate.from
         || (anchor.position >= candidate.from && anchor.position < candidate.to));
       if (source) this.addScoreSelection(source, anchor.verse);
@@ -1290,6 +1663,16 @@ export class App {
       return;
     }
     if (this._selectedNotes.length === 0) return;
+    if ((event.key === "ArrowLeft" || event.key === "ArrowRight")
+      && !event.altKey && !event.shiftKey) {
+      event.preventDefault();
+      event.stopPropagation();
+      this.editSelectedTiming(
+        event.key === "ArrowRight" ? 1 : -1,
+        event.ctrlKey || event.metaKey,
+      );
+      return;
+    }
     if (event.ctrlKey || event.metaKey || event.altKey) return;
     let edit: PitchEdit | null = null;
     let label = "";
@@ -1327,6 +1710,307 @@ export class App {
     clearTimeout(this.debounceTimer);
     const ok = this.reload(this.getText());
     this.setStatus(ok ? `已修改 ${changes.length} 个音符：${label}` : "修改后的谱面暂时无法解析");
+  }
+
+  private automaticTimingDivision(): NoteTimingDivision {
+    const source = this._selectedNotes[this._selectedNotes.length - 1]?.source;
+    const measure = source?.chord.measure;
+    if (!measure) return 16;
+    let division = Math.max(4, measure.time.beatType);
+    for (const entry of measure.entries) {
+      if (!(entry instanceof Chord) || entry.generatedTimingContinuation) continue;
+      division = Math.max(division, 4 * (1 << Math.max(0, entry.beams)));
+    }
+    const allowed: NoteTimingDivision[] = [1, 2, 4, 8, 16, 32, 64];
+    return allowed.find((value) => value >= Math.min(64, division)) ?? 64;
+  }
+
+  private activeTimingDivision(): NoteTimingDivision {
+    if (this.engravingStyle.rhythmGuideMode === "manual") {
+      const selected = this.engravingStyle.rhythmGuideDivision;
+      if (this.documentFormat === "jpw") return selected;
+      return Math.min(selected, this.slashTimingGridLimits().enabledMaximum) as NoteTimingDivision;
+    }
+    return this.automaticTimingDivision();
+  }
+
+  private replaceDocumentText(next: string, anchors?: SelectionAnchor[]): boolean {
+    const before = this.getText();
+    if (before === next) return true;
+    let prefix = 0;
+    const shared = Math.min(before.length, next.length);
+    while (prefix < shared && before[prefix] === next[prefix]) prefix++;
+    let suffix = 0;
+    while (suffix < shared - prefix
+      && before[before.length - 1 - suffix] === next[next.length - 1 - suffix]) suffix++;
+    this.view.dispatch({
+      changes: {
+        from: prefix,
+        to: before.length - suffix,
+        insert: next.slice(prefix, next.length - suffix),
+      },
+    });
+    if (anchors) this._pendingSelectionAnchors = anchors;
+    clearTimeout(this.debounceTimer);
+    return this.reload(this.getText());
+  }
+
+  /**
+   * TXT timing edits are overlays on the compact source timeline. Convert the
+   * unedited source first, then carry the overlay into JPW metadata; serializing
+   * the already shifted render score would otherwise bake and reapply it.
+   */
+  private slashDocumentAsJpw(): string {
+    if (!this.slashOptions) return scoreToJpwabc(this.painter.score);
+    const edits = normalizeNoteTimingEdits(this.slashOptions.noteTimingEdits ?? []);
+    if (edits.length === 0) return scoreToJpwabc(this.painter.score);
+    const baseOptions: SlashScoreOptions = {
+      ...this.slashOptions,
+      symbolDurations: { ...this.slashOptions.symbolDurations },
+      noteTimingEdits: [],
+    };
+    const baseText = stripSlashScoreOptions(this.getText());
+    const baseScore = parseSlashScore(baseText, baseOptions).score;
+    return upsertOptionalTitleField(
+      scoreToJpwabc(baseScore),
+      "NoteTimingEdits",
+      serializeJpwNoteTimingEdits(edits),
+    );
+  }
+
+  private slashTimelineSerializationGrid(): {
+    division: SlashDurationDivision;
+    symbol: string;
+    options: SlashScoreOptions;
+    subdivisionMode?: "brace" | "bracket";
+    } | null;
+  private slashTimelineSerializationGrid(
+    baseOptions: SlashScoreOptions | null,
+  ): {
+    division: SlashDurationDivision;
+    symbol: string;
+    options: SlashScoreOptions;
+    subdivisionMode?: "brace" | "bracket";
+    } | null;
+  private slashTimelineSerializationGrid(
+    baseOptions: SlashScoreOptions | null = this.slashOptions,
+  ): {
+    division: SlashDurationDivision;
+    symbol: string;
+    options: SlashScoreOptions;
+    subdivisionMode?: "brace" | "bracket";
+    } | null {
+    if (!baseOptions) return null;
+    const requested = Math.max(4, this.activeTimingDivision()) as SlashDurationDivision;
+    const configuredMappings = Object.entries(baseOptions.symbolDurations);
+    const activeMappings = baseOptions.multiDurationSymbols === false
+      ? configuredMappings.slice(0, 1)
+      : configuredMappings;
+    const mapped = activeMappings
+      .filter((entry): entry is [string, SlashDurationDivision] =>
+        entry[0].length === 1 && [4, 8, 16, 32, 64].includes(entry[1]));
+    const finest = Math.max(
+      baseOptions.noteDivision ?? 4,
+      4,
+      ...mapped.map(([, division]) => division),
+      baseOptions.spaceDivision ?? 4,
+    );
+    const division = ([4, 8, 16, 32, 64] as SlashDurationDivision[])
+      .find((candidate) => candidate >= Math.min(64, finest)) ?? 64;
+    const existing = mapped.find(([, value]) => value === division)?.[0]
+      ?? (baseOptions.spaceDivision === division ? " " : undefined);
+    const symbol = existing
+      ?? [".", "=", "_", "*", "~", ":", "·"].find((candidate) =>
+        baseOptions.symbolDurations[candidate] === undefined)
+      ?? ".";
+    const subdivisionMode = requested > division
+      ? baseOptions.braceMode === "subdivide"
+        ? "brace"
+        : baseOptions.bracketMode === "subdivide"
+          ? "bracket"
+          : undefined
+      : undefined;
+    const options: SlashScoreOptions = {
+      ...baseOptions,
+      symbolDurations: { ...baseOptions.symbolDurations },
+      noteTimingEdits: [],
+    };
+    if (!existing) {
+      options.symbolDurations[symbol] = division;
+      if (mapped.length > 0) options.multiDurationSymbols = true;
+    }
+    return { division, symbol, options, subdivisionMode };
+  }
+
+  private moveSelectedAttacks(
+    sources: readonly JpwSourceNote[],
+    direction: -1 | 1,
+    division: NoteTimingDivision,
+  ): void {
+    const delta = noteTimingStep(division).timesInt(direction);
+    const unique = [...new Map(sources.map((source) => [source.note, source])).values()];
+    const anchors = unique.map((source): SelectionAnchor => ({
+      position: source.from,
+      verse: this._selectedNotes.find((selection) => selection.source === source)?.verse ?? 0,
+      partIndex: source.partIndex,
+      grace: source.grace,
+      pitch: source.note.pitch,
+      absoluteTick: source.note.absoluteTick.plus(delta).toString(),
+    }));
+    const result = moveScoreNotesOnTimeline(
+      this.painter.score,
+      unique.map((source) => ({
+        partIndex: source.partIndex,
+        note: source.note,
+        grace: source.grace,
+      })),
+      delta,
+      { preserveRests: this.documentFormat === "jpw" },
+    );
+    if (result.changed === 0) {
+      this.setStatus(result.blocked > 0
+        ? this.documentFormat === "jpw" && direction < 0
+          ? `左移后必须能完整容纳原时值；若会与保留在原和弦中的音或下一起音重叠，就不能继续左移`
+          : "倚音、休止符或乐谱边界上的音符不能按当前方向继续移动"
+        : "没有可移动的音符");
+      return;
+    }
+
+    let next: string;
+    if (this.documentFormat === "jpw") {
+      const withoutOverlay = upsertOptionalTitleField(
+        this.getText(),
+        "NoteTimingEdits",
+        "",
+      );
+      const generated = scoreToJpwabc(this.painter.score);
+      next = replaceJpwNotationSections(
+        withoutOverlay,
+        generated,
+      );
+      next = upsertOptionalTitleField(
+        next,
+        "Arpeggios",
+        readJpwTitleField(generated, "Arpeggios"),
+      );
+    } else {
+      const serialization = this.slashTimelineSerializationGrid();
+      if (!serialization) return;
+      const voiceCount = Math.max(1, Math.min(
+        MAX_SLASH_VOICES,
+        serialization.options.voiceCount,
+      ));
+      const generated = scoreToSlashScore(
+        this.painter.score,
+        this.documentFormat,
+        serialization.division,
+        serialization.symbol,
+        {
+          braceMode: serialization.options.braceMode,
+          bracketMode: serialization.options.bracketMode ?? "triplet",
+          ordering: serialization.options.ordering ?? "pitch-asc",
+          subdivisionMode: serialization.subdivisionMode,
+          durationNotation: serialization.options,
+        },
+        voiceCount,
+      );
+      this.slashOptions = serialization.options;
+      const rewritten = rewriteSlashDurationDirectives(
+        replaceSlashScoreLines(this.getText(), generated, this.documentFormat),
+        serialization.options,
+      );
+      next = embedSlashScoreOptions(
+        rewritten,
+        serialization.options,
+      );
+    }
+
+    const ok = this.replaceDocumentText(next, anchors);
+    const grid = division === 1 ? "全音符" : `${division} 分音符`;
+    this.setStatus(ok
+      ? `已把 ${result.changed} 个独立音按${grid}刻度${direction > 0 ? "右移" : "左移"}；小节总拍长保持不变${
+        result.blocked ? `，另有 ${result.blocked} 个未移动` : ""
+      }`
+      : "移动后的时值无法重新写回当前乐谱");
+  }
+
+  private editSelectedTiming(direction: -1 | 1, resize: boolean): void {
+    const sources = [...new Map(this._selectedNotes.map(({ source }) => [
+      source.note,
+      source,
+    ])).values()];
+    if (sources.length === 0) return;
+    if (resize && this.documentFormat !== "jpw") {
+      this.setStatus("键盘谱和数字谱只支持左右方向键移动起音；Ctrl+左右调整时值仅用于 JPW 简谱");
+      return;
+    }
+    const division = this.activeTimingDivision();
+    if (!resize) {
+      this.moveSelectedAttacks(sources, direction, division);
+      return;
+    }
+
+    const step = noteTimingStep(division);
+    const exactSelections = [...new Map(this._selectedNotes.map((selection) => [
+      selection.visualNote.chord,
+      selection,
+    ])).values()];
+    const extendable = exactSelections.filter((selection) =>
+      !selection.visualNote.chord.notes.some((note) =>
+          note.tuplet !== null || note.tupletBegin || note.tupletEnd));
+    const skippedTuplets = exactSelections.length - extendable.length;
+    const anchors = extendable.map(({ source, verse, visualNote }): SelectionAnchor => ({
+      position: source.from,
+      verse,
+      partIndex: source.partIndex,
+      grace: source.grace,
+      pitch: visualNote.pitch,
+      absoluteTick: visualNote.absoluteTick.toString(),
+    }));
+    const result = resizeScoreNoteSegmentsWithRests(
+      this.painter.score,
+      extendable.map(({ source, visualNote }) => ({
+        partIndex: source.partIndex,
+        note: visualNote,
+        grace: source.grace,
+      })),
+      step.timesInt(direction),
+    );
+    if (result.changed === 0) {
+      if (skippedTuplets > 0) {
+        this.setStatus("三连音内部时值需要保持等分，当前未修改");
+      } else if (direction > 0) {
+        this.setStatus("Ctrl+右只能让当前音段吞并紧邻的休止符；后面已有音符、延音段或休止不足时不能延长");
+      } else {
+        this.setStatus("Ctrl+左会缩短当前音段并补上等量休止符；当前音段已经达到所选刻度的最短时值");
+      }
+      return;
+    }
+
+    const withoutOverlay = upsertOptionalTitleField(
+      this.getText(),
+      "NoteTimingEdits",
+      "",
+    );
+    const generated = scoreToJpwabc(this.painter.score);
+    let next = replaceJpwNotationSections(withoutOverlay, generated);
+    next = upsertOptionalTitleField(
+      next,
+      "Arpeggios",
+      readJpwTitleField(generated, "Arpeggios"),
+    );
+    const ok = this.replaceDocumentText(next, anchors);
+    const grid = division === 1 ? "全音符" : `${division} 分音符`;
+    const action = direction > 0
+      ? "向右延长，并从紧邻休止符扣除等量时值"
+      : "缩短，并在释放的位置补上等量休止符";
+    this.setStatus(ok
+      ? `已将 ${result.changed} 个当前音段按${grid}刻度${action}${
+        result.blocked || skippedTuplets
+          ? `；另有 ${result.blocked + skippedTuplets} 个未修改`
+          : ""
+      }`
+      : "时值修改后的谱面无法重新写回当前乐谱");
   }
 
   private setStatus(s: string): void {
@@ -1400,12 +2084,62 @@ export class App {
         ? `；V${migration.mergedVoices.join("、V")} 已并入默认 V${next.voiceCount}`
         : `；声部数量已从 ${migration.from} 调整为 ${migration.to}`;
     }
-    this.stopPlayback();
-    this.documentFormat = next.kind;
-    this.slashOptions = {
+    const rhythmSignature = (options: SlashScoreOptions): string => JSON.stringify({
+      symbols: options.symbolDurations,
+      multiple: options.multiDurationSymbols ?? false,
+      space: options.spaceDivision,
+      note: options.noteDivision,
+      empty: options.emptyGroupsAsRests ?? false,
+      ordering: options.ordering ?? "pitch-asc",
+    });
+    let appliedOptions: SlashScoreOptions = {
       ...next,
       symbolDurations: { ...next.symbolDurations },
-      tempoMarks: next.tempoMarks?.map((mark) => ({ ...mark })) ?? [],
+      noteTimingEdits: [],
+    };
+    if (next.kind === current.kind
+      && rhythmSignature(current) !== rhythmSignature(next)) {
+      try {
+        const sourceOptions: SlashScoreOptions = {
+          ...current,
+          voiceCount: next.voiceCount,
+          symbolDurations: { ...current.symbolDurations },
+        };
+        const score = parseSlashScore(text, sourceOptions).score;
+        const serialization = this.slashTimelineSerializationGrid(appliedOptions);
+        if (!serialization) throw new Error("当前时值设置无法生成文本谱");
+        const generated = scoreToSlashScore(
+          score,
+          next.kind,
+          serialization.division,
+          serialization.symbol,
+          {
+            braceMode: serialization.options.braceMode,
+            bracketMode: serialization.options.bracketMode ?? "triplet",
+            ordering: serialization.options.ordering ?? "pitch-asc",
+            subdivisionMode: serialization.subdivisionMode,
+            durationNotation: serialization.options,
+          },
+          next.voiceCount,
+        );
+        text = replaceSlashScoreLines(text, generated, next.kind);
+        appliedOptions = serialization.options;
+        text = rewriteSlashDurationDirectives(text, appliedOptions);
+      } catch (reason) {
+        this.setStatus(
+          reason instanceof Error
+            ? `时值符号无法应用：${reason.message}`
+            : "时值符号无法应用到当前乐谱",
+        );
+        return;
+      }
+    }
+    this.stopPlayback();
+    this.documentFormat = appliedOptions.kind;
+    this.slashOptions = {
+      ...appliedOptions,
+      symbolDurations: { ...appliedOptions.symbolDurations },
+      tempoMarks: appliedOptions.tempoMarks?.map((mark) => ({ ...mark })) ?? [],
     };
     this.setText(embedSlashScoreOptions(text, this.slashOptions));
     this.setStatus(
@@ -1451,7 +2185,10 @@ export class App {
   async changeDocumentFormat(target: "jpw" | SlashScoreKind): Promise<void> {
     if (target === this.documentFormat || this.mode !== "jp") return;
     this.stopPlayback();
-    if (target !== "jpw" && this.documentFormat !== "jpw" && this.slashOptions) {
+    if (target !== "jpw"
+      && this.documentFormat !== "jpw"
+      && this.slashOptions
+      && hasSlashScoreLines(this.getText(), target)) {
       // Keyboard/number recognition is a non-destructive view switch for a
       // mixed TXT document. Keep both representations exactly where the user
       // wrote them; only the persisted parser choice and live preview change.
@@ -1470,9 +2207,10 @@ export class App {
     }
     const score = this.painter.score;
     if (target === "jpw") {
+      const text = this.slashDocumentAsJpw();
       this.documentFormat = "jpw";
       this.slashOptions = null;
-      this.setText(scoreToJpwabc(score));
+      this.setText(text);
     } else {
       const current = this.slashOptions;
       const voiceCount = current?.voiceCount
@@ -1485,7 +2223,20 @@ export class App {
           ...Object.values(current.symbolDurations),
         ) as 4 | 8 | 16 | 32 | 64
         : 16;
-      const raw = scoreToSlashScore(score, target, division, ".", undefined, voiceCount);
+      const raw = scoreToSlashScore(
+        score,
+        target,
+        division,
+        ".",
+        current
+          ? {
+            braceMode: current.braceMode,
+            bracketMode: current.bracketMode ?? "triplet",
+            ordering: current.ordering ?? "pitch-asc",
+          }
+          : undefined,
+        voiceCount,
+      );
       const analysis = analyzeSlashScore(raw);
       const options: SlashScoreOptions = {
         ...(current ?? defaultSlashScoreOptions(target, analysis)),
@@ -1522,7 +2273,7 @@ export class App {
     if (target === "jpw") {
       const text = this.documentFormat === "jpw"
         ? this.getText()
-        : scoreToJpwabc(this.painter.score);
+        : this.slashDocumentAsJpw();
       return {
         bytes: encodeJpwabc(text),
         name: `${title}.jpwabc`,
@@ -1773,6 +2524,7 @@ export class App {
             sourceMidi: parsed,
             braceMode: slashBraceMode,
             bracketMode: slashBracketMode,
+            ordering: options.slashOrdering ?? "pitch-asc",
           }, slashVoiceCount);
           const slashAnalysis = analyzeSlashScore(slashText);
           const slashOptions = defaultSlashScoreOptions(outputFormat, slashAnalysis);
@@ -1792,6 +2544,7 @@ export class App {
           slashOptions.beatType = options.beatType;
           slashOptions.braceMode = slashBraceMode;
           slashOptions.bracketMode = slashBracketMode;
+          slashOptions.ordering = options.slashOrdering ?? "pitch-asc";
           slashOptions.tempoMarks = score.tempoMarks.map((mark) => ({
             measure: mark.measure,
             offset: mark.offset.toFloat(),
@@ -2632,6 +3385,89 @@ function upsertTitleField(doc: string, field: string, value: string): string {
   if (existing >= 0) lines[existing] = nextLine;
   else lines.splice(end, 0, nextLine);
   return lines.join("\n");
+}
+
+function upsertOptionalTitleField(doc: string, field: string, value: string): string {
+  if (value) return upsertTitleField(doc, field, value);
+  const lines = doc.split("\n");
+  const titleAt = lines.findIndex((line) => line.trim().toLowerCase() === ".title");
+  if (titleAt < 0) return doc;
+  let end = titleAt + 1;
+  while (end < lines.length && !lines[end].trimStart().startsWith(".")) end++;
+  const key = field.toLowerCase();
+  const existing = lines.findIndex((line, index) =>
+    index > titleAt && index < end
+    && line.split("=", 1)[0].trim().toLowerCase() === key);
+  if (existing < 0) return doc;
+  lines.splice(existing, 1);
+  return lines.join("\n");
+}
+
+function readJpwTitleField(doc: string, field: string): string {
+  const lines = doc.split(/\r?\n/);
+  const titleAt = lines.findIndex((line) => line.trim().toLowerCase() === ".title");
+  if (titleAt < 0) return "";
+  const key = field.toLowerCase();
+  for (let index = titleAt + 1; index < lines.length; index++) {
+    if (lines[index].trimStart().startsWith(".")) break;
+    const equals = lines[index].indexOf("=");
+    if (equals < 0 || lines[index].slice(0, equals).trim().toLowerCase() !== key) continue;
+    const value = lines[index].slice(equals + 1).trim();
+    return value.startsWith("{") && value.endsWith("}")
+      ? value.slice(1, -1)
+      : value;
+  }
+  return "";
+}
+
+function replaceJpwNotationSections(original: string, generated: string): string {
+  interface SectionBlock {
+    header: string;
+    from: number;
+    to: number;
+    lines: string[];
+  }
+  const blocks = (text: string): { lines: string[]; sections: SectionBlock[] } => {
+    const lines = text.split(/\r?\n/);
+    const starts = lines.flatMap((line, index) =>
+      line.trimStart().startsWith(".") ? [index] : []);
+    const sections = starts.map((from, index) => ({
+      header: lines[from].trim().toLowerCase(),
+      from,
+      to: starts[index + 1] ?? lines.length,
+      lines: lines.slice(from, starts[index + 1] ?? lines.length),
+    }));
+    return { lines, sections };
+  };
+  const source = blocks(original);
+  const replacement = blocks(generated);
+  const wanted = (header: string): boolean =>
+    header === ".words" || header === ".voice" || header.startsWith(".voice.");
+  const queues = new Map<string, string[][]>();
+  for (const section of replacement.sections.filter((item) => wanted(item.header))) {
+    const queue = queues.get(section.header) ?? [];
+    queue.push(section.lines);
+    queues.set(section.header, queue);
+  }
+  const fallbackVoices = replacement.sections
+    .filter((section) => section.header === ".voice" || section.header.startsWith(".voice."))
+    .map((section) => section.lines);
+  let fallbackVoiceIndex = 0;
+  const changes = source.sections
+    .filter((section) => wanted(section.header))
+    .map((section) => {
+      const exact = queues.get(section.header)?.shift();
+      const lines = exact ?? (section.header === ".words"
+        ? replacement.sections.find((item) => item.header === ".words")?.lines
+        : fallbackVoices[fallbackVoiceIndex++]);
+      return lines ? { from: section.from, to: section.to, lines } : null;
+    })
+    .filter((change): change is { from: number; to: number; lines: string[] } => change !== null)
+    .sort((left, right) => right.from - left.from);
+  for (const change of changes) {
+    source.lines.splice(change.from, change.to - change.from, ...change.lines);
+  }
+  return source.lines.join(original.includes("\r\n") ? "\r\n" : "\n");
 }
 
 function importedFileStem(path: string): string {

@@ -20,6 +20,7 @@ export type {
   MidiQuantizeDivision,
   MidiScoreMode,
   MidiSlashGroupMode,
+  MidiSlashOrdering,
   MidiTrackAssignment,
   ParsedMidi,
 } from "./types";

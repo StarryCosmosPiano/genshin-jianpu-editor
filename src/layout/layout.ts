@@ -1979,7 +1979,7 @@ export class Line {
     if (byMeasure.size === 0) return;
 
     const strokeWidth = Math.max(0.8, opt.numberSize * 0.038);
-    for (const entries of byMeasure.values()) {
+    for (const [measureIndex, entries] of byMeasure) {
       const anchors = entries.map((positioned) => ({
         tick: positioned.entry.syncTick.toFloat(),
         x: positioned.x,
@@ -1988,7 +1988,10 @@ export class Line {
       const endAnchor = [...anchors].reverse().find((item) => item.entry instanceof Barline);
       if (!endAnchor || endAnchor.tick <= 1e-8 || anchors.length < 2) continue;
 
-      const beatType = anchors.find((anchor) => anchor.entry.syncBeatType > 0)?.entry.syncBeatType ?? 4;
+      const meterAnchor = anchors.find((anchor) =>
+        anchor.entry.syncBeats > 0 && anchor.entry.syncBeatType > 0)?.entry;
+      const beats = meterAnchor?.syncBeats ?? 4;
+      const beatType = meterAnchor?.syncBeatType ?? 4;
       let minorDivision: number = Math.max(4, beatType);
       if (style.rhythmGuideMode === "manual") {
         minorDivision = Math.max(minorDivision, style.rhythmGuideDivision);
@@ -1999,7 +2002,8 @@ export class Line {
           }
         }
       }
-      const majorStep = 4 / beatType;
+      const compound = beatType === 8 && beats >= 6 && beats % 3 === 0;
+      const majorStep = compound ? 3 * 4 / beatType : 4 / beatType;
       const minorStep = 4 / minorDivision;
       const unique: Array<{ tick: number; x: number }> = [];
       for (const anchor of anchors) {
@@ -2020,6 +2024,7 @@ export class Line {
 
       const baseline = new GraphicLine();
       baseline.classes.add("rhythm-guide-line");
+      baseline.classes.add(`rhythm-guide-measure-${measureIndex}`);
       baseline.strokeColor = opt.color;
       baseline.strokeWidth = strokeWidth;
       baseline.p0 = new Point(xAt(0), baselineY);
@@ -2033,7 +2038,11 @@ export class Line {
         const major = Math.abs(majorRatio - Math.round(majorRatio)) < 1e-7;
         const mark = new GraphicLine();
         mark.classes.add("rhythm-guide-tick");
+        mark.classes.add(`rhythm-guide-measure-${measureIndex}`);
         mark.classes.add(major ? "rhythm-guide-major" : "rhythm-guide-minor");
+        if (major) {
+          mark.classes.add(`rhythm-guide-beat-${Math.round(majorRatio)}`);
+        }
         mark.strokeColor = opt.color;
         mark.strokeWidth = strokeWidth;
         const x = xAt(tick);

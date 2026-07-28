@@ -33,6 +33,7 @@ body.file-drag-active #app::after {
 }
 
 #toolbar {
+  --toolbar-control-height: 29px;
   flex: 0 0 auto;
   display: flex;
   align-items: center;
@@ -40,6 +41,11 @@ body.file-drag-active #app::after {
   padding: 6px 10px;
   background: var(--panel);
   border-bottom: 1px solid var(--border);
+  overflow-x: auto;
+}
+#toolbar > button,
+#toolbar > select {
+  height: var(--toolbar-control-height);
 }
 #toolbar button { padding: 4px 10px; cursor: pointer; }
 #toolbar button.format-unavailable {
@@ -54,6 +60,66 @@ body.file-drag-active #app::after {
   background: #e7e7e7;
 }
 #toolbar .sep { width: 1px; height: 20px; background: var(--border); margin: 0 6px; }
+
+#rhythm-grid-control {
+  display: inline-flex;
+  align-items: stretch;
+  flex: 0 0 auto;
+  height: var(--toolbar-control-height);
+  border: 1px solid #b9b9b9;
+  border-radius: 5px;
+  overflow: hidden;
+  background: #fff;
+}
+#rhythm-grid-control .rhythm-grid-label {
+  display: inline-flex;
+  align-items: center;
+  padding: 0 7px;
+  color: #555;
+  background: #f4f4f4;
+  border-right: 1px solid #ccc;
+  font-size: 12px;
+  white-space: nowrap;
+}
+#toolbar #rhythm-grid-control button {
+  display: grid;
+  place-items: center;
+  width: 29px;
+  min-width: 29px;
+  padding: 0;
+  border: 0;
+  border-right: 1px solid #ddd;
+  border-radius: 0;
+  background: #fff;
+  color: #222;
+  font-family: "Bravura", "Segoe UI Symbol", serif;
+  font-size: 20px;
+  line-height: 1;
+}
+#rhythm-grid-control .rhythm-grid-glyph {
+  display: block;
+  line-height: 1;
+  transform: translateY(10px);
+}
+#rhythm-grid-control button[data-rhythm-division="1"] .rhythm-grid-glyph {
+  transform: translateY(2px);
+}
+#toolbar #rhythm-grid-control button:last-child { border-right: 0; }
+#toolbar #rhythm-grid-control button:hover { background: #edf5ff; }
+#toolbar #rhythm-grid-control button.active {
+  color: #fff;
+  background: #1769cf;
+}
+#toolbar #rhythm-grid-control button.grid-unavailable:not(.active) {
+  color: #888;
+  background: #f5f5f5;
+  cursor: help;
+}
+#rhythm-grid-control[data-mode="auto"] .rhythm-grid-label::after {
+  content: "·自动";
+  margin-left: 2px;
+  color: #777;
+}
 
 .toolbar-notice {
   position: fixed;
@@ -151,6 +217,33 @@ body.file-drag-active #app::after {
   box-shadow: inset 0 -1px 0 rgba(21, 101, 255, 0.65);
 }
 
+.cm-editor .cm-slash-timing-error-line {
+  background: rgba(220, 38, 38, 0.11);
+  box-shadow:
+    inset 3px 0 0 #dc2626,
+    inset 0 -1px 0 rgba(220, 38, 38, 0.42);
+}
+
+.cm-editor .cm-gutterElement.cm-slash-timing-error-number {
+  color: #b91c1c;
+  background: rgba(220, 38, 38, 0.14);
+  font-weight: 700;
+}
+
+.cm-editor .cm-gutterElement.cm-slash-timing-incomplete-number {
+  color: #a16207;
+  background: rgba(245, 158, 11, 0.18);
+  font-weight: 700;
+}
+
+.cm-slash-timing-message {
+  margin-left: 0.55em;
+  color: #b91c1c;
+  font-size: 0.86em;
+  font-weight: 600;
+  white-space: normal;
+}
+
 .cm-slash-voice {
   border-radius: 2px;
 }
@@ -210,6 +303,13 @@ body.file-drag-active #app::after {
 .score-page g.selected { cursor: pointer; }
 .score-page text, .score-page path, .score-page line { cursor: default; }
 .score-page g.soft-deleted { opacity: 0.28; }
+
+.score-page .slash-measure-error-box {
+  fill: rgba(220, 38, 38, 0.09);
+  stroke: #dc2626;
+  stroke-width: 1.5;
+  vector-effect: non-scaling-stroke;
+}
 
 /* playback cursor — highlight the currently sounding note */
 .score-page g.playing [fill]:not([fill="none"]) { fill: #e8590c; }

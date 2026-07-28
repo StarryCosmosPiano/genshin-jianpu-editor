@@ -8,6 +8,8 @@ export interface JpwSourceNote {
   /** Non-metrical pitch printed before the chord's main sounding notes. */
   grace: boolean;
   partIndex: number;
+  /** Stable editable chord order within this source part. */
+  chordIndex: number;
   tokenFrom: number;
   tokenTo: number;
   /** Exact editable pitch span, including accidental and octave markers. */
@@ -103,6 +105,14 @@ function pitchSpans(token: TextRange): TextRange[] {
   return result;
 }
 
+function jpwTokenQuarterDuration(token: TextRange): number {
+  const notation = token.text.replace(/\{[^}]*\}/g, "");
+  const beams = notation.match(/_/g)?.length ?? 0;
+  const beats = 1 + (notation.match(/-/g)?.length ?? 0);
+  const dotted = notation.includes(".") ? 1.5 : 1;
+  return beats * dotted / (1 << beams);
+}
+
 /** Exact pitch spans inside the JPW `{...}` grace-note block of one Note token. */
 function gracePitchSpans(token: TextRange): TextRange[] {
   const block = /\{((?:(?:#b|#|b)?[0-7](?:[,'gd])*)+)\}/.exec(token.text);
@@ -131,11 +141,71 @@ export function buildJpwSourceNotes(text: string, score: Score): JpwSourceNote[]
   const result: JpwSourceNote[] = [];
   score.parts.forEach((part, partIndex) => {
     const chords = part.measures.flatMap((measure) =>
-      measure.entries.filter((entry): entry is Chord => entry instanceof Chord));
+      measure.entries.filter((entry): entry is Chord =>
+        entry instanceof Chord && !entry.generatedTimingContinuation))
+      .sort((left, right) =>
+        (left.timingSourceIndex ?? Number.MAX_SAFE_INTEGER)
+        - (right.timingSourceIndex ?? Number.MAX_SAFE_INTEGER));
     const tokens = voiceTokens[partIndex] ?? [];
-    for (let chordIndex = 0; chordIndex < Math.min(chords.length, tokens.length); chordIndex++) {
-      const chord = chords[chordIndex];
-      const token = tokens[chordIndex];
+    let chordCursor = 0;
+    let tieOpen = false;
+    let previous: { chord: Chord; chordIndex: number; pitches: string[] } | null = null;
+    let mergedRest: {
+      chord: Chord;
+      chordIndex: number;
+      remainingDuration: number;
+    } | null = null;
+    const chordPitches = (chord: Chord): string[] =>
+      chord.notes.map(sourcePitchOf).map(normalizedPitch).sort();
+    const samePitches = (left: readonly string[], right: readonly string[]): boolean =>
+      left.length === right.length
+      && left.every((pitch, index) => pitch === right[index]);
+    for (const token of tokens) {
+      const mainSpans = pitchSpans(token);
+      const expected = mainSpans.map((span) => normalizedPitch(span.text)).sort();
+      const sameTiePitch = tieOpen
+        && previous !== null
+        && samePitches(previous.pitches, expected);
+      const restToken = expected.length === 1 && expected[0] === "0";
+      const tokenDuration = restToken ? jpwTokenQuarterDuration(token) : 0;
+      let chordIndex = -1;
+      let chord: Chord | null = null;
+      let reusedMergedRest = false;
+      if (restToken
+        && mergedRest
+        && mergedRest.remainingDuration + 1e-8 >= tokenDuration) {
+        // Several source `0__` tokens can be rendered as one legal `0_`
+        // inside a beat. Keep every original zero editable by mapping its
+        // range back to the same merged rest chord.
+        chord = mergedRest.chord;
+        chordIndex = mergedRest.chordIndex;
+        reusedMergedRest = true;
+        mergedRest.remainingDuration = Math.max(
+          0,
+          mergedRest.remainingDuration - tokenDuration,
+        );
+      } else if (sameTiePitch && previous) {
+        const visibleContinuation = chords[chordCursor];
+        if (visibleContinuation?.transparentContinuation
+          && samePitches(chordPitches(visibleContinuation), expected)) {
+          chord = visibleContinuation;
+          chordIndex = chordCursor++;
+        } else {
+          // The continuation was absorbed into a legal value inside one beat.
+          // Keep both editable source numbers mapped to the merged score note.
+          chord = previous.chord;
+          chordIndex = previous.chordIndex;
+        }
+      } else {
+        chordIndex = chords.findIndex((candidate, index) =>
+          index >= chordCursor && samePitches(chordPitches(candidate), expected));
+        if (chordIndex < 0 && chordCursor < chords.length) chordIndex = chordCursor;
+        if (chordIndex >= 0) {
+          chord = chords[chordIndex];
+          chordCursor = chordIndex + 1;
+        }
+      }
+      if (!chord || chordIndex < 0) continue;
       const append = (notes: readonly Note[], spans: readonly TextRange[], grace: boolean): void => {
         const unused = new Set(spans.map((_span, index) => index));
         for (const note of notes) {
@@ -151,6 +221,7 @@ export function buildJpwSourceNotes(text: string, score: Score): JpwSourceNote[]
             note,
             grace,
             partIndex,
+            chordIndex,
             tokenFrom: token.from,
             tokenTo: token.to,
             from: span.from,
@@ -159,7 +230,25 @@ export function buildJpwSourceNotes(text: string, score: Score): JpwSourceNote[]
         }
       };
       append(chord.graceNotes, gracePitchSpans(token), true);
-      append(chord.notes, pitchSpans(token), false);
+      append(chord.notes, mainSpans, false);
+      if (restToken && !reusedMergedRest) {
+        mergedRest = {
+          chord,
+          chordIndex,
+          remainingDuration: Math.max(
+            0,
+            (chord.duration?.toFloat() ?? tokenDuration) - tokenDuration,
+          ),
+        };
+      } else if (!restToken) {
+        mergedRest = null;
+      }
+      previous = { chord, chordIndex, pitches: expected };
+      const notation = token.text.replace(/\{[^}]*\}/g, "");
+      const opens = notation.includes("(");
+      const closes = notation.includes(")");
+      if (closes) tieOpen = opens;
+      else if (opens) tieOpen = true;
     }
   });
   return result.sort((a, b) => a.from - b.from || a.to - b.to);
@@ -176,38 +265,87 @@ export function buildSlashSourceNotes(text: string, options: SlashScoreOptions, 
     events.set(key, group);
   }
 
-  const candidates = score.parts.flatMap((part, partIndex) => part.measures.flatMap((measure) =>
-    measure.entries
-      .filter((entry): entry is Chord => entry instanceof Chord && !entry.rest && !entry.transparentContinuation)
-      .map((chord) => ({
-        chord,
-        partIndex,
-        time: measure.position.plus(chord.position).toFloat(),
-        pitches: [...new Set(chord.notes.filter((note) => !note.rest).map((note) => note.pitch))].sort((a, b) => a - b),
-      })),
-  )).sort((a, b) => a.time - b.time || a.partIndex - b.partIndex);
+  const candidates = score.parts.flatMap((part, partIndex) => {
+    let chordIndex = 0;
+    return part.measures.flatMap((measure) =>
+      measure.entries
+      .filter((entry): entry is Chord =>
+        entry instanceof Chord
+        && !entry.generatedTimingContinuation
+        && !entry.rest)
+      .map((chord) => {
+        const fallbackIndex = chordIndex++;
+        return {
+          chord,
+          partIndex,
+          chordIndex: chord.timingSourceIndex ?? fallbackIndex,
+          time: measure.position.plus(chord.position).toFloat(),
+          pitches: [...new Set(chord.notes.filter((note) => !note.rest).map((note) => note.pitch))].sort((a, b) => a - b),
+        };
+      }),
+    );
+  }).sort((a, b) =>
+    a.partIndex - b.partIndex || a.chordIndex - b.chordIndex || a.time - b.time);
 
   const result: JpwSourceNote[] = [];
   const usedCandidates = new Set<number>();
-  const lastTimeByPart = new Map<number, number>();
+  const lastSourceIndexByPart = new Map<number, number>();
+  const lastMappedByPart = new Map<number, {
+    groupKey: string;
+    pitches: number[];
+    candidateIndex: number;
+  }>();
+  const sourceGroupKey = (offset: number): string => {
+    const lineStart = Math.max(
+      text.lastIndexOf("\n", Math.max(0, offset - 1)),
+      text.lastIndexOf("\r", Math.max(0, offset - 1)),
+    ) + 1;
+    const prefix = text.slice(lineStart, offset);
+    return `${lineStart}:${prefix.split("/").length - 1}`;
+  };
   for (const event of events.values()) {
     const mainEvent = event.filter((source) => !source.grace);
     const graceEvent = event.filter((source) => source.grace);
     if (mainEvent.length === 0) continue;
     const expected = [...new Set(mainEvent.map((source) => source.pitch))].sort((a, b) => a - b);
     const preferredPart = Math.max(0, (mainEvent[0]?.voiceIndex ?? 1) - 1);
-    const minimumTime = lastTimeByPart.get(preferredPart) ?? -Infinity;
-    let candidateIndex = candidates.findIndex((candidate, index) =>
-      !usedCandidates.has(index) &&
-      candidate.partIndex === preferredPart &&
-      candidate.time >= minimumTime - 1e-8 &&
-      candidate.pitches.length === expected.length &&
-      candidate.pitches.every((pitch, pitchIndex) => pitch === expected[pitchIndex]));
+    const minimumSourceIndex = lastSourceIndexByPart.get(preferredPart) ?? -1;
+    const groupKey = sourceGroupKey(mainEvent[0].from);
+    const lastMapped = lastMappedByPart.get(preferredPart);
+    const sameSustainedSource = lastMapped
+      && lastMapped.groupKey === groupKey
+      && lastMapped.pitches.length === expected.length
+      && lastMapped.pitches.every((pitch, pitchIndex) => pitch === expected[pitchIndex]);
+    // A repeated source pitch inside one slash group is duration spelling, not
+    // a new attack. If a beat boundary requires a visible gray continuation,
+    // map to that chord; otherwise both source tokens select the merged note.
+    let candidateIndex = sameSustainedSource
+      ? candidates.findIndex((candidate, index) =>
+        !usedCandidates.has(index)
+        && candidate.partIndex === preferredPart
+        && candidate.chordIndex >= minimumSourceIndex
+        && candidate.chord.transparentContinuation
+        && candidate.pitches.length === expected.length
+        && candidate.pitches.every((pitch, pitchIndex) => pitch === expected[pitchIndex]))
+      : -1;
+    let reusedCandidate = false;
+    if (candidateIndex < 0 && sameSustainedSource) {
+      candidateIndex = lastMapped.candidateIndex;
+      reusedCandidate = true;
+    }
     if (candidateIndex < 0) {
       candidateIndex = candidates.findIndex((candidate, index) =>
         !usedCandidates.has(index) &&
         candidate.partIndex === preferredPart &&
-        candidate.time >= minimumTime - 1e-8 &&
+        candidate.chordIndex >= minimumSourceIndex &&
+        candidate.pitches.length === expected.length &&
+        candidate.pitches.every((pitch, pitchIndex) => pitch === expected[pitchIndex]));
+    }
+    if (candidateIndex < 0) {
+      candidateIndex = candidates.findIndex((candidate, index) =>
+        !usedCandidates.has(index) &&
+        candidate.partIndex === preferredPart &&
+        candidate.chordIndex >= minimumSourceIndex &&
         expected.every((pitch) => candidate.pitches.includes(pitch)));
     }
     // A rolled subset and a simultaneous chord can be merged into one model
@@ -242,6 +380,7 @@ export function buildSlashSourceNotes(text: string, options: SlashScoreOptions, 
           note: notes[noteIndex],
           grace,
           partIndex: candidate.partIndex,
+          chordIndex: candidate.chordIndex,
           tokenFrom,
           tokenTo,
           from: source.from,
@@ -254,8 +393,13 @@ export function buildSlashSourceNotes(text: string, options: SlashScoreOptions, 
     };
     append(graceEvent, candidate.chord.graceNotes, true);
     append(mainEvent, candidate.chord.notes, false);
-    usedCandidates.add(candidateIndex);
-    lastTimeByPart.set(preferredPart, candidate.time);
+    if (!reusedCandidate) usedCandidates.add(candidateIndex);
+    lastSourceIndexByPart.set(preferredPart, candidate.chordIndex);
+    lastMappedByPart.set(preferredPart, {
+      groupKey,
+      pitches: expected,
+      candidateIndex,
+    });
   }
   return result.sort((a, b) => a.from - b.from || a.to - b.to);
 }

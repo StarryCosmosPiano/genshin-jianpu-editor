@@ -13,7 +13,18 @@ import {
 } from "../score/score";
 import { midiToScore } from "../midi/importer";
 import { detectMidiSlashGestures, type MidiSlashGesture } from "../midi/gestures";
-import type { MidiImportOptions, MidiQuantizeDivision, ParsedMidi, ParsedMidiNote } from "../midi/types";
+import type {
+  MidiImportOptions,
+  MidiQuantizeDivision,
+  MidiSlashOrdering,
+  ParsedMidi,
+  ParsedMidiNote,
+} from "../midi/types";
+import {
+  applyNoteTimingEdits,
+  normalizeNoteTimingEdits,
+  type NoteTimingEditData,
+} from "../score/note-timing";
 
 export type SlashScoreKind = "keyboard" | "number";
 export type SlashDurationDivision = 4 | 8 | 16 | 32 | 64;
@@ -48,15 +59,23 @@ export interface SlashScoreOptions {
   beats: number;
   beatType: number;
   symbolDurations: Record<string, SlashDurationDivision>;
+  /** False keeps only symbol slot 1 active; true allows all configured symbols. */
+  multiDurationSymbols?: boolean;
   /** null means formatting whitespace; otherwise literal spaces add duration to the adjacent sounding note. */
   spaceDivision: SlashDurationDivision | null;
   /** null preserves the legacy marker-only rhythm; otherwise every note/chord advances this duration itself. */
   noteDivision: SlashDurationDivision | null;
+  /** Write a completely empty slash group as ` - ` instead of duration markers. */
+  emptyGroupsAsRests?: boolean;
   braceMode: SlashBraceMode;
   /** Defaults to triplet when absent in an older saved options comment. */
   bracketMode?: SlashGroupMode;
+  /** Stable chord text order chosen during MIDI-to-TXT conversion. */
+  ordering?: MidiSlashOrdering;
   /** MIDI tempo annotations retained inside the editable TXT settings comment. */
   tempoMarks?: SlashTempoMark[];
+  /** Direct score-pane rhythmic edits retained inside the TXT settings comment. */
+  noteTimingEdits?: NoteTimingEditData[];
 }
 
 export interface SlashMeterSuggestion {
@@ -76,8 +95,10 @@ export interface SlashScoreAnalysis {
   observedSymbols: string[];
   containsScoreSpaces: boolean;
   suggestedMappings: Record<string, SlashDurationDivision>;
+  multiDurationSymbols: boolean;
   suggestedSpaceDivision: SlashDurationDivision | null;
   suggestedNoteDivision: SlashDurationDivision | null;
+  emptyGroupsAsRests: boolean;
   meter: SlashMeterSuggestion;
   tempoBpm: number;
   tempoBeatUnit: TempoBeatUnit;
@@ -89,7 +110,9 @@ export interface SlashScoreAnalysis {
   lyricist: string;
   suggestedBraceMode: SlashBraceMode;
   suggestedBracketMode: SlashGroupMode;
+  ordering: MidiSlashOrdering;
   tempoMarks: SlashTempoMark[];
+  noteTimingEdits: NoteTimingEditData[];
   /** One long score line contains several measures and must be split from the chosen meter. */
   continuous: boolean;
 }
@@ -105,7 +128,26 @@ export interface SlashScoreSummary {
   ignoredTags: number;
   clippedGroups: number;
   ignoredCharacters: number;
+  diagnostics: SlashScoreDiagnostic[];
   warnings: string[];
+}
+
+export interface SlashScoreDiagnostic {
+  severity: "error" | "incomplete";
+  /** One-based source line number shown in the editor gutter. */
+  line: number;
+  from: number;
+  to: number;
+  /** Zero-based rendered measures covered by this source-line problem. */
+  measureIndices: number[];
+  /** Exact rhythmic groups when the offending beat can be identified. */
+  beatLocations: Array<{
+    measureIndex: number;
+    /** Zero-based beat/group inside the rendered measure; null means the full measure. */
+    beatIndex: number | null;
+    beatCount: number;
+  }>;
+  message: string;
 }
 
 export interface SlashScoreResult {
@@ -114,9 +156,18 @@ export interface SlashScoreResult {
 }
 
 export interface MidiSlashExportOptions {
-  sourceMidi: ParsedMidi;
+  sourceMidi?: ParsedMidi;
   braceMode: SlashGroupMode;
   bracketMode: SlashGroupMode;
+  ordering?: MidiSlashOrdering;
+  /** Serialize one binary level finer than `division` with this configured delimiter. */
+  subdivisionMode?: "brace" | "bracket";
+  /** Canonical TXT spelling used when rewriting an editable slash score. */
+  durationNotation?: Pick<
+    SlashScoreOptions,
+    "symbolDurations" | "multiDurationSymbols" | "spaceDivision"
+    | "noteDivision" | "emptyGroupsAsRests"
+  >;
 }
 
 /** One editable pitch spelling in the original keyboard/number slash-score text. */
@@ -156,19 +207,33 @@ interface Directives {
   arranger: string;
   lyricist: string;
   mappings: Record<string, SlashDurationDivision>;
+  multiDurationSymbols: boolean | null;
   spaceDivision: SlashDurationDivision | null | undefined;
   noteDivision: SlashDurationDivision | null | undefined;
+  emptyGroupsAsRests: boolean | null;
   braceMode: SlashBraceMode | null;
   bracketMode: SlashGroupMode | null;
+  ordering: MidiSlashOrdering;
   tempoMarks: SlashTempoMark[];
+  noteTimingEdits: NoteTimingEditData[];
 }
 
 interface TimedEvent {
   start: number;
   end: number;
   pitches: number[];
+  /** Exact source `/` group, independent of whether that group fills one beat or one measure. */
+  sourceGroupKey?: string;
+  /** Absolute end of the source `/` group. */
+  sourceGroupEnd?: number;
+  /** Source duration contributions kept separate for readable multi-voice spelling. */
+  writtenDurations?: number[];
   /** Leading duration in a slash group continues this preceding event. */
   continuationOf?: TimedEvent;
+  /** A repeated source pitch explicitly starts this continuation segment. */
+  sourcePitchContinuation?: boolean;
+  /** A voice-only boundary added for readable sustain; it has no source token. */
+  syntheticContinuation?: boolean;
   /** Non-metrical notes printed before this event. */
   gracePitches?: number[][];
   /** The event is a rolled chord and receives an arpeggio wave. */
@@ -245,6 +310,8 @@ interface SourceLineRecord {
   raw: string;
   text: string;
   from: number;
+  to: number;
+  line: number;
   score: boolean;
   kind: SlashScoreKind | null;
   sectionKind: SlashScoreKind | null;
@@ -264,6 +331,7 @@ function sourceLineRecords(text: string): SourceLineRecord[] {
   const records: SourceLineRecord[] = [];
   let lineFrom = text.startsWith("\uFEFF") ? 1 : 0;
   let sectionKind: SlashScoreKind | null = null;
+  let lineNumber = 1;
   while (lineFrom <= text.length) {
     let lineTo = lineFrom;
     while (lineTo < text.length && text[lineTo] !== "\r" && text[lineTo] !== "\n") lineTo++;
@@ -277,6 +345,8 @@ function sourceLineRecords(text: string): SourceLineRecord[] {
       raw,
       text: stripped.text,
       from: lineFrom,
+      to: lineTo,
+      line: lineNumber,
       score,
       kind: score ? scoreLineKind(stripped.text) : null,
       sectionKind,
@@ -284,6 +354,7 @@ function sourceLineRecords(text: string): SourceLineRecord[] {
     });
     if (lineTo >= text.length) break;
     lineFrom = lineTo + (text[lineTo] === "\r" && text[lineTo + 1] === "\n" ? 2 : 1);
+    lineNumber++;
   }
   return records;
 }
@@ -314,6 +385,12 @@ function selectedScoreLine(
   return owner === null || owner === kind;
 }
 
+/** Whether this TXT already contains real score rows for the requested kind. */
+export function hasSlashScoreLines(text: string, kind: SlashScoreKind): boolean {
+  const records = sourceLineRecords(text);
+  return records.some((_record, index) => selectedScoreLine(records, index, kind));
+}
+
 function sourceLines(text: string, kind?: SlashScoreKind): SourceLines {
   const records = sourceLineRecords(text);
   return {
@@ -325,6 +402,51 @@ function sourceLines(text: string, kind?: SlashScoreKind): SourceLines {
       .map((record) => record.raw),
     ignoredTags: records.reduce((sum, record) => sum + record.ignoredTags, 0),
   };
+}
+
+/**
+ * Replace only the active keyboard/number score lines while retaining titles,
+ * comments, the other mixed notation kind, and all user-authored prose.
+ */
+export function replaceSlashScoreLines(
+  text: string,
+  replacement: string,
+  kind: SlashScoreKind,
+): string {
+  const original = sourceLineRecords(text);
+  const replacementRecords = sourceLineRecords(replacement);
+  const generated = replacementRecords
+    .filter((_record, index) => selectedScoreLine(
+      replacementRecords,
+      index,
+      kind,
+    ))
+    .map((record) => record.raw);
+  const selected = original.map((_record, index) =>
+    selectedScoreLine(original, index, kind));
+  if (!selected.some(Boolean) || generated.length === 0) return text;
+  const lineEnding = text.includes("\r\n") ? "\r\n" : "\n";
+  const bom = text.startsWith("\uFEFF") ? "\uFEFF" : "";
+
+  if (selected.filter(Boolean).length === generated.length) {
+    let cursor = 0;
+    return bom + original.map((record, index) =>
+      selected[index] ? generated[cursor++] : record.raw).join(lineEnding);
+  }
+
+  const lines: string[] = [];
+  let inserted = false;
+  original.forEach((record, index) => {
+    if (!selected[index]) {
+      lines.push(record.raw);
+      return;
+    }
+    if (!inserted) {
+      lines.push(...generated);
+      inserted = true;
+    }
+  });
+  return bom + lines.join(lineEnding);
 }
 
 /** Infer the minimum voice count from markers in real score lines only. */
@@ -388,11 +510,15 @@ function readDirectives(text: string): Directives {
     arranger: "",
     lyricist: "",
     mappings: {},
+    multiDurationSymbols: null,
     spaceDivision: undefined,
     noteDivision: undefined,
+    emptyGroupsAsRests: null,
     braceMode: null,
     bracketMode: null,
+    ordering: "pitch-asc",
     tempoMarks: [],
+    noteTimingEdits: [],
   };
   const meter = /(?:^|\n)\s*(\d{1,2})\s*\/\s*(2|4|8|16)\s*拍?/m.exec(text);
   if (meter) {
@@ -467,8 +593,12 @@ function readDirectives(text: string): Directives {
         bpm?: number; f?: number; m?: [number, number]; s?: Record<string, SlashDurationDivision>;
         bu?: TempoBeatUnit;
         sp?: SlashDurationDivision | null; nd?: SlashDurationDivision | null;
+        ms?: boolean;
+        er?: boolean;
         b?: "n" | "g" | "s" | "a" | "t"; q?: "n" | "g" | "s" | "a" | "t";
+        o?: MidiSlashOrdering;
         tm?: SlashTempoMark[];
+        ne?: NoteTimingEditData[];
       };
       const value = JSON.parse(stored[1]) as Stored;
       const storedKind = value.kind ?? (value.k === "k" ? "keyboard" : value.k === "n" ? "number" : undefined);
@@ -508,6 +638,10 @@ function readDirectives(text: string): Directives {
           if (symbol && DIVISIONS.includes(division as SlashDurationDivision)) result.mappings[symbol] = division as SlashDurationDivision;
         }
       }
+      const storedMultiSymbols = value.multiDurationSymbols ?? value.ms;
+      if (typeof storedMultiSymbols === "boolean") {
+        result.multiDurationSymbols = storedMultiSymbols;
+      }
       const storedSpace = value.spaceDivision !== undefined ? value.spaceDivision : value.sp;
       if (storedSpace === null || DIVISIONS.includes(storedSpace as SlashDurationDivision)) {
         result.spaceDivision = storedSpace as SlashDurationDivision | null;
@@ -515,6 +649,10 @@ function readDirectives(text: string): Directives {
       const storedNote = value.noteDivision !== undefined ? value.noteDivision : value.nd;
       if (storedNote === null || DIVISIONS.includes(storedNote as SlashDurationDivision)) {
         result.noteDivision = storedNote as SlashDurationDivision | null;
+      }
+      const storedEmptyGroups = value.emptyGroupsAsRests ?? value.er;
+      if (typeof storedEmptyGroups === "boolean") {
+        result.emptyGroupsAsRests = storedEmptyGroups;
       }
       const compactMode = (value: unknown): SlashGroupMode | undefined =>
         value === "n" ? "none"
@@ -530,6 +668,11 @@ function readDirectives(text: string): Directives {
       const storedBracket = value.bracketMode ?? compactMode(value.q);
       if (validMode(storedBrace)) result.braceMode = storedBrace;
       if (validMode(storedBracket)) result.bracketMode = storedBracket;
+      const storedOrdering = value.ordering ?? value.o;
+      if (storedOrdering === "voice-asc" || storedOrdering === "voice-desc"
+        || storedOrdering === "pitch-asc" || storedOrdering === "pitch-desc") {
+        result.ordering = storedOrdering;
+      }
       const storedTempoMarks = value.tempoMarks ?? value.tm;
       if (Array.isArray(storedTempoMarks)) {
         result.tempoMarks = storedTempoMarks.flatMap((mark) => {
@@ -544,6 +687,7 @@ function readDirectives(text: string): Directives {
           return [{ measure, offset, kind, bpm }];
         });
       }
+      result.noteTimingEdits = normalizeNoteTimingEdits(value.noteTimingEdits ?? value.ne);
     } catch {
       // A damaged settings comment is ordinary ignored text; natural-language directives still work.
     }
@@ -584,8 +728,13 @@ function defaultDivisionForSymbol(symbol: string): SlashDurationDivision {
   return 16;
 }
 
-function effectiveMappings(options: Pick<SlashScoreOptions, "symbolDurations" | "spaceDivision">): Record<string, SlashDurationDivision> {
-  const mappings = { ...options.symbolDurations };
+function effectiveMappings(
+  options: Pick<SlashScoreOptions, "symbolDurations" | "spaceDivision">
+    & Partial<Pick<SlashScoreOptions, "multiDurationSymbols">>,
+): Record<string, SlashDurationDivision> {
+  const entries = Object.entries(options.symbolDurations);
+  const enabled = options.multiDurationSymbols === false ? entries.slice(0, 1) : entries;
+  const mappings = Object.fromEntries(enabled) as Record<string, SlashDurationDivision>;
   if (options.spaceDivision) mappings[" "] = options.spaceDivision;
   else delete mappings[" "];
   return mappings;
@@ -613,7 +762,7 @@ function segmentMarkerDuration(
       if (end < 0) { index++; continue; }
       const content = segment.slice(index + 1, end);
       const mode = modeFor(char);
-      const nominal = segmentMarkerDuration(content, mappings, "subdivide", noteDivision, "subdivide");
+      const nominal = segmentMarkerDuration(content, mappings, braceMode, noteDivision, bracketMode);
       const atomCount = braceAtomsText(content).length;
       if (mode === "triplet") {
         duration += (nominal > 1e-8 ? nominal : atomCount * (noteUnit || braceUnit)) * 2 / 3;
@@ -641,10 +790,16 @@ function segmentMarkerDuration(
   return duration;
 }
 
-/** Count sounding atoms without needing key/fifths conversion. */
+/** Count timed atoms without needing key/fifths conversion. */
 function braceAtomsText(text: string): string[] {
   const atoms: string[] = [];
   for (let index = 0; index < text.length;) {
+    if (text[index] === "{" || text[index] === "[") {
+      const closing = text[index] === "{" ? "}" : "]";
+      const end = text.indexOf(closing, index + 1);
+      index = end >= 0 ? end + 1 : index + 1;
+      continue;
+    }
     if (text[index] === "(") {
       const end = text.indexOf(")", index + 1);
       if (end >= 0) {
@@ -653,7 +808,7 @@ function braceAtomsText(text: string): string[] {
         continue;
       }
     }
-    if (/[A-Z1-7]/.test(text[index])) atoms.push(text[index]);
+    if (/[A-Z1-7]/.test(text[index]) || text[index] === "0") atoms.push(text[index]);
     index++;
   }
   return atoms;
@@ -661,7 +816,10 @@ function braceAtomsText(text: string): string[] {
 
 function splitGroups(line: string): string[] {
   const groups = line.split("/");
-  while (groups.length > 0 && groups[groups.length - 1].trim() === "") groups.pop();
+  // Only discard the literal empty field created by a closing slash. A field
+  // containing spaces can be a complete rhythmic group when space has a
+  // configured duration and must survive import/rewrite round trips.
+  while (groups.length > 0 && groups[groups.length - 1] === "") groups.pop();
   return groups;
 }
 
@@ -779,8 +937,11 @@ export function analyzeSlashScore(text: string): SlashScoreAnalysis {
     observedSymbols: observed.symbols,
     containsScoreSpaces: observed.spaces,
     suggestedMappings,
+    multiDurationSymbols: directive.multiDurationSymbols
+      ?? Object.keys(directive.mappings).length > 1,
     suggestedSpaceDivision: spaceDivision,
     suggestedNoteDivision: noteDivision,
+    emptyGroupsAsRests: directive.emptyGroupsAsRests ?? false,
     meter,
     tempoBpm: directive.tempoBpm ?? 90,
     tempoBeatUnit: directive.tempoBeatUnit ?? "quarter",
@@ -792,7 +953,9 @@ export function analyzeSlashScore(text: string): SlashScoreAnalysis {
     lyricist: directive.lyricist,
     suggestedBraceMode: braceMode,
     suggestedBracketMode: bracketMode,
+    ordering: directive.ordering,
     tempoMarks: directive.tempoMarks,
+    noteTimingEdits: directive.noteTimingEdits,
     continuous,
   };
 }
@@ -813,11 +976,15 @@ export function defaultSlashScoreOptions(kind: SlashScoreKind, analysis?: SlashS
     beats: analysis?.meter.beats ?? 4,
     beatType: analysis?.meter.beatType ?? 4,
     symbolDurations: { ...(analysis?.suggestedMappings ?? { ".": 8 }) },
+    multiDurationSymbols: analysis?.multiDurationSymbols ?? false,
     spaceDivision: analysis?.suggestedSpaceDivision ?? null,
     noteDivision: analysis?.suggestedNoteDivision ?? null,
+    emptyGroupsAsRests: analysis?.emptyGroupsAsRests ?? false,
     braceMode: analysis?.suggestedBraceMode ?? "grace",
     bracketMode: analysis?.suggestedBracketMode ?? "triplet",
+    ordering: analysis?.ordering ?? "pitch-asc",
     tempoMarks: analysis?.tempoMarks.map((mark) => ({ ...mark })) ?? [],
+    noteTimingEdits: analysis?.noteTimingEdits.map((edit) => ({ ...edit })) ?? [],
   };
 }
 
@@ -1041,6 +1208,9 @@ function pitchesIn(text: string, options: SlashScoreOptions): number[] {
 interface TimedAtom {
   pitches: number[];
   nominalDuration: number;
+  gracePitches?: number[][];
+  arpeggio?: boolean;
+  arpeggioPitches?: number[];
 }
 
 function timedContainerAtoms(text: string, options: SlashScoreOptions, fallback: number): TimedAtom[] {
@@ -1049,14 +1219,25 @@ function timedContainerAtoms(text: string, options: SlashScoreOptions, fallback:
   const atoms: TimedAtom[] = [];
   const state: { active: TimedAtom | null } = { active: null };
   let leadingDuration = 0;
+  let pendingGrace: number[][] = [];
+  let pendingArpeggio: number[] = [];
 
   const start = (pitches: number[]): void => {
     if (state.active) {
       if (state.active.nominalDuration <= 1e-9) state.active.nominalDuration = fallback;
       atoms.push(state.active);
     }
-    state.active = { pitches, nominalDuration: noteUnit + leadingDuration };
+    const rolled = [...new Set(pendingArpeggio)];
+    state.active = {
+      pitches: rolled.length > 0 ? [...new Set([...rolled, ...pitches])] : pitches,
+      nominalDuration: noteUnit + leadingDuration,
+      gracePitches: pendingGrace.length > 0 ? pendingGrace : undefined,
+      arpeggio: rolled.length > 0 || undefined,
+      arpeggioPitches: rolled.length > 0 ? rolled : undefined,
+    };
     leadingDuration = 0;
+    pendingGrace = [];
+    pendingArpeggio = [];
   };
 
   for (let index = 0; index < text.length;) {
@@ -1076,6 +1257,29 @@ function timedContainerAtoms(text: string, options: SlashScoreOptions, fallback:
         index = end + 1;
         continue;
       }
+    }
+    if (text[index] === "{" || text[index] === "[") {
+      const opening = text[index];
+      const closing = opening === "{" ? "}" : "]";
+      const end = text.indexOf(closing, index + 1);
+      if (end >= 0) {
+        const mode = opening === "{"
+          ? options.braceMode
+          : options.bracketMode ?? "triplet";
+        const pitches = pitchesIn(text.slice(index + 1, end), options);
+        if (mode === "grace" && pitches.length > 0) {
+          pendingGrace.push(pitches);
+        } else if (mode === "arpeggio" && pitches.length > 0) {
+          pendingArpeggio.push(...pitches);
+        }
+        index = end + 1;
+        continue;
+      }
+    }
+    if (text[index] === "0") {
+      start([]);
+      index++;
+      continue;
     }
     const pitch = pitchAt(text, index, options);
     if (pitch) {
@@ -1110,6 +1314,7 @@ function parseGroup(
   group: string,
   absoluteStart: number,
   targetDuration: number,
+  sourceGroupKey: string,
   options: SlashScoreOptions,
   events: TimedEvent[],
   previousEvent: TimedEvent | null,
@@ -1130,6 +1335,7 @@ function parseGroup(
     start: number;
     pitches: number[];
     hadDuration: boolean;
+    durationPieces: number[];
     continuationOf: TimedEvent | null;
     gracePitches: number[][];
     arpeggio: boolean;
@@ -1142,10 +1348,24 @@ function parseGroup(
     let finish = end;
     if (finish <= active.start + 1e-9 && fillIfEmpty) finish = Math.min(targetDuration, active.start + minimumUnit);
     if (finish > active.start + 1e-9) {
+      const total = finish - active.start;
+      const writtenDurations: number[] = [];
+      let written = 0;
+      for (const piece of active.durationPieces) {
+        const available = total - written;
+        if (available <= 1e-9) break;
+        const kept = Math.min(piece, available);
+        if (kept > 1e-9) writtenDurations.push(kept);
+        written += kept;
+      }
+      if (written < total - 1e-9) writtenDurations.push(total - written);
       const event: TimedEvent = {
         start: absoluteStart + active.start,
         end: absoluteStart + Math.min(targetDuration, finish),
         pitches: active.pitches,
+        sourceGroupKey,
+        sourceGroupEnd: absoluteStart + targetDuration,
+        writtenDurations,
       };
       if (active.continuationOf) event.continuationOf = active.continuationOf;
       if (active.gracePitches.length > 0) event.gracePitches = active.gracePitches;
@@ -1161,9 +1381,11 @@ function parseGroup(
 
   const applyIntrinsicDuration = (): void => {
     if (!active || noteUnit === null) return;
+    const before = cursor;
     const finish = cursor + noteUnit;
     if (finish > targetDuration + 1e-8) clipped = true;
     cursor = Math.min(targetDuration, finish);
+    if (cursor > before + 1e-9) active.durationPieces.push(cursor - before);
     active.hadDuration = true;
   };
 
@@ -1193,6 +1415,7 @@ function parseGroup(
       start: Math.max(0, cursor - unattachedDuration),
       pitches,
       hadDuration: unattachedDuration > 1e-9,
+      durationPieces: unattachedDuration > 1e-9 ? [unattachedDuration] : [],
       continuationOf: null,
       gracePitches,
       arpeggio: false,
@@ -1216,6 +1439,7 @@ function parseGroup(
           start: 0,
           pitches: [...previousEvent.pitches],
           hadDuration: false,
+          durationPieces: [],
           continuationOf: previousEvent,
           gracePitches: [],
           arpeggio: false,
@@ -1230,9 +1454,13 @@ function parseGroup(
         start: number;
         pitches: number[];
         hadDuration: boolean;
+        durationPieces: number[];
         continuationOf: TimedEvent | null;
       } | null;
-      if (current) current.hadDuration = true;
+      if (current) {
+        if (cursor > before + 1e-9) current.durationPieces.push(cursor - before);
+        current.hadDuration = true;
+      }
       else unattachedDuration += cursor - before;
       if (before + amount > targetDuration + 1e-8) clipped = true;
       index++;
@@ -1279,7 +1507,15 @@ function parseGroup(
               start: absoluteStart + start,
               end: absoluteStart + finish,
               pitches: atom.pitches,
+              sourceGroupKey,
+              sourceGroupEnd: absoluteStart + targetDuration,
+              writtenDurations: [finish - start],
             };
+            if (atom.gracePitches?.length) event.gracePitches = atom.gracePitches;
+            if (atom.arpeggio) event.arpeggio = true;
+            if (atom.arpeggioPitches?.length) {
+              event.arpeggioPitches = atom.arpeggioPitches;
+            }
             events.push(event);
             lastEvent = event;
           }
@@ -1299,6 +1535,11 @@ function parseGroup(
         continue;
       }
     }
+    if (char === "0") {
+      startNote([]);
+      index++;
+      continue;
+    }
     const pitch = pitchAt(group, index, options);
     if (pitch) {
       startNote([clamp(pitch.pitch, 0, 127)]);
@@ -1316,6 +1557,7 @@ function parseGroup(
     start: number;
     pitches: number[];
     hadDuration: boolean;
+    durationPieces: number[];
     continuationOf: TimedEvent | null;
   } | null;
   if (remaining) {
@@ -1330,6 +1572,9 @@ function parseGroup(
         start: absoluteStart + cursor,
         end: absoluteStart + finish,
         pitches: atom.pitches,
+        sourceGroupKey,
+        sourceGroupEnd: absoluteStart + targetDuration,
+        writtenDurations: [finish - cursor],
       };
       events.push(event);
       lastEvent = event;
@@ -1367,12 +1612,222 @@ function optionsWithDirectives(text: string, base: SlashScoreOptions): SlashScor
     beats: base.beats,
     beatType: base.beatType,
     symbolDurations: { ...base.symbolDurations },
+    multiDurationSymbols: base.multiDurationSymbols
+      ?? directive.multiDurationSymbols
+      ?? false,
     spaceDivision: base.spaceDivision,
     noteDivision: base.noteDivision,
+    emptyGroupsAsRests: base.emptyGroupsAsRests
+      ?? directive.emptyGroupsAsRests
+      ?? false,
     braceMode: base.braceMode,
     bracketMode: base.bracketMode ?? directive.bracketMode ?? "triplet",
+    ordering: base.ordering ?? directive.ordering,
     tempoMarks: base.tempoMarks ?? directive.tempoMarks,
+    noteTimingEdits: base.noteTimingEdits?.length
+      ? base.noteTimingEdits
+      : directive.noteTimingEdits,
   };
+}
+
+function readableQuarterLength(value: number): string {
+  const rounded = Math.round(value * 1000) / 1000;
+  return Number.isInteger(rounded) ? String(rounded) : String(rounded);
+}
+
+/**
+ * Validate the editable slash-score time grid without refusing to render it.
+ * A closed source row is a committed measure and therefore receives an error
+ * when one beat is short/long. The final, not-yet-closed slash group is treated
+ * as live typing instead: only its line number becomes yellow.
+ */
+export function slashScoreDiagnostics(
+  text: string,
+  baseOptions: SlashScoreOptions,
+): SlashScoreDiagnostic[] {
+  const options = optionsWithDirectives(text, baseOptions);
+  const records = sourceLineRecords(text);
+  const selected = records.filter((_record, index) =>
+    selectedScoreLine(records, index, options.kind));
+  if (selected.length === 0) return [];
+
+  const measureLength = options.beats * 4 / options.beatType;
+  const inferred = inferSlashMeter(
+    text,
+    options.symbolDurations,
+    options.spaceDivision,
+    options.braceMode,
+    options.noteDivision,
+    options.bracketMode ?? "triplet",
+    options.kind,
+  );
+  const expectedGroups = groupsForMeter({
+    ...inferred,
+    beats: options.beats,
+    beatType: options.beatType,
+  });
+  const groupDuration = measureLength / Math.max(1, expectedGroups);
+  const wholeMeasureGroups = slashGroupsUseWholeMeasures(
+    selected.map((record) => record.text),
+    options,
+    groupDuration,
+    measureLength,
+  );
+  const continuous = selected.length === 1
+    && !wholeMeasureGroups
+    && splitGroups(selected[0].text).length > expectedGroups;
+  const mappings = effectiveMappings(options);
+  const diagnostics: SlashScoreDiagnostic[] = [];
+  let nextMeasure = 0;
+
+  selected.forEach((record, recordIndex) => {
+    const groups = splitGroups(record.text);
+    const closed = record.text.trimEnd().endsWith("/");
+    const errors: string[] = [];
+    const errorMeasures = new Set<number>();
+    const errorLocations = new Map<string, {
+      measureIndex: number;
+      beatIndex: number | null;
+      beatCount: number;
+    }>();
+    const incompleteMeasures = new Set<number>();
+    const firstHasSound = recordIndex === 0 && groups.some((group) =>
+      groupHasContent(group, options) && !isRestOnlyGroup(group, options));
+    const openingPickup = recordIndex === 0 && firstHasSound && (
+      wholeMeasureGroups || (groups.length > 0 && groups.length < expectedGroups)
+    );
+
+    const measureForGroup = (groupIndex: number): number => {
+      if (wholeMeasureGroups) return nextMeasure + groupIndex;
+      if (continuous) return Math.floor(groupIndex / expectedGroups);
+      return nextMeasure;
+    };
+    const targetForGroup = wholeMeasureGroups ? measureLength : groupDuration;
+    const addErrorLocation = (
+      measureIndex: number,
+      beatIndex: number | null,
+    ): void => {
+      const normalizedBeat = beatIndex !== null
+        && beatIndex >= 0
+        && beatIndex < expectedGroups
+        ? beatIndex
+        : null;
+      errorLocations.set(
+        `${measureIndex}:${normalizedBeat === null ? "*" : normalizedBeat}`,
+        {
+          measureIndex,
+          beatIndex: normalizedBeat,
+          beatCount: Math.max(1, expectedGroups),
+        },
+      );
+    };
+    const beatForGroup = (groupIndex: number): number | null => {
+      if (wholeMeasureGroups) return null;
+      if (continuous) return groupIndex % expectedGroups;
+      return groupIndex < expectedGroups ? groupIndex : null;
+    };
+
+    groups.forEach((group, groupIndex) => {
+      const measureIndex = measureForGroup(groupIndex);
+      let duration = segmentMarkerDuration(
+        group,
+        mappings,
+        options.braceMode,
+        options.noteDivision,
+        options.bracketMode ?? "triplet",
+      );
+      if (isRestOnlyGroup(group, options) || group.length === 0) {
+        duration = targetForGroup;
+      } else if (duration <= 1e-8 && groupHasContent(group, options)) {
+        // A single unmarked pitch inherits the remainder of its slash group.
+        duration = targetForGroup;
+      }
+
+      if (duration > targetForGroup + 1e-8) {
+        errorMeasures.add(measureIndex);
+        addErrorLocation(measureIndex, beatForGroup(groupIndex));
+        errors.push(
+          `第 ${groupIndex + 1} 拍写了 ${readableQuarterLength(duration)} 个四分音符，`
+          + `超过 ${readableQuarterLength(targetForGroup)} 个四分音符`,
+        );
+        return;
+      }
+      if (duration >= targetForGroup - 1e-8) return;
+      if (openingPickup && measureIndex === 0) return;
+      const liveFinalGroup = !closed && groupIndex === groups.length - 1;
+      if (liveFinalGroup) {
+        incompleteMeasures.add(measureIndex);
+      } else {
+        errorMeasures.add(measureIndex);
+        addErrorLocation(measureIndex, beatForGroup(groupIndex));
+        errors.push(
+          `第 ${groupIndex + 1} 拍只有 ${readableQuarterLength(duration)} 个四分音符，`
+          + `应为 ${readableQuarterLength(targetForGroup)} 个四分音符`,
+        );
+      }
+    });
+
+    if (!wholeMeasureGroups) {
+      const remainder = continuous ? groups.length % expectedGroups : groups.length;
+      const structurallyShort = remainder > 0 && remainder < expectedGroups;
+      if (structurallyShort && !openingPickup) {
+        const measureIndex = continuous
+          ? Math.floor(groups.length / expectedGroups)
+          : nextMeasure;
+        if (!closed) {
+          incompleteMeasures.add(measureIndex);
+        } else {
+          errorMeasures.add(measureIndex);
+          for (let beat = remainder; beat < expectedGroups; beat++) {
+            addErrorLocation(measureIndex, beat);
+          }
+          errors.push(`小节只有 ${remainder}/${expectedGroups} 个拍组`);
+        }
+      }
+      if (!continuous && groups.length > expectedGroups) {
+        errorMeasures.add(nextMeasure);
+        addErrorLocation(nextMeasure, null);
+        errors.push(`一行包含 ${groups.length} 个拍组，当前拍号只允许 ${expectedGroups} 个`);
+      }
+    }
+
+    if (!closed && errors.length === 0) {
+      incompleteMeasures.add(measureForGroup(Math.max(0, groups.length - 1)));
+    }
+
+    if (errors.length > 0) {
+      diagnostics.push({
+        severity: "error",
+        line: record.line,
+        from: record.from,
+        to: record.to,
+        measureIndices: [...errorMeasures].sort((left, right) => left - right),
+        beatLocations: errorLocations.size > 0
+          ? [...errorLocations.values()]
+          : [...errorMeasures].map((measureIndex) => ({
+            measureIndex,
+            beatIndex: null,
+            beatCount: Math.max(1, expectedGroups),
+          })),
+        message: `第 ${record.line} 行小节时值错误：${errors.slice(0, 2).join("；")}`,
+      });
+    } else if (incompleteMeasures.size > 0) {
+      diagnostics.push({
+        severity: "incomplete",
+        line: record.line,
+        from: record.from,
+        to: record.to,
+        measureIndices: [...incompleteMeasures].sort((left, right) => left - right),
+        beatLocations: [],
+        message: `第 ${record.line} 行正在输入：当前拍尚未用 / 完成`,
+      });
+    }
+
+    if (wholeMeasureGroups) nextMeasure += groups.length;
+    else if (continuous) nextMeasure = Math.ceil(groups.length / expectedGroups);
+    else nextMeasure++;
+  });
+  return diagnostics;
 }
 
 function splitTimedEventsByVoice(
@@ -1494,6 +1949,265 @@ function splitTimedEventsByVoice(
     Number(Boolean(left.continuationOf)) - Number(Boolean(right.continuationOf)));
 }
 
+function sameTimedPitches(left: TimedEvent, right: TimedEvent): boolean {
+  const a = [...left.pitches].sort((x, y) => x - y);
+  const b = [...right.pitches].sort((x, y) => x - y);
+  return a.length > 0 && a.length === b.length
+    && a.every((pitch, index) => pitch === b[index]);
+}
+
+function continuationRoot(event: TimedEvent): TimedEvent {
+  let result = event;
+  const visited = new Set<TimedEvent>();
+  while (result.continuationOf && !visited.has(result)) {
+    visited.add(result);
+    result = result.continuationOf;
+  }
+  return result;
+}
+
+const METRICAL_DURATION_VALUES = [
+  { value: 4, alignment: 4 },
+  { value: 3, alignment: 4 },
+  { value: 2, alignment: 2 },
+  { value: 1.5, alignment: 2 },
+  { value: 1, alignment: 1 },
+  { value: 0.75, alignment: 1 },
+  { value: 0.5, alignment: 0.5 },
+  { value: 0.375, alignment: 0.5 },
+  { value: 0.25, alignment: 0.25 },
+  { value: 0.1875, alignment: 0.25 },
+  { value: 0.125, alignment: 0.125 },
+  { value: 0.09375, alignment: 0.125 },
+  { value: 0.0625, alignment: 0.0625 },
+] as const;
+
+/**
+ * Return only the internal starts required to spell one sustained sound
+ * metrically. A half/whole note on its legal beat has no internal boundary;
+ * an off-beat or bar-crossing value receives the minimum readable tie chain.
+ */
+function metricalContinuationStarts(
+  start: number,
+  end: number,
+  measureDuration: number,
+  beatDuration: number,
+): number[] {
+  const starts: number[] = [];
+  let cursor = Math.round(start * 192) / 192;
+  const final = Math.round(end * 192) / 192;
+  let guard = 0;
+  while (cursor < final - 1e-8 && guard++ < 4096) {
+    const measureIndex = Math.max(0, Math.floor((cursor + 1e-8) / measureDuration));
+    const measureStart = measureIndex * measureDuration;
+    const measureEnd = measureStart + measureDuration;
+    const available = Math.min(final, measureEnd) - cursor;
+    const local = cursor - measureStart;
+    const beatIndex = Math.floor((local + 1e-8) / beatDuration);
+    const nextBeat = Math.min(measureDuration, (beatIndex + 1) * beatDuration);
+    const availableInBeat = Math.max(0, nextBeat - local);
+    const written = METRICAL_DURATION_VALUES.find((candidate) => {
+      const cell = local / candidate.alignment;
+      return candidate.value <= available + 1e-8
+        && (
+          Math.abs(cell - Math.round(cell)) <= 1e-8
+          || candidate.value <= availableInBeat + 1e-8
+        );
+    });
+    const value = written?.value ?? Math.min(available, 1 / 16);
+    if (value <= 1e-9) break;
+    cursor = Math.round((cursor + value) * 192) / 192;
+    if (cursor < final - 1e-8) starts.push(cursor);
+  }
+  return starts;
+}
+
+function splitVoicedWrittenDurations(
+  events: readonly TimedEvent[],
+  options: SlashScoreOptions,
+): TimedEvent[] {
+  if (options.voiceCount <= 1) return [...events];
+  const result: TimedEvent[] = [];
+  const firstByOriginal = new Map<TimedEvent, TimedEvent>();
+
+  for (const event of events) {
+    const total = event.end - event.start;
+    if (total <= 1e-9) continue;
+    let requested = event.writtenDurations?.filter((value) => value > 1e-9) ?? [total];
+    const groupEdge = event.sourceGroupEnd;
+    if (groupEdge !== undefined
+      && groupEdge > event.start + 1e-9
+      && groupEdge < event.end - 1e-9) {
+      // A slash boundary is stronger than the adjacent intrinsic/symbol
+      // contributions. Keep the attack readable up to that boundary, then
+      // continue it faintly on the next group.
+      requested = [groupEdge - event.start, event.end - groupEdge];
+    }
+
+    const pieces: number[] = [];
+    let remaining = total;
+    for (const value of requested) {
+      if (remaining <= 1e-9) break;
+      const kept = Math.min(value, remaining);
+      if (kept > 1e-9) pieces.push(kept);
+      remaining -= kept;
+    }
+    if (remaining > 1e-9) pieces.push(remaining);
+    if (pieces.length === 0) pieces.push(total);
+
+    let cursor = event.start;
+    const first: TimedEvent = {
+      ...event,
+      end: cursor + pieces[0],
+      writtenDurations: [pieces[0]],
+    };
+    firstByOriginal.set(event, first);
+    result.push(first);
+    cursor = first.end;
+    let previous = first;
+    for (const duration of pieces.slice(1)) {
+      const continuation: TimedEvent = {
+        ...event,
+        start: cursor,
+        end: cursor + duration,
+        writtenDurations: [duration],
+        continuationOf: previous,
+        sourcePitchContinuation: undefined,
+        syntheticContinuation: true,
+        gracePitches: undefined,
+        arpeggio: false,
+        arpeggioPitches: undefined,
+      };
+      result.push(continuation);
+      previous = continuation;
+      cursor = continuation.end;
+    }
+  }
+
+  for (const event of events) {
+    if (!event.continuationOf) continue;
+    const first = firstByOriginal.get(event);
+    if (first) first.continuationOf = firstByOriginal.get(event.continuationOf)
+      ?? event.continuationOf;
+  }
+  return result.sort((left, right) =>
+    left.start - right.start
+    || (left.voiceIndex ?? 0) - (right.voiceIndex ?? 0)
+    || Number(Boolean(left.continuationOf)) - Number(Boolean(right.continuationOf)));
+}
+
+/**
+ * TXT has one public time axis, while every marked voice sustains independently.
+ * Preserve an explicitly repeated pitch as a written gray continuation inside
+ * the same slash group, and add a source-less continuation at the group edge
+ * when a voice has to ring into the next group. A same pitch in a later slash
+ * group or measure remains a new black attack.
+ */
+function addIndependentVoiceContinuations(
+  events: readonly TimedEvent[],
+  options: SlashScoreOptions,
+  measures: number,
+): TimedEvent[] {
+  if (options.voiceCount <= 1) return [...events];
+  const result = [...events];
+  const removed = new Set<TimedEvent>();
+  const measureDuration = options.beats * 4 / options.beatType;
+  const compound = options.beatType === 8
+    && options.beats >= 6
+    && options.beats % 3 === 0;
+  const groupsPerMeasure = Math.max(1, compound ? options.beats / 3 : options.beats);
+  const groupDuration = measureDuration / groupsPerMeasure;
+  const scoreEnd = Math.max(measureDuration, measures * measureDuration);
+  const gridGroupKey = (time: number): string => {
+    const measure = Math.max(0, Math.floor((time + 1e-8) / measureDuration));
+    const local = time - measure * measureDuration;
+    const group = Math.max(0, Math.floor((local + 1e-8) / groupDuration));
+    return `${measure}:${group}`;
+  };
+  const eventGroupKey = (event: TimedEvent): string =>
+    event.sourceGroupKey ?? gridGroupKey(event.start);
+
+  for (let voice = 0; voice < options.voiceCount; voice++) {
+    const ordered = result
+      .filter((event) => (event.voiceIndex ?? options.voiceCount - 1) === voice)
+      .sort((left, right) =>
+        left.start - right.start
+        || Number(Boolean(left.continuationOf)) - Number(Boolean(right.continuationOf)));
+
+    let previousWrittenAttack: TimedEvent | null = null;
+    for (const event of ordered) {
+      if (event.continuationOf) continue;
+      if (previousWrittenAttack
+        && eventGroupKey(previousWrittenAttack) === eventGroupKey(event)
+        && sameTimedPitches(previousWrittenAttack, event)) {
+        event.continuationOf = previousWrittenAttack;
+        event.sourcePitchContinuation = true;
+      }
+      previousWrittenAttack = event;
+    }
+
+    const attacks = ordered.filter((event) => !event.continuationOf);
+    attacks.forEach((attack, index) => {
+      const nextStart = attacks[index + 1]?.start ?? scoreEnd;
+      let chain = result.filter((event) =>
+        event !== attack
+        && (event.voiceIndex ?? options.voiceCount - 1) === voice
+        && continuationRoot(event) === attack
+        && event.start > attack.start + 1e-8
+        && event.start < nextStart - 1e-8);
+      const requiredStarts = metricalContinuationStarts(
+        attack.start,
+        nextStart,
+        measureDuration,
+        groupDuration,
+      );
+      const requiredKey = new Set(requiredStarts.map((value) => Math.round(value * 192)));
+
+      // A repeated spelling of the same voice/pitch describes one sustained
+      // sound. Keep a visible continuation only at a boundary required by the
+      // metric spelling. Inside one beat, adjacent sixteenths therefore merge
+      // into an eighth/dotted eighth even when both source tokens exist.
+      for (const continuation of chain) {
+        if (!requiredKey.has(Math.round(continuation.start * 192))) {
+          removed.add(continuation);
+        }
+      }
+      chain = chain.filter((continuation) => !removed.has(continuation));
+
+      for (const start of requiredStarts) {
+        const hasStart = chain.some((continuation) =>
+          Math.abs(continuation.start - start) <= 1e-8);
+        if (hasStart) continue;
+        const parent = [...chain]
+          .filter((continuation) => continuation.start < start - 1e-8)
+          .sort((left, right) => right.start - left.start)[0] ?? attack;
+        const continuation: TimedEvent = {
+          start,
+          end: nextStart,
+          pitches: [...attack.pitches],
+          sourceGroupKey: attack.sourceGroupKey,
+          sourceGroupEnd: attack.sourceGroupEnd,
+          voiceIndex: voice,
+          continuationOf: parent,
+          syntheticContinuation: true,
+        };
+        result.push(continuation);
+        chain.push(continuation);
+      }
+      chain.sort((left, right) => left.start - right.start);
+      attack.end = chain[0]?.start ?? nextStart;
+      chain.forEach((continuation, chainIndex) => {
+        continuation.end = chain[chainIndex + 1]?.start ?? nextStart;
+      });
+    });
+  }
+
+  return result.filter((event) => !removed.has(event)).sort((left, right) =>
+    left.start - right.start
+    || (left.voiceIndex ?? 0) - (right.voiceIndex ?? 0)
+    || Number(Boolean(left.continuationOf)) - Number(Boolean(right.continuationOf)));
+}
+
 function parsedMidiFromEvents(events: TimedEvent[], measures: number, options: SlashScoreOptions): ParsedMidi {
   const ppq = 960;
   const notes: ParsedMidiNote[] = [];
@@ -1593,9 +2307,13 @@ function equalPitches(left: readonly number[], right: readonly number[]): boolea
 }
 
 function linkContinuation(left: Chord, right: Chord): void {
+  if (left === right) return;
+  const used = new Set<Note>();
   for (const next of right.notes) {
-    const previous = left.notes.find((note) => !note.rest && note.pitch === next.pitch);
+    const previous = left.notes.find((note) =>
+      !note.rest && note.pitch === next.pitch && !used.has(note));
     if (!previous || next.rest) continue;
+    used.add(previous);
     previous.tieStart = true;
     previous.tieNext = next;
     next.tieEnd = true;
@@ -1626,6 +2344,7 @@ function applySlashContinuations(score: Score, events: readonly TimedEvent[]): v
   chords.sort((a, b) => a.start - b.start || a.end - b.end);
 
   const eventLastChord = new Map<TimedEvent, Chord>();
+  const sourceBackedContinuations = new Set<Chord>();
   for (const event of events) {
     const pitches = [...event.pitches].sort((a, b) => a - b);
     const voice = clamp(event.voiceIndex ?? 0, 0, Math.max(0, score.parts.length - 1));
@@ -1650,13 +2369,22 @@ function applySlashContinuations(score: Score, events: readonly TimedEvent[]): v
     if (matching.length === 0) continue;
 
     if (event.continuationOf) {
-      let previous = eventLastChord.get(event.continuationOf) ??
+      const rootEvent = continuationRoot(event);
+      let previous = eventLastChord.get(event.continuationOf)
+        ?? eventLastChord.get(rootEvent)
+        ??
         [...chords].reverse().find((item) =>
           item.partIndex === voice &&
           Math.abs(item.end - event.start) <= 1e-8 &&
           equalPitches(item.pitches, pitches))?.chord ?? null;
-      for (const item of matching) {
+      for (let index = 0; index < matching.length; index++) {
+        const item = matching[index];
         item.chord.transparentContinuation = true;
+        item.chord.generatedTimingContinuation =
+          !(event.sourcePitchContinuation && index === 0);
+        if (event.sourcePitchContinuation && index === 0) {
+          sourceBackedContinuations.add(item.chord);
+        }
         // A continuation split into several notated values is one tie chain,
         // not the generic slur used by the MIDI readability simplifier.
         item.chord.slurStart = false;
@@ -1665,8 +2393,56 @@ function applySlashContinuations(score: Score, events: readonly TimedEvent[]): v
         if (previous) linkContinuation(previous, item.chord);
         previous = item.chord;
       }
+      eventLastChord.set(rootEvent, matching[matching.length - 1].chord);
     }
     eventLastChord.set(event, matching[matching.length - 1].chord);
+  }
+
+  // Preserve which MIDI-written pieces are continuation tails before replacing
+  // the provisional links. Rebuilding them chronologically avoids self-links or
+  // backward cycles when a voice has both source-duration and group-edge splits.
+  for (const item of chords) {
+    const sounding = item.chord.notes.filter((note) => !note.rest);
+    if (sounding.length > 0
+      && sounding.every((note) => note.tieEnd && note.tiePrev !== null)) {
+      item.chord.transparentContinuation = true;
+    }
+  }
+  for (const item of chords) {
+    for (const note of item.chord.notes) {
+      note.tieStart = false;
+      note.tieEnd = false;
+      note.tiePrev = null;
+      note.tieNext = null;
+    }
+  }
+  for (const item of chords) {
+    if (!item.chord.transparentContinuation) continue;
+    const adjacent = [...chords].reverse().find((candidate) =>
+      candidate.partIndex === item.partIndex
+      && candidate.chord !== item.chord
+      && candidate.start < item.start - 1e-8
+      && Math.abs(candidate.end - item.start) <= 1e-8);
+    // Never search past a more recent different attack merely because an
+    // older chord happens to have the same pitch. A tie may continue only the
+    // immediately adjacent sounding event in this voice.
+    if (adjacent && equalPitches(adjacent.pitches, item.pitches)) {
+      linkContinuation(adjacent.chord, item.chord);
+      item.chord.slurStart = false;
+      item.chord.slurEnd = false;
+      item.chord.slurEndChord = null;
+    } else {
+      item.chord.transparentContinuation = false;
+      item.chord.generatedTimingContinuation = false;
+    }
+  }
+
+  // Only an explicitly repeated source pitch owns a text range; every other
+  // tied tail is generated, gray, and excluded from text-selection matching.
+  for (const item of chords) {
+    if (!item.chord.transparentContinuation) continue;
+    item.chord.generatedTimingContinuation =
+      !sourceBackedContinuations.has(item.chord);
   }
 }
 
@@ -1745,7 +2521,7 @@ function applySlashTempoMarks(score: Score, marks: readonly SlashTempoMark[]): v
 
 function finestQuantize(options: SlashScoreOptions): MidiQuantizeDivision {
   let division = Math.max(4, options.noteDivision ?? 4, ...Object.values(effectiveMappings(options))) as SlashDurationDivision;
-  if (options.braceMode !== "arpeggio" || (options.bracketMode ?? "triplet") !== "arpeggio") {
+  if (options.braceMode === "subdivide" || (options.bracketMode ?? "triplet") === "subdivide") {
     division = Math.min(64, division * 2) as SlashDurationDivision;
   }
   return DIVISIONS.includes(division) ? division : 64;
@@ -1896,6 +2672,7 @@ export function parseSlashScore(text: string, baseOptions: SlashScoreOptions): S
   let previousEvent: TimedEvent | null = null;
   let clippedGroups = 0;
   let ignoredCharacters = 0;
+  const diagnostics = slashScoreDiagnostics(text, options);
   const warnings: string[] = [];
   if (wholeMeasureGroups) warnings.push("已按音符和空格自身时值，将每个 / 分段识别为一小节");
 
@@ -1912,6 +2689,7 @@ export function parseSlashScore(text: string, baseOptions: SlashScoreOptions): S
         group,
         measureIndex * measureLength + groupStart,
         target,
+        `${measureIndex}:${groupIndex}`,
         options,
         events,
         previousEvent,
@@ -1955,7 +2733,14 @@ export function parseSlashScore(text: string, baseOptions: SlashScoreOptions): S
   if (strayMarkers > 0) warnings.push(`${strayMarkers} 个后面没有音高的声部标记已忽略`);
 
   if (!wholeMeasureGroups && lines.score.length === 1 && logicalMeasures.length > 1) warnings.push(`原文没有小节换行，已按 ${options.beats}/${options.beatType} 自动分成 ${logicalMeasures.length} 小节`);
-  const voicedEvents = splitTimedEventsByVoice(text, options, events);
+  const voicedEvents = addIndependentVoiceContinuations(
+    splitVoicedWrittenDurations(
+      splitTimedEventsByVoice(text, options, events),
+      options,
+    ),
+    options,
+    logicalMeasures.length,
+  );
   const parsed = parsedMidiFromEvents(voicedEvents, logicalMeasures.length, options);
   const instrumentName = options.instrumentName?.trim() || "钢琴";
   const midiOptions: MidiImportOptions = {
@@ -1982,6 +2767,7 @@ export function parseSlashScore(text: string, baseOptions: SlashScoreOptions): S
         voice: voice + 1,
       }))
       : undefined,
+    preserveSourceRhythmSpelling: true,
   };
   const imported = midiToScore(parsed, midiOptions);
   if (options.voiceCount === 2) {
@@ -2025,6 +2811,7 @@ export function parseSlashScore(text: string, baseOptions: SlashScoreOptions): S
     // can pull following systems back into usable space on the previous page.
     measure.newPage = false;
   }));
+  applyNoteTimingEdits(imported.score, options.noteTimingEdits ?? [], "slash");
   return {
     score: imported.score,
     summary: {
@@ -2036,6 +2823,7 @@ export function parseSlashScore(text: string, baseOptions: SlashScoreOptions): S
       ignoredTags: lines.ignoredTags,
       clippedGroups,
       ignoredCharacters,
+      diagnostics,
       warnings,
     },
   };
@@ -2102,6 +2890,7 @@ function measureEvents(score: Score, measureIndex: number): OutputEvent[] {
   const grouped = new Map<number, {
     start: number;
     attackEnds: number[];
+    restEnds: number[];
     continuationEnds: number[];
     chords: Chord[];
     voiceIndexes: number[];
@@ -2111,7 +2900,8 @@ function measureEvents(score: Score, measureIndex: number): OutputEvent[] {
     const measure = part.measures[measureIndex];
     if (!measure) continue;
     for (const entry of measure.entries) {
-      if (!(entry instanceof Chord) || entry.rest || entry.notes.every((note) => note.rest)) continue;
+      if (!(entry instanceof Chord)) continue;
+      const rest = entry.rest || entry.notes.every((note) => note.rest);
       const sounding = entry.notes.filter((note) => !note.rest);
       // A transparent slash continuation or an explicit JPW tie-stop advances
       // the common time axis but must not become a new keyboard/number attack.
@@ -2126,12 +2916,15 @@ function measureEvents(score: Score, measureIndex: number): OutputEvent[] {
       const item = grouped.get(key) ?? {
         start,
         attackEnds: [],
+        restEnds: [],
         continuationEnds: [],
         chords: [],
         voiceIndexes: [],
       };
-      if (continuation) {
+      if (entry.generatedTimingContinuation || continuation) {
         item.continuationEnds.push(start + duration);
+      } else if (rest) {
+        item.restEnds.push(start + duration);
       } else {
         item.attackEnds.push(start + duration);
         item.chords.push(entry);
@@ -2142,7 +2935,7 @@ function measureEvents(score: Score, measureIndex: number): OutputEvent[] {
   }
   return [...grouped.values()]
     .map((item): OutputEvent => {
-      const ends = [...item.attackEnds, ...item.continuationEnds];
+      const ends = [...item.attackEnds, ...item.restEnds, ...item.continuationEnds];
       return {
         start: item.start,
         // Multiple voices can overlap for different lengths. The slash text
@@ -2151,45 +2944,177 @@ function measureEvents(score: Score, measureIndex: number): OutputEvent[] {
         end: Math.max(item.start + 1 / 192, ...ends),
         chords: item.chords,
         voiceIndexes: item.voiceIndexes,
-        specialToken: item.chords.length === 0 ? "" : undefined,
+        specialToken: item.chords.length === 0
+          ? item.restEnds.length > 0 ? "0" : ""
+          : undefined,
       };
     })
     .sort((a, b) => a.start - b.start);
 }
 
-function outputToken(event: OutputEvent, kind: SlashScoreKind, fifths: number, voiceCount = 1): string {
-  if (event.specialToken !== undefined) return event.specialToken;
-  if (event.explicitPitches) return pitchesToken(event.explicitPitches, kind, fifths);
-  if (voiceCount > 1 && event.voiceIndexes?.length === event.chords.length) {
-    const values = event.chords.flatMap((chord, chordIndex) => {
-      const voice = clamp(event.voiceIndexes![chordIndex], 1, voiceCount);
-      const prefix = voice === voiceCount ? "" : SLASH_VOICE_SEPARATOR.repeat(voice);
-      return chord.notes
-        .filter((note) => !note.rest)
-        .sort((left, right) => left.pitch - right.pitch)
-        .map((note) => prefix + (kind === "keyboard"
-          ? keyboardPitchValue(note.pitch, fifths)
-          : numericPitchValue(note.pitch, fifths)));
-    });
-    return values.length === 1 ? values[0] : `(${values.join("")})`;
+function compareOutputPitch(
+  left: { pitch: number; voice: number; order: number },
+  right: { pitch: number; voice: number; order: number },
+  ordering: MidiSlashOrdering,
+): number {
+  if (ordering === "voice-asc" || ordering === "voice-desc") {
+    const voice = ordering === "voice-asc"
+      ? left.voice - right.voice
+      : right.voice - left.voice;
+    if (voice !== 0) return voice;
+    return left.pitch - right.pitch || left.order - right.order;
   }
-  const notes = event.chords.flatMap((chord) => chord.notes.filter((note) => !note.rest));
-  const fake = event.chords[0];
-  if (!fake) return "";
-  const unique = new Map<number, Chord["notes"][number]>();
-  for (const note of notes) unique.set(note.pitch, note);
-  const values = [...unique.values()].sort((a, b) => a.pitch - b.pitch)
-    .map((note) => kind === "keyboard" ? keyboardPitchValue(note.pitch, fifths) : numericPitchValue(note.pitch, fifths));
-  return values.length === 1 ? values[0] : `(${values.join("")})`;
+  const pitch = ordering === "pitch-desc"
+    ? right.pitch - left.pitch
+    : left.pitch - right.pitch;
+  return pitch || left.voice - right.voice || left.order - right.order;
 }
 
-function pitchValues(pitches: readonly number[], kind: SlashScoreKind, fifths: number): string[] {
-  return [...new Set(pitches)].sort((a, b) => a - b)
+function outputToken(
+  event: OutputEvent,
+  kind: SlashScoreKind,
+  fifths: number,
+  voiceCount = 1,
+  ordering: MidiSlashOrdering = "pitch-asc",
+  groups: Pick<MidiSlashExportOptions, "braceMode" | "bracketMode"> = {
+    braceMode: "grace",
+    bracketMode: "triplet",
+  },
+): string {
+  if (event.specialToken !== undefined) return event.specialToken;
+  let token = "";
+  if (event.explicitPitches) {
+    token = pitchesToken(event.explicitPitches, kind, fifths, ordering === "pitch-desc");
+  } else if (voiceCount > 1 && event.voiceIndexes?.length === event.chords.length) {
+    const values = event.chords.flatMap((chord, chordIndex) => {
+      const voice = clamp(event.voiceIndexes![chordIndex], 1, voiceCount);
+      return chord.notes
+        .filter((note) => !note.rest)
+        .map((note, noteIndex) => ({
+          pitch: note.pitch,
+          voice,
+          order: chordIndex * 1000 + noteIndex,
+        }));
+    }).sort((left, right) => compareOutputPitch(left, right, ordering))
+      .map(({ pitch, voice }) => {
+        const prefix = voice === voiceCount ? "" : SLASH_VOICE_SEPARATOR.repeat(voice);
+        return prefix + (kind === "keyboard"
+          ? keyboardPitchValue(pitch, fifths)
+          : numericPitchValue(pitch, fifths));
+      });
+    token = values.length === 1 ? values[0] : `(${values.join("")})`;
+  } else {
+    const notes = event.chords.flatMap((chord) => chord.notes.filter((note) => !note.rest));
+    const fake = event.chords[0];
+    if (!fake) return "";
+    const unique = new Map<number, Chord["notes"][number]>();
+    for (const note of notes) unique.set(note.pitch, note);
+    const values = [...unique.values()].sort((a, b) =>
+      ordering === "pitch-desc" ? b.pitch - a.pitch : a.pitch - b.pitch)
+      .map((note) => kind === "keyboard" ? keyboardPitchValue(note.pitch, fifths) : numericPitchValue(note.pitch, fifths));
+    token = values.length === 1 ? values[0] : `(${values.join("")})`;
+  }
+
+  const rolled = [...new Set(event.chords.flatMap((chord) =>
+    chord.arpeggio
+      ? chord.arpeggioPitches ?? chord.notes.filter((note) => !note.rest).map((note) => note.pitch)
+      : []))];
+  const arpeggioDelimiter = delimiterFor("arpeggio", groups);
+  if (rolled.length > 0 && arpeggioDelimiter) {
+    const rolledSet = new Set(rolled);
+    const retained = eventPitches(event).filter((pitch) => !rolledSet.has(pitch));
+    token = `${arpeggioDelimiter[0]}${
+      voicedPitchesToken(rolled, event, kind, fifths, voiceCount, ordering)
+    }${arpeggioDelimiter[1]}${
+      voicedPitchesToken(retained, event, kind, fifths, voiceCount, ordering)
+    }`;
+  }
+
+  const grace = event.chords.flatMap((chord) =>
+    chord.graceNotes.filter((note) => !note.rest).map((note) => note.pitch));
+  const graceDelimiter = delimiterFor("grace", groups);
+  if (grace.length > 0 && graceDelimiter) {
+    token = `${graceDelimiter[0]}${
+      voicedPitchesToken(grace, event, kind, fifths, voiceCount, ordering)
+    }${graceDelimiter[1]}${token}`;
+  }
+  return token;
+}
+
+/**
+ * Serialize one slash group on the configured base grid while using a
+ * subdivision container only for cells that contain an attack halfway
+ * through the base value.  For example, with "." = 16th, `[AB]` represents
+ * two 32nd-note attacks without changing the persisted meaning of ".".
+ */
+function subdividedGroupText(
+  events: readonly OutputEvent[],
+  start: number,
+  end: number,
+  baseUnit: number,
+  symbol: string,
+  subdivisionMode: "brace" | "bracket",
+  kind: SlashScoreKind,
+  fifths: number,
+  voiceCount: number,
+  ordering: MidiSlashOrdering,
+  groups: Pick<MidiSlashExportOptions, "braceMode" | "bracketMode">,
+): string {
+  const [opening, closing] = subdivisionMode === "brace"
+    ? ["{", "}"] as const
+    : ["[", "]"] as const;
+  const fineUnit = baseUnit / 2;
+  const fineCellCount = Math.max(2, Math.round((end - start) / fineUnit));
+  const byFineCell = new Map<number, OutputEvent>();
+  for (const event of events) {
+    const fineCell = Math.round((Math.max(start, event.start) - start) / fineUnit);
+    if (fineCell < 0 || fineCell >= fineCellCount) continue;
+    const aligned = start + fineCell * fineUnit;
+    if (Math.abs(event.start - aligned) > fineUnit * 0.24 && !event.continued) continue;
+    const previous = byFineCell.get(fineCell);
+    if (!previous || (previous.continued && !event.continued)) {
+      byFineCell.set(fineCell, event);
+    }
+  }
+
+  const tokenAt = (fineCell: number): string => {
+    const event = byFineCell.get(fineCell);
+    if (!event || event.continued) return "";
+    return outputToken(event, kind, fifths, voiceCount, ordering, groups);
+  };
+
+  let out = "";
+  for (let fineCell = 0; fineCell < fineCellCount; fineCell += 2) {
+    const first = tokenAt(fineCell);
+    const second = tokenAt(fineCell + 1);
+    if (second) {
+      // A zero atom advances the first half-cell when no sound begins there.
+      // It is timeline padding only; per-voice sustain is rebuilt separately.
+      out += `${opening}${first || "0"}${second}${closing}`;
+    } else {
+      out += first + symbol;
+    }
+  }
+  return out;
+}
+
+function pitchValues(
+  pitches: readonly number[],
+  kind: SlashScoreKind,
+  fifths: number,
+  descending = false,
+): string[] {
+  return [...new Set(pitches)].sort((a, b) => descending ? b - a : a - b)
     .map((pitch) => kind === "keyboard" ? keyboardPitchValue(pitch, fifths) : numericPitchValue(pitch, fifths));
 }
 
-function pitchesToken(pitches: readonly number[], kind: SlashScoreKind, fifths: number): string {
-  const values = pitchValues(pitches, kind, fifths);
+function pitchesToken(
+  pitches: readonly number[],
+  kind: SlashScoreKind,
+  fifths: number,
+  descending = false,
+): string {
+  const values = pitchValues(pitches, kind, fifths, descending);
   return values.length <= 1 ? values[0] ?? "" : `(${values.join("")})`;
 }
 
@@ -2209,16 +3134,23 @@ function voicedPitchesToken(
   kind: SlashScoreKind,
   fifths: number,
   voiceCount: number,
+  ordering: MidiSlashOrdering,
 ): string {
-  if (voiceCount <= 1) return pitchesToken(pitches, kind, fifths);
-  const values = [...new Set(pitches)].sort((left, right) => left - right).map((pitch) => {
-    const voice = eventVoiceForPitch(event, pitch, voiceCount);
-    const prefix = voice === voiceCount ? "" : SLASH_VOICE_SEPARATOR.repeat(voice);
-    const value = kind === "keyboard"
-      ? keyboardPitchValue(pitch, fifths)
-      : numericPitchValue(pitch, fifths);
-    return prefix + value;
-  });
+  if (voiceCount <= 1) {
+    return pitchesToken(pitches, kind, fifths, ordering === "pitch-desc");
+  }
+  const values = [...new Set(pitches)].map((pitch, order) => ({
+    pitch,
+    voice: eventVoiceForPitch(event, pitch, voiceCount),
+    order,
+  })).sort((left, right) => compareOutputPitch(left, right, ordering))
+    .map(({ pitch, voice }) => {
+      const prefix = voice === voiceCount ? "" : SLASH_VOICE_SEPARATOR.repeat(voice);
+      const value = kind === "keyboard"
+        ? keyboardPitchValue(pitch, fifths)
+        : numericPitchValue(pitch, fifths);
+      return prefix + value;
+    });
   return values.length <= 1 ? values[0] ?? "" : `(${values.join("")})`;
 }
 
@@ -2305,6 +3237,7 @@ function applyMidiSlashGestures(
   division: SlashDurationDivision,
   symbol: string,
   voiceCount: number,
+  ordering: MidiSlashOrdering,
 ): OutputEvent[] {
   const unit = 4 / division;
   const measureEnd = measureStart + measureLength;
@@ -2324,10 +3257,17 @@ function applyMidiSlashGestures(
       const rolled = new Set(rolledPitches);
       const extra = eventPitches(target).filter((pitch) => !rolled.has(pitch));
       const atoms = gesture.events
-        .map((event) => voicedPitchesToken(event.pitches, target, kind, fifths, voiceCount))
+        .map((event) => voicedPitchesToken(
+          event.pitches,
+          target,
+          kind,
+          fifths,
+          voiceCount,
+          ordering,
+        ))
         .join("");
       target.specialToken = `${opening}${atoms}${closing}` +
-        voicedPitchesToken(extra, target, kind, fifths, voiceCount);
+        voicedPitchesToken(extra, target, kind, fifths, voiceCount, ordering);
       continue;
     }
 
@@ -2340,10 +3280,17 @@ function applyMidiSlashGestures(
       const retained = eventPitches(target).filter((pitch) =>
         mainPitches.has(pitch) || !gracePitches.has(pitch));
       const graceText = graceEvents
-        .map((event) => voicedPitchesToken(event.pitches, target, kind, fifths, voiceCount))
+        .map((event) => voicedPitchesToken(
+          event.pitches,
+          target,
+          kind,
+          fifths,
+          voiceCount,
+          ordering,
+        ))
         .join("");
       target.specialToken = `${opening}${graceText}${closing}` +
-        voicedPitchesToken(retained, target, kind, fifths, voiceCount);
+        voicedPitchesToken(retained, target, kind, fifths, voiceCount, ordering);
       for (const source of graceEvents) {
         const quantized = Math.round(source.start / unit) * unit - measureStart;
         const separate = nearestEvent(events, quantized, unit * 0.2);
@@ -2367,7 +3314,14 @@ function applyMidiSlashGestures(
       const atoms = gesture.events.map((source, index) => {
         const matchedEvent = matched[index] ?? first;
         const sounding = matched[index] ? eventPitches(matched[index]!) : source.pitches;
-        return voicedPitchesToken(sounding, matchedEvent, kind, fifths, voiceCount) +
+        return voicedPitchesToken(
+          sounding,
+          matchedEvent,
+          kind,
+          fifths,
+          voiceCount,
+          ordering,
+        ) +
           symbol.repeat(markerCount);
       }).join("");
       first.specialToken = `${opening}${atoms}${closing}`;
@@ -2396,6 +3350,69 @@ function slashGroupDirective(label: "花括号" | "方括号", mode: SlashGroupM
   return `${label}=${description}`;
 }
 
+interface DurationGlyph {
+  glyph: string;
+  quarterNotes: number;
+  order: number;
+}
+
+function serializationDurationGlyphs(
+  division: SlashDurationDivision,
+  symbol: string,
+  notation?: MidiSlashExportOptions["durationNotation"],
+): DurationGlyph[] {
+  const mappings = notation
+    ? effectiveMappings(notation)
+    : { [symbol]: division } as Record<string, SlashDurationDivision>;
+  const result = Object.entries(mappings)
+    .filter(([glyph, value]) =>
+      Array.from(glyph).length === 1 && DIVISIONS.includes(value))
+    .map(([glyph, value], order) => ({
+      glyph,
+      quarterNotes: 4 / value,
+      order,
+    }))
+    .sort((left, right) =>
+      right.quarterNotes - left.quarterNotes || left.order - right.order);
+  if (result.length === 0) {
+    result.push({ glyph: symbol, quarterNotes: 4 / division, order: 0 });
+  }
+  return result;
+}
+
+/**
+ * Use the fewest configured duration glyphs while retaining their slot order.
+ * With "."=eighth and space=sixteenth this deliberately writes one dot
+ * instead of two spaces; changing "." to "=" therefore rewrites every
+ * equivalent duration consistently.
+ */
+function encodeSlashDuration(
+  duration: number,
+  glyphs: readonly DurationGlyph[],
+  fallbackUnit: number,
+  fallbackGlyph: string,
+): string {
+  let remaining = Math.max(0, Math.round(duration * 192) / 192);
+  let result = "";
+  let guard = 0;
+  while (remaining > 1e-8 && guard++ < 1024) {
+    const glyph = glyphs.find((candidate) =>
+      candidate.quarterNotes <= remaining + 1e-8);
+    if (glyph) {
+      result += glyph.glyph;
+      remaining = Math.max(
+        0,
+        Math.round((remaining - glyph.quarterNotes) * 192) / 192,
+      );
+      continue;
+    }
+    const count = Math.max(1, Math.round(remaining / fallbackUnit));
+    result += fallbackGlyph.repeat(count);
+    remaining = 0;
+  }
+  return result;
+}
+
 export function scoreToSlashScore(
   score: Score,
   kind: SlashScoreKind,
@@ -2409,19 +3426,31 @@ export function scoreToSlashScore(
   const beatType = firstMeasure?.time.beatType ?? 4;
   const fifths = firstMeasure?.key.fifths ?? 0;
   const unit = 4 / division;
+  const durationNotation = midiExport?.durationNotation;
+  const durationGlyphs = serializationDurationGlyphs(
+    division,
+    symbol,
+    durationNotation,
+  );
+  const noteUnit = durationNotation?.noteDivision
+    ? 4 / durationNotation.noteDivision
+    : 0;
+  const durationText = (duration: number): string =>
+    encodeSlashDuration(duration, durationGlyphs, unit, symbol);
   const compound = beatType === 8 && beats >= 6 && beats % 3 === 0;
   const groups = compound ? beats / 3 : beats;
   const groupDuration = compound ? 1.5 : 4 / beatType;
   const measureCount = Math.max(0, ...score.parts.map((part) => part.measures.length));
   const braceMode = midiExport?.braceMode ?? "grace";
   const bracketMode = midiExport?.bracketMode ?? "triplet";
-  const detectedGestures = midiExport
+  const ordering = midiExport?.ordering ?? "pitch-asc";
+  const detectedGestures = midiExport?.sourceMidi
     ? detectMidiSlashGestures(midiExport.sourceMidi, division)
     : null;
   const midiGestures = detectedGestures
     ? [...detectedGestures.grace, ...detectedGestures.arpeggio, ...detectedGestures.triplet]
     : [];
-  const midiOnsets = midiExport
+  const midiOnsets = midiExport?.sourceMidi
     ? midiOnsetPitchMap(midiExport.sourceMidi, division, midiGestures)
     : null;
   const lines: string[] = [
@@ -2448,7 +3477,7 @@ export function scoreToSlashScore(
     const measureStart = measure?.position.toFloat() ?? measureIndex * beats * 4 / beatType;
     const measureLength = (measure?.time.beats ?? beats) * 4 / (measure?.time.beatType ?? beatType);
     let events = measureEvents(score, measureIndex);
-    if (midiExport) {
+    if (midiExport?.sourceMidi) {
       events = retainMidiOnsets(events, measureStart, midiOnsets!, voiceCount > 1);
       // Slash scores express sustain with their own adjacent rhythm symbols.
       // Ignore MIDI note-off/pedal length and hold each onset until the next
@@ -2467,6 +3496,7 @@ export function scoreToSlashScore(
         division,
         symbol,
         voiceCount,
+        ordering,
       );
     }
     const segments: string[] = [];
@@ -2491,34 +3521,57 @@ export function scoreToSlashScore(
         });
       }
       inGroup.sort((a, b) => a.start - b.start || Number(Boolean(b.continued)) - Number(Boolean(a.continued)));
+      const hasNewSound = attacks.some((event) =>
+        event.chords.some((chord) =>
+          chord.notes.some((note) => !note.rest)));
+      if (durationNotation?.emptyGroupsAsRests && !hasNewSound) {
+        segments.push(" - ");
+        continue;
+      }
       if (inGroup.length === 0) { segments.push("-"); continue; }
+      if (midiExport?.subdivisionMode) {
+        segments.push(subdividedGroupText(
+          inGroup,
+          start,
+          end,
+          unit,
+          symbol,
+          midiExport.subdivisionMode,
+          kind,
+          fifths,
+          voiceCount,
+          ordering,
+          { braceMode, bracketMode },
+        ));
+        continue;
+      }
       let cursor = start;
       let out = "";
-      let cellsLeft = Math.max(1, Math.round(groupDuration / unit));
-      const appendMarkers = (duration: number, atLeastOne = false) => {
-        const wanted = Math.max(atLeastOne ? 1 : 0, Math.round(duration / unit));
-        const count = Math.min(cellsLeft, wanted);
-        out += symbol.repeat(count);
-        cellsLeft -= count;
+      const appendMarkers = (duration: number) => {
+        out += durationText(Math.max(0, duration));
       };
       inGroup.forEach((event, eventIndex) => {
         const eventStart = Math.max(start, event.start);
         if (eventStart > cursor + 1e-8) appendMarkers(eventStart - cursor);
-        const token = event.continued ? "" : outputToken(event, kind, fifths, voiceCount);
+        const token = event.continued
+          ? ""
+          : outputToken(event, kind, fifths, voiceCount, ordering, {
+            braceMode,
+            bracketMode,
+          });
         if (token) out += token;
         if (event.embeddedDuration !== undefined) {
           const occupied = Math.min(end - eventStart, event.embeddedDuration);
-          cellsLeft = Math.max(0, cellsLeft - Math.round(occupied / unit));
           cursor = Math.max(cursor, eventStart + occupied);
           return;
         }
         const nextStart = inGroup[eventIndex + 1]?.start ?? end;
         const eventEnd = Math.min(end, event.end, nextStart);
-        appendMarkers(eventEnd - eventStart, true);
+        const intrinsic = token && !event.continued ? noteUnit : 0;
+        appendMarkers(Math.max(0, eventEnd - eventStart - intrinsic));
         cursor = Math.max(cursor, eventEnd);
       });
       if (cursor < end - 1e-8) appendMarkers(end - cursor);
-      if (cellsLeft > 0) out += symbol.repeat(cellsLeft);
       segments.push(out || "-");
     }
     lines.push(segments.join("/") + "/");
@@ -2548,7 +3601,7 @@ export function embedSlashScoreOptions(text: string, options: SlashScoreOptions)
   const clean = stripSlashScoreOptions(text);
   const stored: Record<string, unknown> = {
     v: 2,
-    vc: clamp(Math.round(options.voiceCount), 1, MAX_SLASH_VOICES),
+    vc: clamp(Math.round(options.voiceCount || 1), 1, MAX_SLASH_VOICES),
     k: options.kind === "keyboard" ? "k" : "n",
     n: options.title,
     bpm: options.tempoBpm,
@@ -2556,10 +3609,13 @@ export function embedSlashScoreOptions(text: string, options: SlashScoreOptions)
     f: options.fifths,
     m: [options.beats, options.beatType],
     s: { ...options.symbolDurations },
+    ms: options.multiDurationSymbols ?? false,
     sp: options.spaceDivision,
     nd: options.noteDivision,
+    er: options.emptyGroupsAsRests ?? false,
     b: compactSlashGroupMode(options.braceMode),
     q: compactSlashGroupMode(options.bracketMode ?? "triplet"),
+    o: options.ordering ?? "pitch-asc",
   };
   if (options.instrumentName?.trim()) stored.i = options.instrumentName.trim();
   if (options.subtitle) stored.u = options.subtitle;
@@ -2568,6 +3624,9 @@ export function embedSlashScoreOptions(text: string, options: SlashScoreOptions)
   if (options.lyricist) stored.l = options.lyricist;
   if (options.tempoMarks?.length) {
     stored.tm = options.tempoMarks.map((mark) => ({ ...mark }));
+  }
+  if (options.noteTimingEdits?.length) {
+    stored.ne = normalizeNoteTimingEdits(options.noteTimingEdits).map((edit) => ({ ...edit }));
   }
   const line = `// @jpeditor ${JSON.stringify(stored)}`;
   const lines = clean.replace(/^\uFEFF/, "").split(/\r?\n/);
@@ -2584,6 +3643,58 @@ export function stripSlashScoreOptions(text: string): string {
     /^[ \t]*\/\/[ \t]*@jpeditor[ \t]+\{[^\r\n]*\}[ \t]*(?:\r?\n|$)/gm,
     "",
   );
+}
+
+/**
+ * Keep the human-readable TXT rhythm declarations in sync with the settings
+ * comment. Changing "." to "=" updates both the score rows and the visible
+ * `点/符号/空格` declaration instead of leaving contradictory instructions.
+ */
+export function rewriteSlashDurationDirectives(
+  text: string,
+  options: Pick<
+    SlashScoreOptions,
+    "symbolDurations" | "multiDurationSymbols" | "spaceDivision" | "noteDivision"
+  >,
+): string {
+  const lineEnding = text.includes("\r\n") ? "\r\n" : "\n";
+  const bom = text.startsWith("\uFEFF") ? "\uFEFF" : "";
+  const body = bom ? text.slice(1) : text;
+  const lines = body.split(/\r?\n/);
+  const durationDirective = /^\s*(?:点|两个点|符号\s*[（(].*?[）)]|空格|音符(?:自身时值)?|音自身时值)\s*[=＝：:]/i;
+  const found = lines.flatMap((line, index) =>
+    durationDirective.test(line) ? [index] : []);
+  const tempoIndex = lines.findIndex((line) =>
+    /^\s*(?:速度|Tempo)\s*[=＝：:]/i.test(line));
+  const insertion = found[0] ?? (tempoIndex >= 0 ? tempoIndex + 1 : 0);
+  const retained = lines.filter((line) => !durationDirective.test(line));
+  const removedBeforeInsertion = found.filter((index) => index < insertion).length;
+  const at = Math.max(0, Math.min(
+    retained.length,
+    insertion - removedBeforeInsertion,
+  ));
+
+  const configured = Object.entries(options.symbolDurations);
+  const active = options.multiDurationSymbols === false
+    ? configured.slice(0, 1)
+    : configured;
+  const directives = active.flatMap(([glyph, division]) => {
+    const value = Array.from(glyph)[0];
+    if (!value || value === " ") return [];
+    return [
+      value === "."
+        ? `点=${division}分音符`
+        : `符号(${value})=${division}分音符`,
+    ];
+  });
+  if (options.spaceDivision) {
+    directives.push(`空格=${options.spaceDivision}分音符`);
+  }
+  if (options.noteDivision) {
+    directives.push(`音符自身时值=${options.noteDivision}分音符`);
+  }
+  retained.splice(at, 0, ...directives);
+  return bom + retained.join(lineEnding);
 }
 
 export interface SlashVoiceMigration {

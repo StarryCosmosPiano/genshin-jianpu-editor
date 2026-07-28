@@ -244,8 +244,24 @@ export class BarlineEntry extends Entry {
   }
 }
 
+export interface ChordTimingOriginal {
+  measureIndex: number;
+  position: Fraction;
+  beats: number;
+  beams: number;
+  dot: number;
+  tieStart: boolean;
+  tieEnd: boolean;
+}
+
 export class Chord extends Entry {
   notes: Note[] = [];
+  /** Synthetic tied segment created from a persisted rhythmic edit. */
+  generatedTimingContinuation = false;
+  /** Original editable source order, retained when a timing edit reorders attacks. */
+  timingSourceIndex: number | null = null;
+  /** Pre-edit notation used when the transformed score is serialized again. */
+  timingOriginal: ChordTimingOriginal | null = null;
   /** Small, non-metrical notes printed before this chord. */
   graceNotes: Note[] = [];
   /** Draw a vertical arpeggio wave beside this chord. */
@@ -358,6 +374,8 @@ export class Measure {
   newSystem = false;
   newPage = false;
   position = new Fraction(0);
+  /** Keeps a manually moved final attack from shortening the written bar. */
+  timingMinimumDuration: Fraction | null = null;
   leftBarline: BarStyle | null = null;
   barline: BarStyle | null = null;
   repeatBackward = false;
@@ -381,7 +399,12 @@ export class Measure {
       const cur = e.position.plus(e.duration);
       if (end === null || cur.compareTo(end) > 0) end = cur;
     }
-    if (end !== null) return end;
+    if (end !== null) {
+      return this.timingMinimumDuration && this.timingMinimumDuration.compareTo(end) > 0
+        ? this.timingMinimumDuration
+        : end;
+    }
+    if (this.timingMinimumDuration) return this.timingMinimumDuration;
     // A hand can be silent for a complete piano measure.  Keep the shared
     // measure clock moving even though this Part has no visible chord.
     return new Fraction(this.time.beats * 4, this.time.beatType);
@@ -656,6 +679,13 @@ export class Score {
   tempoBeatUnit: TempoBeatUnit = "quarter";
   /** Imported accelerando/ritardando and settled-tempo annotations. */
   tempoMarks: TempoMark[] = [];
+  /** Persisted per-source-chord move/length deltas used by direct score editing. */
+  noteTimingEdits: Array<{
+    part: number;
+    chord: number;
+    move: string;
+    duration: string;
+  }> = [];
   composer = "";
   lyricist = "";
   creator = new Map<string, string>();

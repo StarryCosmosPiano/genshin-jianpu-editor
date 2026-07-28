@@ -524,6 +524,41 @@ function splitNormalDuration(duration: number): number[] {
   return pieces;
 }
 
+function splitMetricalDuration(duration: number, start: number): number[] {
+  const candidates = [
+    { value: 4, alignment: 4 },
+    { value: 3, alignment: 4 },
+    { value: 2, alignment: 2 },
+    { value: 1.5, alignment: 2 },
+    { value: 1, alignment: 1 },
+    { value: 0.75, alignment: 1 },
+    { value: 0.5, alignment: 0.5 },
+    { value: 0.375, alignment: 0.5 },
+    { value: 0.25, alignment: 0.25 },
+    { value: 0.1875, alignment: 0.25 },
+    { value: 0.125, alignment: 0.125 },
+    { value: 0.09375, alignment: 0.125 },
+    { value: 0.0625, alignment: 0.0625 },
+  ] as const;
+  const pieces: number[] = [];
+  let position = Math.round(start * 64) / 64;
+  let remaining = Math.round(duration * 64) / 64;
+  let guard = 0;
+  while (remaining > 1e-8 && guard++ < 1024) {
+    const written = candidates.find((candidate) => {
+      const cell = position / candidate.alignment;
+      return candidate.value <= remaining + 1e-8
+        && Math.abs(cell - Math.round(cell)) <= 1e-8;
+    });
+    const value = written?.value ?? Math.min(remaining, 1 / 16);
+    pieces.push(value);
+    position = Math.round((position + value) * 64) / 64;
+    remaining = Math.round((remaining - value) * 64) / 64;
+  }
+  if (pieces.length === 0) pieces.push(1 / 16);
+  return pieces;
+}
+
 function addChord(measure: Measure, start: number, duration: number, pitches: number[], fifths: number, triplet: TripletMark | null): Chord {
   const chord = new Chord(measure);
   const shape = durationShape(duration, triplet);
@@ -566,9 +601,19 @@ function linkTiedChords(left: Chord, right: Chord): void {
   }
 }
 
-function addSegment(measure: Measure, start: number, duration: number, pitches: number[], fifths: number, triplet: TripletMark | null): Chord[] {
+function addSegment(
+  measure: Measure,
+  start: number,
+  duration: number,
+  pitches: number[],
+  fifths: number,
+  triplet: TripletMark | null,
+  preserveSourceRhythmSpelling = false,
+): Chord[] {
   if (triplet) return [addChord(measure, start, duration, pitches, fifths, triplet)];
-  const pieces = splitNormalDuration(duration);
+  const pieces = preserveSourceRhythmSpelling
+    ? splitNormalDuration(duration)
+    : splitMetricalDuration(duration, start);
   const chords: Chord[] = [];
   let position = start;
   for (const piece of pieces) {
@@ -688,6 +733,7 @@ function makePart(
   events: QuantizedChord[],
   fifths: number,
   metadata?: { instrumentName: string; voiceIndex: number; sourceTrack: number },
+  preserveSourceRhythmSpelling = false,
 ): Part {
   const part = new Part();
   part.hand = hand;
@@ -715,8 +761,26 @@ function makePart(
     for (const event of overlapping) {
       const start = Math.max(bound.start, event.start);
       const end = Math.min(bound.end, event.end);
-      if (start > cursor + 1e-8) addSegment(measure, cursor - bound.start, start - cursor, [], fifths, null);
-      const eventChords = addSegment(measure, start - bound.start, end - start, event.pitches, fifths, event.triplet);
+      if (start > cursor + 1e-8) {
+        addSegment(
+          measure,
+          cursor - bound.start,
+          start - cursor,
+          [],
+          fifths,
+          null,
+          preserveSourceRhythmSpelling,
+        );
+      }
+      const eventChords = addSegment(
+        measure,
+        start - bound.start,
+        end - start,
+        event.pitches,
+        fifths,
+        event.triplet,
+        preserveSourceRhythmSpelling,
+      );
       const previous = eventLastChord.get(event);
       if (previous && eventChords[0]) linkTiedChords(previous, eventChords[0]);
       if (eventChords.length > 0) eventLastChord.set(event, eventChords[eventChords.length - 1]);
@@ -727,7 +791,17 @@ function makePart(
       }
       cursor = Math.max(cursor, end);
     }
-    if (cursor < bound.end - 1e-8) addSegment(measure, cursor - bound.start, bound.end - cursor, [], fifths, null);
+    if (cursor < bound.end - 1e-8) {
+      addSegment(
+        measure,
+        cursor - bound.start,
+        bound.end - cursor,
+        [],
+        fifths,
+        null,
+        preserveSourceRhythmSpelling,
+      );
+    }
     measure.init({ keepChords: true, primaryVoice: true });
     part.measures.push(measure);
   }
@@ -839,15 +913,36 @@ export function midiToScore(parsed: ParsedMidi, options: MidiImportOptions): Mid
         instrumentName: assignment.instrumentName,
         voiceIndex: assignment.voice,
         sourceTrack: assignment.track,
-      }));
+      }, options.preserveSourceRhythmSpelling));
     }
   } else if (resolvedMode === "double") {
     score.piano = true;
     if (!score.instrumentName) score.instrumentName = "钢琴";
-    score.parts.push(makePart(bounds, "right", quantized[0].events, options.fifths));
-    score.parts.push(makePart(bounds, "left", quantized[1].events, options.fifths));
+    score.parts.push(makePart(
+      bounds,
+      "right",
+      quantized[0].events,
+      options.fifths,
+      undefined,
+      options.preserveSourceRhythmSpelling,
+    ));
+    score.parts.push(makePart(
+      bounds,
+      "left",
+      quantized[1].events,
+      options.fifths,
+      undefined,
+      options.preserveSourceRhythmSpelling,
+    ));
   } else {
-    score.parts.push(makePart(bounds, null, quantized[0].events, options.fifths));
+    score.parts.push(makePart(
+      bounds,
+      null,
+      quantized[0].events,
+      options.fifths,
+      undefined,
+      options.preserveSourceRhythmSpelling,
+    ));
   }
   normalizeOpeningPickup(score);
   applyMidiOrnaments(score, gestures);

@@ -5,6 +5,11 @@ export type MidiHandMode = "auto" | "single" | "double";
 export type MidiOutputFormat = "jpw" | "keyboard" | "number";
 export type MidiScoreMode = "hands" | "ensemble";
 export type MidiSlashGroupMode = "none" | "grace" | "arpeggio" | "triplet" | "subdivide";
+export type MidiSlashOrdering =
+  | "voice-asc"
+  | "voice-desc"
+  | "pitch-asc"
+  | "pitch-desc";
 
 /** One sounding MIDI track mapped to one ordered numbered-notation voice. */
 export interface MidiTrackAssignment {
@@ -113,6 +118,13 @@ export interface MidiImportOptions {
   /** Meaning assigned to curly/square groups in generated keyboard/number text. */
   slashBraceMode?: MidiSlashGroupMode;
   slashBracketMode?: MidiSlashGroupMode;
+  /** Ordering used inside generated keyboard/number vertical chords. */
+  slashOrdering?: MidiSlashOrdering;
+  /**
+   * Keep source TXT duration contributions intact. Ordinary MIDI import leaves
+   * this off so off-beat values are split at readable metrical boundaries.
+   */
+  preserveSourceRhythmSpelling?: boolean;
 }
 
 export interface MidiImportSummary {

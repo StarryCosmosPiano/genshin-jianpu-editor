@@ -70,18 +70,39 @@ function fileStem(path: string): string {
 interface SymbolRow {
   glyph: HTMLInputElement;
   division: HTMLSelectElement;
+  wrap: HTMLLabelElement;
 }
 
 type SlashDialogPurpose = "import" | "settings";
 
-function collectMappings(rows: SymbolRow[]): Record<string, SlashDurationDivision> {
+function activeSymbolRows(rows: SymbolRow[], multiple: boolean): SymbolRow[] {
+  return multiple ? rows : rows.slice(0, 1);
+}
+
+function collectMappings(
+  rows: SymbolRow[],
+  multiple: boolean,
+): Record<string, SlashDurationDivision> {
   const mappings: Record<string, SlashDurationDivision> = {};
-  for (const item of rows) {
+  for (const item of activeSymbolRows(rows, multiple)) {
     const glyph = Array.from(item.glyph.value)[0];
     const division = selectedDivision(item.division);
     if (glyph && glyph !== " " && division) mappings[glyph] = division;
   }
   return mappings;
+}
+
+function mappedSpaceDivision(
+  rows: SymbolRow[],
+  multiple: boolean,
+  fallback: HTMLSelectElement,
+): SlashDurationDivision | null {
+  for (const item of activeSymbolRows(rows, multiple)) {
+    if (item.glyph.value !== "" && item.glyph.value !== " ") continue;
+    const division = selectedDivision(item.division);
+    if (division) return division;
+  }
+  return selectedDivision(fallback);
 }
 
 /** Configure and validate a keyboard/number slash score before it replaces the current editor text. */
@@ -206,10 +227,14 @@ export function showSlashScoreImportDialog(
     mappingSummary.textContent = "时值符号对应（可全部自定义）";
     const mappingHint = document.createElement("div");
     mappingHint.className = "modal-hint";
-    mappingHint.textContent = "符号每出现一次就给相邻音符增加所选时值；例如点=16分时，四个点合成一拍音长。没有明确休止符时，时值符号不会单独生成休止。符号留空或选择“不作为时值”即忽略。";
+    mappingHint.textContent = "符号每出现一次就给相邻音符增加所选时值；例如“.”设为8分、“=”设为16分时，两个“=”会和一个“.”产生相同音长。符号栏留空但选择了时值时，代表把普通空格当作该时值；选择“不作为时值”才会忽略。";
 
-    const symbols = [...new Set([...analysis.observedSymbols, ...Object.keys(initial.symbolDurations)])];
+    const symbols = [...new Set([...Object.keys(initial.symbolDurations), ...analysis.observedSymbols])];
+    if (symbols.length === 0) symbols.push(".");
     while (symbols.length < 5) symbols.push("");
+    const useMultipleSymbols = document.createElement("input");
+    useMultipleSymbols.type = "checkbox";
+    useMultipleSymbols.checked = initial.multiDurationSymbols ?? false;
     const symbolGrid = document.createElement("div");
     symbolGrid.className = "slash-symbol-grid";
     const symbolRows: SymbolRow[] = symbols.map((symbol, index) => {
@@ -226,7 +251,7 @@ export function showSlashScoreImportDialog(
       caption.textContent = `符号 ${index + 1}`;
       wrap.append(caption, glyph, division);
       symbolGrid.append(wrap);
-      return { glyph, division };
+      return { glyph, division, wrap };
     });
     const spaceDivision = divisionSelect(initial.spaceDivision);
     spaceDivision.name = "spaceDivision";
@@ -242,16 +267,34 @@ export function showSlashScoreImportDialog(
     const noteWrap = document.createElement("span");
     noteWrap.className = "slash-space-control";
     noteWrap.append(noteDivision, noteHint);
+    const emptyGroupsAsRests = document.createElement("input");
+    emptyGroupsAsRests.type = "checkbox";
+    emptyGroupsAsRests.checked = initial.emptyGroupsAsRests ?? false;
+    const emptyGroupHint = document.createElement("small");
+    emptyGroupHint.textContent = "开启后，完全没有新起音的整拍写成“/ - /”；关闭时继续使用当前时值符号填满。";
+    const emptyGroupWrap = document.createElement("span");
+    emptyGroupWrap.className = "slash-space-control";
+    emptyGroupWrap.append(emptyGroupsAsRests, emptyGroupHint);
     mappingDetails.append(
       mappingSummary,
       mappingHint,
+      row("使用多种符号", useMultipleSymbols),
       symbolGrid,
       row("音符自身时值", noteWrap),
       row("空格时值", spaceWrap),
+      row("空拍使用 / - /", emptyGroupWrap),
     );
 
     const braceMode = groupModeSelect(initial.braceMode);
     const bracketMode = groupModeSelect(initial.bracketMode ?? "triplet");
+    const ordering = document.createElement("select");
+    ordering.append(
+      option("pitch-asc", "音高正序（低音到高音）", (initial.ordering ?? "pitch-asc") === "pitch-asc"),
+      option("pitch-desc", "音高逆序（高音到低音）", initial.ordering === "pitch-desc"),
+      option("voice-asc", "声部正序（V1 到默认声部）", initial.ordering === "voice-asc"),
+      option("voice-desc", "声部逆序（默认声部到 V1）", initial.ordering === "voice-desc"),
+    );
+    const orderingRow = row("和弦书写顺序", ordering);
 
     const meterHint = document.createElement("div");
     meterHint.className = "slash-meter-hint";
@@ -262,12 +305,26 @@ export function showSlashScoreImportDialog(
     // preserve its stored meter unless the user explicitly changes it.
     let meterTouched = purpose === "settings";
 
-    const currentMappings = () => collectMappings(symbolRows);
+    const currentMappings = () => collectMappings(symbolRows, useMultipleSymbols.checked);
+    const currentSpaceDivision = () => mappedSpaceDivision(
+      symbolRows,
+      useMultipleSymbols.checked,
+      spaceDivision,
+    );
+    const updateSymbolRows = () => {
+      symbolRows.forEach((item, index) => {
+        const enabled = useMultipleSymbols.checked || index === 0;
+        item.wrap.hidden = !enabled;
+        item.wrap.style.display = enabled ? "" : "none";
+        item.glyph.disabled = !enabled;
+        item.division.disabled = !enabled;
+      });
+    };
     const updateRecommendation = () => {
       const suggestion = inferSlashMeter(
         text,
         currentMappings(),
-        selectedDivision(spaceDivision),
+        currentSpaceDivision(),
         braceMode.value as SlashBraceMode,
         selectedDivision(noteDivision),
         bracketMode.value as SlashGroupMode,
@@ -297,6 +354,10 @@ export function showSlashScoreImportDialog(
       item.glyph.oninput = updateRecommendation;
       item.division.onchange = updateRecommendation;
     }
+    useMultipleSymbols.onchange = () => {
+      updateSymbolRows();
+      updateRecommendation();
+    };
     spaceDivision.onchange = updateRecommendation;
     noteDivision.onchange = updateRecommendation;
     braceMode.onchange = updateRecommendation;
@@ -365,6 +426,7 @@ export function showSlashScoreImportDialog(
       info,
       row("谱子类型", kind),
       kindHint,
+      orderingRow,
       row("声部数量（1–9）", voiceCount),
       row("多声部乐器名称", instrumentName),
       row("速度（BPM）", tempo),
@@ -408,10 +470,13 @@ export function showSlashScoreImportDialog(
       beats: clampInt(beats.value, 1, 32, analysis.meter.beats),
       beatType: [2, 4, 8, 16].includes(parseInt(beatType.value, 10)) ? parseInt(beatType.value, 10) : 4,
       symbolDurations: currentMappings(),
-      spaceDivision: selectedDivision(spaceDivision),
+      multiDurationSymbols: useMultipleSymbols.checked,
+      spaceDivision: currentSpaceDivision(),
       noteDivision: selectedDivision(noteDivision),
+      emptyGroupsAsRests: emptyGroupsAsRests.checked,
       braceMode: braceMode.value as SlashBraceMode,
       bracketMode: bracketMode.value as SlashGroupMode,
+      ordering: ordering.value as NonNullable<SlashScoreOptions["ordering"]>,
       tempoMarks: initial.tempoMarks?.map((mark) => ({ ...mark })) ?? [],
     });
 
@@ -429,6 +494,7 @@ export function showSlashScoreImportDialog(
       }
     };
     updateTempoUnit();
+    updateSymbolRows();
     updateRecommendation();
     updateVoiceHint();
     kind.focus();

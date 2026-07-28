@@ -14,6 +14,7 @@ import type {
   MidiQuantizeDivision,
   MidiScoreMode,
   MidiSlashGroupMode,
+  MidiSlashOrdering,
   MidiTrackAssignment,
   ParsedMidi,
 } from "../midi";
@@ -100,6 +101,13 @@ export function showMidiImportDialog(parsed: ParsedMidi, analysis: MidiAnalysis,
       option("jpw", "JPW 简谱（完整排版）", true),
       option("keyboard", "键盘谱文本（完整排版）"),
       option("number", "数字谱文本（完整排版）"),
+    );
+    const slashOrdering = document.createElement("select");
+    slashOrdering.append(
+      option("pitch-asc", "音高正序（低音到高音）", true),
+      option("pitch-desc", "音高逆序（高音到低音）"),
+      option("voice-asc", "声部正序（V1 到 VN）"),
+      option("voice-desc", "声部逆序（VN 到 V1）"),
     );
     const braceMode = slashGroupSelect(analysis.arpeggioGroupCount > 0 ? "arpeggio" : "grace");
     const bracketMode = slashGroupSelect("triplet");
@@ -354,11 +362,13 @@ export function showMidiImportDialog(parsed: ParsedMidi, analysis: MidiAnalysis,
     const controls = document.createElement("div");
     const handRow = row("钢琴手部", hands);
     const splitRow = row("双手分割音高", splitWrap);
+    const orderingRow = row("文本谱和弦书写顺序", slashOrdering);
     controls.append(
       row("导入后格式", outputFormat),
       row("谱面结构", scoreMode),
       row("推荐量化", quantize),
       row("自动识别三连音", triplets),
+      orderingRow,
       handRow,
       splitRow,
     );
@@ -417,10 +427,16 @@ export function showMidiImportDialog(parsed: ParsedMidi, analysis: MidiAnalysis,
       splitRow.hidden = ensemble;
       instrumentRow.hidden = ensemble;
       slashGroups.hidden = outputFormat.value === "jpw";
+      orderingRow.hidden = false;
       mapping.style.display = ensemble ? "" : "none";
       handRow.style.display = ensemble ? "none" : "";
       splitRow.style.display = ensemble ? "none" : "";
       instrumentRow.style.display = ensemble ? "none" : "";
+      slashOrdering.disabled = outputFormat.value === "jpw";
+      orderingRow.style.opacity = outputFormat.value === "jpw" ? "0.5" : "1";
+      orderingRow.title = outputFormat.value === "jpw"
+        ? "切换为键盘谱或数字谱后可设置四种和弦书写顺序"
+        : "";
       if (!ensemble) splitRow.style.opacity = hands.value === "single" ? "0.45" : "1";
       updateHint();
     };
@@ -488,6 +504,7 @@ export function showMidiImportDialog(parsed: ParsedMidi, analysis: MidiAnalysis,
         outputFormat: outputFormat.value as MidiOutputFormat,
         slashBraceMode: braceMode.value as MidiSlashGroupMode,
         slashBracketMode: bracketMode.value as MidiSlashGroupMode,
+        slashOrdering: slashOrdering.value as MidiSlashOrdering,
       });
     };
     updateTempoUnit();
