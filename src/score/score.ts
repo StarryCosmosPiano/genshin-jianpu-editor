@@ -322,6 +322,16 @@ export class Note {
   jpOctave = 0;
   jpAlter = " "; // b,n,#
   number = "0";
+  /** Optional notation-only label. Playback, pitch editing and serializers
+   *  continue to use `number` / `jpOctave`; keyboard TXT can therefore print
+   *  A-Z key caps without changing the musical model. */
+  displayText: string | null = null;
+  displayOctave: number | null = null;
+  /** Optional notation-only accidental override used by alternate staff
+   *  labels. A single space suppresses the accidental without changing pitch. */
+  displayAlter: string | null = null;
+  /** Hide the notation-only label while preserving its measured layout box. */
+  displayHidden = false;
   tieNext: Note | null = null;
   tiePrev: Note | null = null;
   tuplet: Tuplet | null = null;

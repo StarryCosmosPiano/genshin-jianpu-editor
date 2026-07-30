@@ -168,9 +168,12 @@ interface WrittenDuration {
 
 const WRITTEN_DURATIONS: readonly WrittenDuration[] = [
   { value: new Fraction(4), alignment: new Fraction(4), beats: 4, beams: 0, dot: 0 },
-  { value: new Fraction(3), alignment: new Fraction(4), beats: 3, beams: 0, dot: 0 },
-  { value: new Fraction(2), alignment: new Fraction(2), beats: 2, beams: 0, dot: 0 },
-  { value: new Fraction(3, 2), alignment: new Fraction(2), beats: 1, beams: 0, dot: 1 },
+  { value: new Fraction(3), alignment: new Fraction(1), beats: 2, beams: 0, dot: 1 },
+  { value: new Fraction(2), alignment: new Fraction(1), beats: 2, beams: 0, dot: 0 },
+  // Every exact quarter-note beat is a valid onset for a dotted quarter.
+  // This lets a quarter plus its tied eighth continuation use one written
+  // value instead of leaving an unnecessary gray continuation.
+  { value: new Fraction(3, 2), alignment: new Fraction(1), beats: 1, beams: 0, dot: 1 },
   { value: new Fraction(1), alignment: new Fraction(1), beats: 1, beams: 0, dot: 0 },
   { value: new Fraction(3, 4), alignment: new Fraction(1), beats: 1, beams: 1, dot: 1 },
   { value: new Fraction(1, 2), alignment: new Fraction(1, 2), beats: 1, beams: 1, dot: 0 },
@@ -225,6 +228,10 @@ function cloneNote(source: Note, chord: Chord): Note {
   note.jpOctave = source.jpOctave;
   note.jpAlter = source.jpAlter;
   note.number = source.number;
+  note.displayText = source.displayText;
+  note.displayOctave = source.displayOctave;
+  note.displayAlter = source.displayAlter;
+  note.displayHidden = source.displayHidden;
   return note;
 }
 
@@ -620,9 +627,15 @@ function splitMetricalWrittenDuration(
   let remaining = duration;
   let guard = 0;
   while (remaining.compareTo(ZERO) > 0 && guard++ < 1024) {
-    const written = WRITTEN_DURATIONS.find((candidate) =>
-      candidate.value.compareTo(remaining) <= 0
-      && canWriteWithoutTie(candidate, position, beatDuration));
+    const written = WRITTEN_DURATIONS.find((candidate) => {
+      const leavesShortTail =
+        candidate.value.equals(new Fraction(3, 2))
+        && remaining.compareTo(new Fraction(3, 2)) > 0
+        && remaining.compareTo(new Fraction(2)) < 0;
+      return !leavesShortTail
+        && candidate.value.compareTo(remaining) <= 0
+        && canWriteWithoutTie(candidate, position, beatDuration);
+    });
     const value = written?.value
       ?? (remaining.compareTo(MIN_DURATION) < 0 ? remaining : MIN_DURATION);
     result.push(value);
@@ -932,6 +945,7 @@ export function moveScoreNotesOnTimeline(
     note: Note;
     source: Chord;
     sourceStart: Fraction;
+    sourceDuration: Fraction;
     duration: Fraction;
     target: Fraction;
   }> = [];
@@ -956,11 +970,17 @@ export function moveScoreNotesOnTimeline(
       blocked++;
       continue;
     }
-    const duration = selection.note.chord.duration ?? MIN_DURATION;
+    const sourceDuration = selection.note.chord.duration ?? MIN_DURATION;
+    let duration = sourceDuration;
     if (options.preserveRests && delta.compareTo(ZERO) < 0) {
       const source = selection.note.chord;
       const sourceWillRemain = source.notes.some((note) =>
         !note.rest && !selectedNotes.has(note));
+      // A tone that previously moved into a longer vertical chord must be
+      // able to move back out at the currently selected grid value. Keep the
+      // unselected chord at its existing duration, but give the detached tone
+      // exactly one left-move step instead of inheriting the whole chord.
+      if (sourceWillRemain) duration = delta.timesInt(-1);
       const attacks = part.measures.flatMap((measure) =>
         measure.entries
           .filter((entry): entry is Chord =>
@@ -988,6 +1008,7 @@ export function moveScoreNotesOnTimeline(
       note: selection.note,
       source: selection.note.chord,
       sourceStart: start,
+      sourceDuration,
       duration,
       target,
     });
@@ -1071,7 +1092,7 @@ export function moveScoreNotesOnTimeline(
       // If this was one tone of a chord, the tones left behind keep the
       // chord's current duration when the selected tone moves again.
       if (move.source.notes.some((note) => !note.rest)) {
-        const retainedEnd = move.sourceStart.plus(move.duration);
+        const retainedEnd = move.sourceStart.plus(move.sourceDuration);
         requestedBoundaries.set(`${move.partIndex}:${retainedEnd}`, {
           partIndex: move.partIndex,
           at: retainedEnd,

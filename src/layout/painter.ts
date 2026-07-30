@@ -307,7 +307,15 @@ export function renderPageItem(
   if (item.classes.size > 0) g.setAttribute("class", [...item.classes].join(" "));
   if (!item.matrix.isIdentity) g.setAttribute("transform", item.matrix.toSvg());
   const self = renderSelf(item);
-  if (self) g.appendChild(self);
+  if (self) {
+    // A notation-only hidden label keeps its measured PageItem in the layout
+    // tree; only the emitted SVG shape is suppressed. This makes toggling
+    // hidden tied keyboard letters geometrically stable.
+    if (item.classes.has("notation-hidden-label")) {
+      self.setAttribute("visibility", "hidden");
+    }
+    g.appendChild(self);
+  }
   for (const ch of item.children) g.appendChild(renderPageItem(ch, nodeMap));
   nodeMap?.set(item, g);
   return g;

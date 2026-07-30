@@ -373,7 +373,7 @@ class JpScore {
     const dot = ch.timingOriginal?.dot ?? ch.dot;
     const beats = ch.timingOriginal?.beats ?? ch.beats;
     const beams = ch.timingOriginal?.beams ?? ch.beams;
-    if (dot === 1 && beats <= 1) str += ".";
+    if (dot === 1) str += ".";
     for (let i = 0; i < beams; i++) str += "_";
     for (let i = 1; i < beats; i++) str += "-";
     return str;

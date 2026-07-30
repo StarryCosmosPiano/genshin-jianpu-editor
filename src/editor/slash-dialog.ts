@@ -148,6 +148,27 @@ export function showSlashScoreImportDialog(
     const kindHint = document.createElement("div");
     kindHint.className = "modal-hint";
     kindHint.textContent = "文本同时含键盘谱和数字谱时，两种正文都会原样保留；当前只解析这里选择的谱型，另一种谱行不参与小节、休止、播放和右侧排版。";
+    const keyboardKeyLabels = document.createElement("input");
+    keyboardKeyLabels.type = "checkbox";
+    keyboardKeyLabels.checked = initial.keyboardKeyLabels ?? false;
+    const keyboardKeyLabelsHint = document.createElement("small");
+    keyboardKeyLabelsHint.textContent = "只替换右侧谱面的 1–7 为 A–Z 键位；音高、延音、播放和导出保持不变。超出 Z–U 三排范围时用上下加点表示额外八度。";
+    const keyboardKeyLabelsWrap = document.createElement("span");
+    keyboardKeyLabelsWrap.className = "slash-space-control";
+    keyboardKeyLabelsWrap.append(keyboardKeyLabels, keyboardKeyLabelsHint);
+    const keyboardKeyLabelsRow = row("谱面显示键盘按键", keyboardKeyLabelsWrap);
+    const keyboardTieAsZero = document.createElement("input");
+    keyboardTieAsZero.type = "checkbox";
+    keyboardTieAsZero.checked = initial.keyboardTieAsZero ?? false;
+    const keyboardTieAsZeroRow = row("延音用 0 替代", keyboardTieAsZero);
+    keyboardTieAsZeroRow.style.paddingLeft = "28px";
+    keyboardTieAsZeroRow.title = "只替换延音线后面的续音字母，不会把它变成休止符";
+    const keyboardHideTieLabels = document.createElement("input");
+    keyboardHideTieLabels.type = "checkbox";
+    keyboardHideTieLabels.checked = initial.keyboardHideTieLabels ?? false;
+    const keyboardHideTieLabelsRow = row("隐藏延音字母", keyboardHideTieLabels);
+    keyboardHideTieLabelsRow.style.paddingLeft = "28px";
+    keyboardHideTieLabelsRow.title = "保留延音线与节奏标记但隐藏续音字母；与“延音用 0 替代”同时开启时优先隐藏";
     const voiceCount = document.createElement("input");
     voiceCount.type = "number";
     voiceCount.min = "1";
@@ -362,7 +383,21 @@ export function showSlashScoreImportDialog(
     noteDivision.onchange = updateRecommendation;
     braceMode.onchange = updateRecommendation;
     bracketMode.onchange = updateRecommendation;
-    kind.onchange = updateRecommendation;
+    const updateKindControls = () => {
+      const visible = kind.value === "keyboard";
+      keyboardKeyLabelsRow.hidden = !visible;
+      keyboardKeyLabelsRow.style.display = visible ? "" : "none";
+      const tieOptionsVisible = visible && keyboardKeyLabels.checked;
+      keyboardTieAsZeroRow.hidden = !tieOptionsVisible;
+      keyboardTieAsZeroRow.style.display = tieOptionsVisible ? "" : "none";
+      keyboardHideTieLabelsRow.hidden = !tieOptionsVisible;
+      keyboardHideTieLabelsRow.style.display = tieOptionsVisible ? "" : "none";
+    };
+    keyboardKeyLabels.onchange = updateKindControls;
+    kind.onchange = () => {
+      updateKindControls();
+      updateRecommendation();
+    };
 
     const metadata = document.createElement("details");
     const metadataSummary = document.createElement("summary");
@@ -426,6 +461,9 @@ export function showSlashScoreImportDialog(
       info,
       row("谱子类型", kind),
       kindHint,
+      keyboardKeyLabelsRow,
+      keyboardTieAsZeroRow,
+      keyboardHideTieLabelsRow,
       orderingRow,
       row("声部数量（1–9）", voiceCount),
       row("多声部乐器名称", instrumentName),
@@ -448,6 +486,9 @@ export function showSlashScoreImportDialog(
 
     const readOptions = (): SlashScoreOptions => ({
       kind: kind.value as SlashScoreKind,
+      keyboardKeyLabels: kind.value === "keyboard" && keyboardKeyLabels.checked,
+      keyboardTieAsZero: keyboardTieAsZero.checked,
+      keyboardHideTieLabels: keyboardHideTieLabels.checked,
       voiceCount: clampInt(voiceCount.value, 1, 9, analysis.voiceCount),
       instrumentName: instrumentName.value.trim() || "钢琴",
       title: title.value.trim() || fileStem(fileName) || "未命名",
@@ -480,10 +521,15 @@ export function showSlashScoreImportDialog(
       tempoMarks: initial.tempoMarks?.map((mark) => ({ ...mark })) ?? [],
     });
 
+    let dirty = false;
+    const markDirty = () => {
+      dirty = true;
+    };
+    box.addEventListener("input", markDirty);
+    box.addEventListener("change", markDirty);
+
     const close = (value: SlashScoreOptions | null) => { overlay.remove(); resolve(value); };
-    cancel.onclick = () => close(null);
-    overlay.onclick = (event) => { if (event.target === overlay) close(null); };
-    confirm.onclick = () => {
+    const applyAndClose = () => {
       const value = readOptions();
       try {
         parseSlashScore(text, value);
@@ -493,7 +539,20 @@ export function showSlashScoreImportDialog(
         error.textContent = reason instanceof Error ? reason.message : String(reason);
       }
     };
+    cancel.onclick = () => close(null);
+    overlay.onclick = (event) => {
+      if (event.target !== overlay) return;
+      if (purpose === "settings" && dirty) {
+        if (window.confirm("乐谱设置尚未保存，是否立即应用到当前乐谱？")) {
+          applyAndClose();
+        }
+        return;
+      }
+      close(null);
+    };
+    confirm.onclick = applyAndClose;
     updateTempoUnit();
+    updateKindControls();
     updateSymbolRows();
     updateRecommendation();
     updateVoiceHint();

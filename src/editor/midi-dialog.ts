@@ -102,6 +102,21 @@ export function showMidiImportDialog(parsed: ParsedMidi, analysis: MidiAnalysis,
       option("keyboard", "键盘谱文本（完整排版）"),
       option("number", "数字谱文本（完整排版）"),
     );
+    const keyboardKeyLabels = document.createElement("input");
+    keyboardKeyLabels.type = "checkbox";
+    keyboardKeyLabels.checked = false;
+    const keyboardKeyLabelsRow = row("谱面显示键盘按键", keyboardKeyLabels);
+    keyboardKeyLabelsRow.title = "只改变右侧简谱显示；音高、延音、播放和导出的键盘谱文本保持不变";
+    const keyboardTieAsZero = document.createElement("input");
+    keyboardTieAsZero.type = "checkbox";
+    const keyboardTieAsZeroRow = row("延音用 0 替代", keyboardTieAsZero);
+    keyboardTieAsZeroRow.style.paddingLeft = "28px";
+    keyboardTieAsZeroRow.title = "只替换延音线后面的续音字母，不会生成休止符";
+    const keyboardHideTieLabels = document.createElement("input");
+    keyboardHideTieLabels.type = "checkbox";
+    const keyboardHideTieLabelsRow = row("隐藏延音字母", keyboardHideTieLabels);
+    keyboardHideTieLabelsRow.style.paddingLeft = "28px";
+    keyboardHideTieLabelsRow.title = "保留延音线与节奏标记；和“延音用 0 替代”同时开启时优先隐藏";
     const slashOrdering = document.createElement("select");
     slashOrdering.append(
       option("pitch-asc", "音高正序（低音到高音）", true),
@@ -365,6 +380,9 @@ export function showMidiImportDialog(parsed: ParsedMidi, analysis: MidiAnalysis,
     const orderingRow = row("文本谱和弦书写顺序", slashOrdering);
     controls.append(
       row("导入后格式", outputFormat),
+      keyboardKeyLabelsRow,
+      keyboardTieAsZeroRow,
+      keyboardHideTieLabelsRow,
       row("谱面结构", scoreMode),
       row("推荐量化", quantize),
       row("自动识别三连音", triplets),
@@ -427,6 +445,14 @@ export function showMidiImportDialog(parsed: ParsedMidi, analysis: MidiAnalysis,
       splitRow.hidden = ensemble;
       instrumentRow.hidden = ensemble;
       slashGroups.hidden = outputFormat.value === "jpw";
+      keyboardKeyLabelsRow.hidden = outputFormat.value !== "keyboard";
+      keyboardKeyLabelsRow.style.display = outputFormat.value === "keyboard" ? "" : "none";
+      const tieOptionsVisible =
+        outputFormat.value === "keyboard" && keyboardKeyLabels.checked;
+      keyboardTieAsZeroRow.hidden = !tieOptionsVisible;
+      keyboardTieAsZeroRow.style.display = tieOptionsVisible ? "" : "none";
+      keyboardHideTieLabelsRow.hidden = !tieOptionsVisible;
+      keyboardHideTieLabelsRow.style.display = tieOptionsVisible ? "" : "none";
       orderingRow.hidden = false;
       mapping.style.display = ensemble ? "" : "none";
       handRow.style.display = ensemble ? "none" : "";
@@ -462,6 +488,7 @@ export function showMidiImportDialog(parsed: ParsedMidi, analysis: MidiAnalysis,
     };
     hands.onchange = updateStructure;
     scoreMode.onchange = updateStructure;
+    keyboardKeyLabels.onchange = updateStructure;
     outputFormat.onchange = () => {
       updateStructure();
       updateHint();
@@ -502,6 +529,9 @@ export function showMidiImportDialog(parsed: ParsedMidi, analysis: MidiAnalysis,
         scoreMode: scoreMode.value as MidiScoreMode,
         trackAssignments,
         outputFormat: outputFormat.value as MidiOutputFormat,
+        keyboardKeyLabels: outputFormat.value === "keyboard" && keyboardKeyLabels.checked,
+        keyboardTieAsZero: keyboardTieAsZero.checked,
+        keyboardHideTieLabels: keyboardHideTieLabels.checked,
         slashBraceMode: braceMode.value as MidiSlashGroupMode,
         slashBracketMode: bracketMode.value as MidiSlashGroupMode,
         slashOrdering: slashOrdering.value as MidiSlashOrdering,

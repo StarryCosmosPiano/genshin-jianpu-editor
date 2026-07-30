@@ -50,8 +50,14 @@ export async function saveBytes(
     const a = document.createElement("a");
     a.href = URL.createObjectURL(blob);
     a.download = defaultName;
+    a.style.display = "none";
+    document.body.append(a);
     a.click();
-    URL.revokeObjectURL(a.href);
+    const url = a.href;
+    window.setTimeout(() => {
+      a.remove();
+      URL.revokeObjectURL(url);
+    }, 1000);
   }
 }
 

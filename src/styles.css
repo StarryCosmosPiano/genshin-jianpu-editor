@@ -13,7 +13,15 @@
 
 html, body { margin: 0; height: 100%; }
 
-#app { display: flex; flex-direction: column; height: 100vh; }
+#app {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  height: 100vh;
+  height: 100dvh;
+  min-width: 0;
+  overflow: hidden;
+}
 
 body.file-drag-active #app::after {
   content: "松开鼠标，直接导入乐谱 / MIDI / 图片";
@@ -42,12 +50,25 @@ body.file-drag-active #app::after {
   background: var(--panel);
   border-bottom: 1px solid var(--border);
   overflow-x: auto;
+  overflow-y: hidden;
+  overscroll-behavior-x: contain;
+  scrollbar-gutter: stable;
+  -webkit-overflow-scrolling: touch;
 }
 #toolbar > button,
 #toolbar > select {
+  flex: 0 0 auto;
   height: var(--toolbar-control-height);
+  min-width: max-content;
+  white-space: nowrap;
 }
 #toolbar button { padding: 4px 10px; cursor: pointer; }
+#toolbar #btn-preview-lock.active {
+  color: #fff;
+  border-color: #9a5b00;
+  background: #b66a00;
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.22);
+}
 #toolbar button.format-unavailable {
   color: #777;
   background: #ededed;
@@ -142,17 +163,62 @@ body.file-drag-active #app::after {
   transform: translateY(0);
 }
 
-#body { flex: 1 1 auto; display: flex; min-height: 0; }
+#body {
+  flex: 1 1 auto;
+  display: flex;
+  width: 100%;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
 
 #code-pane {
   flex: 0 0 38%;
-  border-right: 1px solid var(--border);
   overflow: auto;
   background: var(--panel);
 }
 
+#body:not([data-code-pane-side="right"]) #code-pane,
+#body[data-code-pane-side="left"] #code-pane {
+  order: 0;
+  border-right: 1px solid var(--border);
+}
+#body:not([data-code-pane-side="right"]) #code-pane-toggle,
+#body[data-code-pane-side="left"] #code-pane-toggle { order: 1; }
+#body:not([data-code-pane-side="right"]) #score-pane,
+#body[data-code-pane-side="left"] #score-pane { order: 2; }
+
+#body[data-code-pane-side="right"] #score-pane { order: 0; }
+#body[data-code-pane-side="right"] #code-pane-toggle { order: 1; }
+#body[data-code-pane-side="right"] #code-pane {
+  order: 2;
+  border-left: 1px solid var(--border);
+}
+
+#code-pane-toggle {
+  z-index: 4;
+  flex: 0 0 20px;
+  width: 20px;
+  min-width: 20px;
+  padding: 0;
+  border: 0;
+  border-left: 1px solid #bcc3cc;
+  border-right: 1px solid #bcc3cc;
+  border-radius: 0;
+  color: #4b5563;
+  background: linear-gradient(90deg, #edf0f4, #fafbfc 50%, #edf0f4);
+  cursor: pointer;
+  writing-mode: vertical-rl;
+}
+#code-pane-toggle:hover {
+  color: #1556a3;
+  background: #e4effc;
+}
+#body.code-pane-collapsed #code-pane { display: none; }
+
 /* Mixed mode is read-only render; hide the code editor entirely. */
-#body.mixed #code-pane { display: none; }
+#body.mixed #code-pane,
+#body.mixed #code-pane-toggle { display: none; }
 
 /* 识别模式：左侧代码区保留可编辑（无需隐藏）。二值底图与识别叠加均衡显示，便于对位核对。 */
 .omr-recognize { background: #fff; }
@@ -193,6 +259,8 @@ body.file-drag-active #app::after {
 
 #score-pane {
   flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
   overflow: auto;
   background: var(--bg);
   padding: 16px;
@@ -318,16 +386,21 @@ body.file-drag-active #app::after {
 .modal-overlay {
   position: fixed;
   inset: 0;
+  padding: 18px;
   background: rgba(0, 0, 0, 0.35);
   display: flex;
   align-items: center;
   justify-content: center;
+  overflow: auto;
+  overscroll-behavior: contain;
   z-index: 1000;
 }
 .modal-box {
   background: #fff;
   border-radius: 6px;
   min-width: 280px;
+  max-width: calc(100vw - 36px);
+  max-height: calc(100dvh - 36px);
   padding: 16px;
   box-shadow: 0 8px 30px rgba(0, 0, 0, 0.25);
 }
@@ -506,17 +579,37 @@ body.file-drag-active #app::after {
 
 /* ---- 全局简谱雕版样式 ---- */
 .engraving-box {
-  width: min(940px, calc(100vw - 36px));
+  width: min(1240px, calc(100vw - 36px));
   max-height: calc(100vh - 36px);
-  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
 }
-.engraving-dialog-body { min-width: 0; }
+.engraving-dialog-body {
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+}
 .engraving-hint { margin-bottom: 10px; }
+.engraving-workspace {
+  display: grid;
+  grid-template-columns: minmax(340px, 0.82fr) minmax(480px, 1.18fr);
+  gap: 14px;
+  min-height: 0;
+  flex: 1;
+  overflow: hidden;
+}
 .engraving-preview {
   display: flex;
   align-items: center;
   justify-content: center;
-  min-height: 290px;
+  position: sticky;
+  top: 0;
+  align-self: start;
+  min-height: 430px;
+  max-height: 100%;
   padding: 8px 12px;
   border: 1px solid #d8dde6;
   border-radius: 6px;
@@ -527,38 +620,39 @@ body.file-drag-active #app::after {
 .engraving-preview svg {
   display: block;
   width: 100%;
-  max-height: 360px;
+  max-height: min(620px, calc(100vh - 190px));
 }
 .engraving-controls {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(220px, 1fr));
+  display: flex;
+  flex-direction: column;
   gap: 10px;
-  margin-top: 12px;
+  min-height: 0;
+  padding-right: 5px;
+  overflow-y: auto;
+  scrollbar-gutter: stable;
 }
 .engraving-section {
-  padding: 10px;
   border: 1px solid #e0e3e8;
   border-radius: 6px;
   background: #f8f9fb;
 }
-.engraving-section-wide {
-  grid-column: 1 / -1;
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  column-gap: 18px;
-  align-content: start;
-}
-.engraving-section-wide > .engraving-section-title,
-.engraving-section-wide > .modal-hint {
-  grid-column: 1 / -1;
-}
-.engraving-section-double {
-  grid-column: span 2;
-}
 .engraving-section-title {
-  margin-bottom: 7px;
+  padding: 10px;
   color: #28313d;
   font-weight: 600;
+  cursor: pointer;
+  user-select: none;
+}
+.engraving-section[open] > .engraving-section-title {
+  margin-bottom: 6px;
+  border-bottom: 1px solid #e0e3e8;
+}
+.engraving-section > :not(summary) {
+  margin-right: 10px;
+  margin-left: 10px;
+}
+.engraving-section > :last-child:not(summary) {
+  margin-bottom: 10px;
 }
 .engraving-control {
   display: grid;
@@ -592,19 +686,26 @@ body.file-drag-active #app::after {
   margin-top: 10px;
   padding: 5px 12px;
   cursor: pointer;
+  align-self: flex-start;
 }
-@media (max-width: 780px) {
-  .engraving-controls { grid-template-columns: 1fr; }
-  .engraving-section-wide {
-    grid-column: auto;
-    grid-template-columns: 1fr;
+@media (max-width: 900px) {
+  .engraving-box {
+    overflow: auto;
   }
-  .engraving-section-double { grid-column: auto; }
-  .engraving-section-wide > .engraving-section-title,
-  .engraving-section-wide > .modal-hint {
-    grid-column: auto;
+  .engraving-workspace {
+    display: flex;
+    flex-direction: column;
+    overflow: visible;
   }
-  .engraving-preview { min-height: 135px; }
+  .engraving-preview {
+    order: -1;
+    z-index: 1;
+    min-height: 190px;
+    max-height: 280px;
+  }
+  .engraving-controls {
+    overflow: visible;
+  }
 }
 
 /* ---- 帮助对话框（双标签页：功能帮助 + 记谱法） ---- */
@@ -735,6 +836,196 @@ body.file-drag-active #app::after {
   background: var(--panel);
   border-top: 1px solid var(--border);
   min-height: 22px;
+}
+
+/* ---- Responsive application shell ----
+   Toolbar controls never shrink into two-line labels.  Narrow screens scroll
+   the toolbar horizontally, while portrait phones stack editor and score so
+   both remain usable without squeezing either pane to an unreadable width. */
+@media (max-width: 760px) {
+  #toolbar {
+    --toolbar-control-height: 34px;
+    gap: 4px;
+    padding: 4px 6px;
+    scroll-snap-type: x proximity;
+  }
+  #toolbar > button,
+  #toolbar > select,
+  #rhythm-grid-control {
+    scroll-snap-align: start;
+  }
+  #toolbar > button {
+    min-width: 42px;
+    padding: 4px 9px;
+  }
+  #toolbar .sep {
+    flex: 0 0 1px;
+    margin: 0 2px;
+  }
+  #toolbar #rhythm-grid-control button {
+    width: 32px;
+    min-width: 32px;
+  }
+
+  #body {
+    flex-direction: column;
+  }
+  #body:not([data-code-pane-side="right"]) #code-pane,
+  #body[data-code-pane-side="left"] #code-pane,
+  #body[data-code-pane-side="right"] #code-pane {
+    flex: 0 0 clamp(180px, 38dvh, 360px);
+    width: 100%;
+    min-width: 0;
+    border-right: 0;
+    border-left: 0;
+  }
+  #body:not([data-code-pane-side="right"]) #code-pane,
+  #body[data-code-pane-side="left"] #code-pane {
+    order: 0;
+    border-bottom: 1px solid var(--border);
+  }
+  #body:not([data-code-pane-side="right"]) #code-pane-toggle,
+  #body[data-code-pane-side="left"] #code-pane-toggle {
+    order: 1;
+  }
+  #body:not([data-code-pane-side="right"]) #score-pane,
+  #body[data-code-pane-side="left"] #score-pane {
+    order: 2;
+  }
+  #body[data-code-pane-side="right"] #score-pane {
+    order: 0;
+  }
+  #body[data-code-pane-side="right"] #code-pane-toggle {
+    order: 1;
+  }
+  #body[data-code-pane-side="right"] #code-pane {
+    order: 2;
+    border-top: 1px solid var(--border);
+  }
+  #code-pane-toggle {
+    flex: 0 0 24px;
+    width: 100%;
+    min-width: 0;
+    height: 24px;
+    min-height: 24px;
+    border-top: 1px solid #bcc3cc;
+    border-right: 0;
+    border-bottom: 1px solid #bcc3cc;
+    border-left: 0;
+    writing-mode: horizontal-tb;
+  }
+  #score-pane {
+    padding: 8px 5px;
+    gap: 8px;
+    align-items: center;
+  }
+  .score-page-wrap {
+    max-width: 100%;
+  }
+  #status {
+    max-height: 44px;
+    padding: 3px 7px;
+    overflow: auto;
+    line-height: 1.35;
+  }
+
+  .modal-overlay {
+    align-items: flex-start;
+    padding: 8px;
+  }
+  .modal-box,
+  .options-box,
+  .midi-import-box,
+  .slash-import-box,
+  .create-score-box,
+  .engraving-box,
+  .help-box {
+    width: 100%;
+    min-width: 0;
+    max-width: none;
+    max-height: calc(100dvh - 16px);
+    border-radius: 5px;
+  }
+  .modal-box {
+    padding: 12px;
+  }
+  .modal-row {
+    align-items: stretch;
+    flex-direction: column;
+    gap: 5px;
+  }
+  .modal-row input,
+  .modal-row select {
+    width: 100%;
+    min-width: 0;
+  }
+  .modal-footer {
+    position: sticky;
+    bottom: -12px;
+    z-index: 3;
+    margin: 14px -12px -12px;
+    padding: 9px 12px calc(9px + env(safe-area-inset-bottom));
+    border-top: 1px solid #e1e4e8;
+    background: rgba(255, 255, 255, 0.97);
+  }
+  .slash-space-control {
+    align-items: stretch;
+  }
+  .slash-space-control small {
+    max-width: none;
+    text-align: left;
+  }
+  .midi-split-control,
+  .midi-meter-control {
+    width: 100%;
+  }
+  .midi-split-control input,
+  .midi-meter-control input,
+  .midi-meter-control select {
+    flex: 1 1 auto;
+    width: auto;
+  }
+  .engraving-preview {
+    min-height: 160px;
+    max-height: 230px;
+  }
+  .engraving-control {
+    grid-template-columns: minmax(92px, 1fr) minmax(90px, 1.2fr) 54px;
+  }
+}
+
+/* A landscape phone has little vertical space but enough horizontal room.
+   Keep the two panes side-by-side and compact only the surrounding chrome. */
+@media (orientation: landscape) and (max-height: 520px) and (min-width: 761px) {
+  #toolbar {
+    --toolbar-control-height: 27px;
+    gap: 4px;
+    padding: 3px 6px;
+  }
+  #toolbar > button {
+    padding: 2px 8px;
+  }
+  #toolbar .sep {
+    margin: 0 2px;
+  }
+  #code-pane {
+    flex-basis: 34%;
+  }
+  #score-pane {
+    padding: 7px;
+    gap: 7px;
+  }
+  #status {
+    min-height: 19px;
+    padding-block: 1px;
+  }
+  .modal-overlay {
+    align-items: flex-start;
+    padding: 6px;
+  }
+  .modal-box {
+    max-height: calc(100dvh - 12px);
+  }
 }
 
 /* ---- .jpwabc syntax highlight classes (ported from editor.css) ---- */

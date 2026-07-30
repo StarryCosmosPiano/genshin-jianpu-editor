@@ -425,8 +425,13 @@ export abstract class SlurTieBase extends Group {
     const cos = Math.cos(-theta);
     const sin = Math.sin(-theta);
     const xlen = Math.min(dist * 0.04 + 10, dist * 0.25);
-    let h = Math.log10(dist) * 17 - 16;
-    h *= -1;
+    const naturalSag = Math.log10(Math.max(dist, 1)) * 17 - 16;
+    // The logarithmic curve approaches (and for very short spans crosses)
+    // zero. That made a short tie, including a system-edge fragment, look
+    // like a straight tapered rule. Preserve a visible upward bow while
+    // keeping the old geometry for normal and long spans.
+    const minimumSag = Math.min(6, Math.max(4, dist * 0.16));
+    const h = -Math.max(minimumSag, naturalSag);
     let p1 = new Point(xlen, h).rotate(cos, sin);
     let p2 = new Point(dist - xlen, h).rotate(cos, sin);
     p1 = p1.offset(xl, yl);
@@ -636,12 +641,34 @@ export class NoteEntry extends Entry {
     return false;
   }
 
+  private static noteText(nt: S.Note): string {
+    return nt.displayText ?? nt.number;
+  }
+
+  private static noteOctave(nt: S.Note): number {
+    return nt.displayOctave ?? nt.jpOctave;
+  }
+
+  private static noteAlter(nt: S.Note): string {
+    return nt.displayAlter ?? nt.jpAlter;
+  }
+
+  private static noteBaselineOffset(nt: S.Note, opt: LayoutOptions): number {
+    // Q has a deep descender, so its uppercase body appears higher than the
+    // surrounding keyboard letters on a shared typographic baseline.
+    return NoteEntry.noteText(nt).substring(0, 1) === "Q"
+      ? opt.numberSize * 0.05
+      : 0;
+  }
+
   private static noteTop(nt: S.Note, opt: LayoutOptions): number {
-    const numberTop = opt.numberBound(nt.number || "1").top;
-    if (nt.jpOctave <= 0) return numberTop;
+    const octave = NoteEntry.noteOctave(nt);
+    const numberTop = opt.numberBound(NoteEntry.noteText(nt) || "1").top
+      + NoteEntry.noteBaselineOffset(nt, opt);
+    if (octave <= 0) return numberTop;
     const diameter = opt.octaveDotDiameter();
     const gap = opt.octaveDotGap();
-    return numberTop - gap - nt.jpOctave * diameter - (nt.jpOctave - 1) * gap;
+    return numberTop - gap - octave * diameter - (octave - 1) * gap;
   }
 
   private static noteBottom(
@@ -650,14 +677,16 @@ export class NoteEntry extends Entry {
     opt: LayoutOptions,
     includeBeams = true,
   ): number {
-    const numberBottom = opt.numberBound(nt.number || "1").bottom;
+    const octave = NoteEntry.noteOctave(nt);
+    const numberBottom = opt.numberBound(NoteEntry.noteText(nt) || "1").bottom
+      + NoteEntry.noteBaselineOffset(nt, opt);
     const rhythmicBottom = includeBeams
       ? Math.max(numberBottom, ch.beams * opt.jpBeamDist)
       : numberBottom;
-    if (nt.jpOctave >= 0) return rhythmicBottom;
+    if (octave >= 0) return rhythmicBottom;
     const diameter = opt.octaveDotDiameter();
     const gap = opt.octaveDotGap();
-    const count = -nt.jpOctave;
+    const count = -octave;
     return rhythmicBottom + gap + count * diameter + (count - 1) * gap;
   }
 
@@ -720,7 +749,7 @@ export class NoteEntry extends Entry {
     ent: NoteEntry,
     rowY = 0,
   ): void {
-    const alt = nt.jpAlter;
+    const alt = NoteEntry.noteAlter(nt);
     if (alt !== " ") {
       const tf = new SmuflText(options);
       tf.classes.add("jianpu-accidental");
@@ -730,6 +759,7 @@ export class NoteEntry extends Entry {
           ? "jianpu-accidental-sharp"
           : "jianpu-accidental-natural");
       tf.color = continuationColor(options.color, fadeTiedContinuation(ent.chord, options, nt));
+      if (nt.displayHidden) tf.classes.add("notation-hidden-label");
       if (options.smuflAsPath) tf.asPath = true;
       let smufl: string;
       switch (alt) {
@@ -758,17 +788,18 @@ export class NoteEntry extends Entry {
     rowY = 0,
     includeBeams = true,
   ): void {
-    const oct = nt.jpOctave;
+    const oct = NoteEntry.noteOctave(nt);
     // Digits do not all share exactly the same tight top/bottom bounds.  Use
     // the owning digit instead of the former generic "1", so an upper or
     // lower dot hugs the number it actually belongs to.
-    const numBound = options.numberBound(nt.number || "1");
+    const numBound = options.numberBound(NoteEntry.noteText(nt) || "1");
     const diameter = options.octaveDotDiameter();
     const gap = options.octaveDotGap();
     for (let d = 0; d < Math.abs(oct); d++) {
       const color = continuationColor(options.color, fadeTiedContinuation(ent.chord, options, nt));
       const tf = new JpOctaveDot(diameter / 2, color);
       tf.owner = owner;
+      if (nt.displayHidden) tf.classes.add("notation-hidden-label");
       tf.update();
       tf.x = owner.x + owner.cx - tf.width / 2;
       if (oct > 0) {
@@ -897,7 +928,8 @@ export class NoteEntry extends Entry {
     const mainNumber = ent.number;
     if (!mainNumber) return;
     const mainPosition = mainNumber.pos(ent.group);
-    const mainBound = options.numberBound(ch.notes[0]?.number || "1");
+    const mainNote = ch.notes[0];
+    const mainBound = options.numberBound(mainNote ? NoteEntry.noteText(mainNote) : "1");
     // Keep the small digit fully above the main note: its visual bottom sits
     // on the same horizontal line as the main digit's visual top.
     const graceBottom = mainPosition.y + mainBound.top;
@@ -914,22 +946,23 @@ export class NoteEntry extends Entry {
       noteGroup.classes.add("jianpu-grace-note");
       const number = new JpNumber();
       number.classes.add("jianpu-grace-number");
-      number.text = note.number;
+      number.text = NoteEntry.noteText(note);
       number.font = font;
       number.color = options.color;
-      const numberBound = LayoutOptions.charBound(font, note.number || "1");
+      const numberBound = LayoutOptions.charBound(font, NoteEntry.noteText(note) || "1");
       number.y = graceBottom - numberBound.bottom;
       number.update();
       noteGroup.add(number);
 
-      if (note.jpAlter !== " ") {
+      const displayAlter = NoteEntry.noteAlter(note);
+      if (displayAlter !== " ") {
         const accidental = new SmuflText(options);
         accidental.classes.add("jianpu-grace-accidental");
         accidental.color = options.color;
         accidental.font = options.smuflFont.makeWithSize(font.size * 0.72);
-        accidental.text = note.jpAlter === "b"
+        accidental.text = displayAlter === "b"
           ? GlyphCodes.accidentalFlat
-          : note.jpAlter === "#"
+          : displayAlter === "#"
             ? GlyphCodes.accidentalSharp
             : GlyphCodes.accidentalNatural;
         accidental.update();
@@ -938,13 +971,14 @@ export class NoteEntry extends Entry {
         noteGroup.add(accidental);
       }
 
-      for (let dotIndex = 0; dotIndex < Math.abs(note.jpOctave); dotIndex++) {
+      const displayOctave = NoteEntry.noteOctave(note);
+      for (let dotIndex = 0; dotIndex < Math.abs(displayOctave); dotIndex++) {
         const dot = new JpOctaveDot(diameter / 2, options.color);
         dot.owner = number;
         dot.update();
         dot.x = number.x + number.cx - dot.width / 2;
         const dotGap = Math.max(0.4, options.octaveDotGap() * 0.62);
-        if (note.jpOctave > 0) {
+        if (displayOctave > 0) {
           dot.y = number.y + numberBound.top -
             dotGap - diameter - dotIndex * (diameter + dotGap);
         } else {
@@ -1045,30 +1079,40 @@ export class NoteEntry extends Entry {
     ent.verse = lrc;
     const notes = ch.notes.length > 0 ? ch.notes : [];
     ent.rowYs = NoteEntry.chordRowYs(notes, ch, options);
+    const noteTexts = notes.map((note) => NoteEntry.noteText(note));
+    // Chord rows used to share x=0, which left-aligned their glyphs. That is
+    // barely visible for equal-width digits, but makes a narrow keyboard key
+    // such as J sit conspicuously to the left of a wide W. Keep the widest
+    // row at x=0 and align every first glyph by its advance-box centre.
+    const chordCenter = noteTexts.reduce((center, text) =>
+      Math.max(center, options.numberFont.measureText(text.substring(0, 1)) / 2), 0);
     let it: JpNumber | null = null;
     for (let i = 0; i < notes.length; i++) {
       const nt = notes[i];
       const num = new JpNumber();
       num.color = continuationColor(options.color, fadeTiedContinuation(ch, options, nt));
-      num.text = nt.number;
+      num.text = noteTexts[i];
       num.font = options.numberFont;
+      if (nt.displayHidden) num.classes.add("notation-hidden-label");
+      num.x = chordCenter - num.cx;
       const rowY = ent.rowYs[i] ?? 0;
-      num.y = rowY;
+      const displayRowY = rowY + NoteEntry.noteBaselineOffset(nt, options);
+      num.y = displayRowY;
       ent.add(num);
-      NoteEntry.addAccidental(num, options, nt, ent, rowY);
+      NoteEntry.addAccidental(num, options, nt, ent, displayRowY);
       NoteEntry.octaveDot(
         nt,
         ch,
         options,
         ent,
         num,
-        rowY,
+        displayRowY,
         i === notes.length - 1,
       );
       if (i === 0) it = num;
     }
     if (!it) throw new Error("chord without notes");
-    if (ch.beats <= 1 && ch.dot > 0) {
+    if (ch.dot > 0) {
       const augmentationDots = "·".repeat(ch.dot);
       for (const number of ent.numbers) number.text += augmentationDots;
     }

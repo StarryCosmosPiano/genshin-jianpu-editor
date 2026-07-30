@@ -323,15 +323,63 @@ function staffCount(partEl: Element): number {
 function twoPartPiano(root: Element): boolean {
   const parts = elems(root, "part");
   if (parts.length !== 2) return false;
-  const names = elems(elem(root, "part-list") ?? root, "score-part")
-    .map((p) => txt(p, "part-name") ?? "")
-    .join(" ");
-  return /(piano|keyboard|right|left|treble|bass|\brh\b|\blh\b|钢琴|右手|左手)/i.test(names);
+  const partList = elem(root, "part-list") ?? root;
+  const partNames = elems(partList, "score-part")
+    .map((p) => (txt(p, "part-name") ?? "").trim());
+  const names = partNames.join(" ");
+  const pairedVoiceNames = partNames.length === 2
+    && partNames.every((name) => /V[12]$/i.test(name))
+    && partNames.map((name) => name.replace(/V[12]$/i, "")).every(
+      (name, _index, bases) => name === bases[0],
+    );
+  const braceGroup = elems(partList, "part-group").some((group) =>
+    txt(group, "group-symbol") === "brace");
+  return pairedVoiceNames || braceGroup
+    || /(piano|keyboard|right|left|treble|bass|\brh\b|\blh\b|钢琴|右手|左手)/i.test(names);
 }
 
 function pianoRoot(root: Element): boolean {
   const parts = elems(root, "part");
-  return (parts.length > 0 && staffCount(parts[0]) >= 2) || twoPartPiano(root);
+  return (parts.length === 1 && staffCount(parts[0]) >= 2) || twoPartPiano(root);
+}
+
+interface ImportedPartMetadata {
+  name: string;
+  voice: number;
+}
+
+function importedPartMetadata(root: Element): Map<string, ImportedPartMetadata> {
+  const result = new Map<string, ImportedPartMetadata>();
+  const partList = elem(root, "part-list");
+  if (!partList) return result;
+  let braceGroup: string | null = null;
+  const voiceByName = new Map<string, number>();
+  for (const child of Array.from(partList.children)) {
+    if (child.tagName === "part-group") {
+      if (child.getAttribute("type") === "start" && txt(child, "group-symbol") === "brace") {
+        braceGroup = normText(txt(child, "group-name"));
+      } else if (child.getAttribute("type") === "stop") {
+        braceGroup = null;
+      }
+      continue;
+    }
+    if (child.tagName !== "score-part") continue;
+    const id = child.getAttribute("id");
+    if (!id) continue;
+    const raw = normText(txt(child, "part-name")) ?? `乐器 ${result.size + 1}`;
+    const voiceSuffix = /^(.*?)(?:\s*V(\d+)|\s+声部\s*(\d+))$/i.exec(raw);
+    const name = braceGroup
+      || voiceSuffix?.[1]?.trim()
+      || raw;
+    const explicitVoice = parseInt(voiceSuffix?.[2] ?? voiceSuffix?.[3] ?? "", 10);
+    const nextVoice = (voiceByName.get(name) ?? 0) + 1;
+    const voice = Number.isFinite(explicitVoice) && explicitVoice > 0
+      ? explicitVoice
+      : nextVoice;
+    voiceByName.set(name, Math.max(nextVoice, voice));
+    result.set(id, { name, voice });
+  }
+  return result;
 }
 
 function importedPianoInstrumentName(root: Element): string {
@@ -347,6 +395,7 @@ function importedPianoInstrumentName(root: Element): string {
       .replace(/\b(?:right|left)\s*(?:hand)?\b/ig, "")
       .replace(/\b[rl]\.?h\.?\b/ig, "")
       .replace(/右手|左手/g, "")
+      .replace(/V\d+$/i, "")
       .replace(/^[\s·:：—–-]+|[\s·:：—–-]+$/g, "")
       .trim())
     .filter((name) => name.length > 0);
@@ -467,12 +516,14 @@ export function loadMusicXml(xmlText: string): Score {
 
   const partEls = elems(root, "part");
   if (partEls.length === 0) throw new Error("MusicXML 没有 part");
-  if (staffCount(partEls[0]) >= 2) {
+  if (partEls.length === 1 && staffCount(partEls[0]) >= 2) {
     const right = new Part();
     right.hand = "right";
+    right.voiceIndex = 1;
     loadPart(right, partEls[0], score.playData, 1);
     const left = new Part();
     left.hand = "left";
+    left.voiceIndex = 2;
     // Sound/repeat metadata is score-global; parsing the second staff into a
     // throwaway PlayData avoids duplicating jump entries.
     loadPart(left, partEls[0], new PlayData(), 2);
@@ -481,16 +532,38 @@ export function loadMusicXml(xmlText: string): Score {
   } else if (twoPartPiano(root)) {
     const right = new Part();
     right.hand = "right";
+    right.voiceIndex = 1;
     loadPart(right, partEls[0], score.playData);
     const left = new Part();
     left.hand = "left";
+    left.voiceIndex = 2;
     loadPart(left, partEls[1], new PlayData());
     score.parts.push(right, left);
     score.piano = true;
   } else {
-    const part = new Part();
-    loadPart(part, partEls[0], score.playData);
-    score.parts.push(part);
+    const metadata = importedPartMetadata(root);
+    for (let partIndex = 0; partIndex < partEls.length; partIndex++) {
+      const partEl = partEls[partIndex];
+      const id = partEl.getAttribute("id") ?? "";
+      const info = metadata.get(id) ?? {
+        name: `乐器 ${partIndex + 1}`,
+        voice: 1,
+      };
+      const staves = staffCount(partEl);
+      for (let staff = 1; staff <= staves; staff++) {
+        const part = new Part();
+        part.instrumentName = info.name;
+        part.voiceIndex = info.voice + staff - 1;
+        loadPart(
+          part,
+          partEl,
+          score.parts.length === 0 ? score.playData : new PlayData(),
+          staves > 1 ? staff : undefined,
+        );
+        score.parts.push(part);
+      }
+    }
+    score.ensemble = score.parts.length > 1;
   }
   if (score.piano) {
     score.instrumentName = importedPianoInstrumentName(root);
@@ -506,8 +579,10 @@ export function loadMusicXml(xmlText: string): Score {
   }
   for (const part of score.parts) {
     for (const m of part.measures) {
-      m.init(score.piano ? { keepChords: true, primaryVoice: true } : undefined);
-      if (score.piano) {
+      m.init(score.piano || score.ensemble
+        ? { keepChords: true, primaryVoice: true }
+        : undefined);
+      if (score.piano || score.ensemble) {
         for (const ent of m.entries) {
           if (!(ent instanceof Chord)) continue;
           const lyrics = ent.notes.flatMap((n) => n.lyrics);

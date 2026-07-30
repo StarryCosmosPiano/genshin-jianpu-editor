@@ -4,6 +4,7 @@
 // exported MIDI honors the expanded play order (repeats / voltas / D.C. / D.S.).
 
 import { Score } from "./score";
+import { scorePartTrackName } from "./part-label";
 import {
   buildTimeline,
   partGain,
@@ -115,9 +116,7 @@ export function scoreToMidi(score: Score, opts?: PlayOptions): Uint8Array {
   const out: number[] = [...header, ...tempoTrack(tempo)];
   for (let i = 0; i < score.parts.length; i++) {
     const part = score.parts[i];
-    const trackName = part.instrumentName
-      ? `${part.instrumentName}${score.parts.filter((item) => item.instrumentName === part.instrumentName).length > 1 ? ` 声部 ${part.voiceIndex}` : ""}`
-      : part.hand === "right" ? "Right Hand" : part.hand === "left" ? "Left Hand" : `声部 ${i + 1}`;
+    const trackName = scorePartTrackName(score, part, i);
     out.push(...partTrack(notes, i, trackName, opts));
   }
   return new Uint8Array(out);

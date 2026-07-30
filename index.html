@@ -64,7 +64,7 @@
           "alternateName": "Genshin Jianpu Editor",
           "applicationCategory": "MultimediaApplication",
           "operatingSystem": "Windows, macOS, Web",
-          "softwareVersion": "0.2.0",
+          "softwareVersion": "0.3.0",
           "url": "https://starrycosmospiano.github.io/genshin-jianpu-editor/",
           "downloadUrl": "https://github.com/StarryCosmosPiano/genshin-jianpu-editor/releases",
           "screenshot": "https://starrycosmospiano.github.io/genshin-jianpu-editor/og-image.png",
@@ -164,6 +164,7 @@
         <button id="btn-score-settings" title="修改当前键盘谱或数字谱的识别、节奏、拍号、速度与标题设置">乐谱设置</button>
         <button id="btn-layout-style" title="调整数字、和弦、花括号和小节线并应用到全部简谱">排版</button>
         <span class="sep"></span>
+        <button id="btn-preview-lock" type="button" aria-pressed="false" title="暂停文本编辑引起的实时重排">锁定谱面</button>
         <button id="btn-play">播放</button>
         <button id="btn-stop">停止</button>
         <div id="rhythm-grid-control" role="group" aria-label="音符移动与节奏刻度">
@@ -188,6 +189,7 @@
       </div>
       <div id="body">
         <div id="code-pane"></div>
+        <button id="code-pane-toggle" type="button" aria-label="隐藏或展开文本编辑器" aria-expanded="true" title="隐藏文本编辑器">◀</button>
         <div id="score-pane"></div>
       </div>
       <div id="status"></div>

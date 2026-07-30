@@ -16,8 +16,11 @@ import avidMidiUrl from "../examples/Avid - 86 -不存在的战区.mid?url";
 
 const AVID_FALLBACK = `// ************** JPW-ABC File Ver 1.0 (for JP-Word v5.50m) **************
 .Title
-Title = {Avid - 86 -不存在的战区}
-Composer = {Hiroyuki Sawano}
+Title = Avid - 86—不存在的战区—
+SubTitle = {86—Eighty Six— ED}
+Composer = {泽野弘之(Hiroyuki Sawano)}
+Arranger = {星宇StarryCosmos}
+Lyricist = {cAnON.}
 Instrument = {钢琴}
 KeyAndMeters = {1=C,4/4}
 Tempo = {73}
@@ -45,8 +48,11 @@ async function loadBuiltInSample(): Promise<string> {
       beatType: analysis.beatType,
       tempoBpm: analysis.tempoBpm,
       tempoBeatUnit: "quarter",
-      title: "Avid - 86 -不存在的战区",
-      composer: "Hiroyuki Sawano",
+      title: "Avid - 86—不存在的战区—",
+      subtitle: "86—Eighty Six— ED",
+      composer: "泽野弘之(Hiroyuki Sawano)",
+      arranger: "星宇StarryCosmos",
+      lyricist: "cAnON.",
       instrumentName: "钢琴",
       scoreMode: "hands",
       outputFormat: "jpw",
@@ -105,6 +111,13 @@ async function boot() {
   on("btn-layout-style", () => showEngravingStyleDialog(app));
   on("btn-export", () => showExportDialog(app));
   on("btn-help", () => showHelpDialog(app));
+  const previewLockBtn = document.getElementById("btn-preview-lock") as HTMLButtonElement | null;
+  if (previewLockBtn) {
+    app.setPreviewLockBtn(previewLockBtn);
+    previewLockBtn.addEventListener("click", () => app.togglePreviewLock());
+  }
+  const codePaneToggle = document.getElementById("code-pane-toggle") as HTMLButtonElement | null;
+  codePaneToggle?.addEventListener("click", () => app.toggleCodePane());
   on("btn-create", () => {
     void showCreateScoreDialog().then((kind) => {
       if (kind) void app.createDocument(kind);

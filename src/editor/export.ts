@@ -1,9 +1,11 @@
 // Export: PNG (rasterize page SVG), MIDI (SMF), PPTX, Mixed PDF.
 import type { App } from "./app";
 import { scoreToMidi } from "../score/midi";
+import { scoreToMusicXml } from "../score/musicxml-export";
 import { buildPptx } from "./pptx";
 import { isTauriRuntime, saveBytes } from "./fileio";
 import { asset } from "../common/asset";
+import { zipSync } from "fflate";
 
 const SVG_NS = "http://www.w3.org/2000/svg";
 
@@ -22,13 +24,25 @@ async function bravuraDataUrl(): Promise<string> {
   return bravuraDataUrlPromise;
 }
 
-/** Serialize a page <svg> with Bravura embedded so it rasterizes faithfully. */
-async function svgToBytes(svg: SVGSVGElement, scale: number): Promise<Uint8Array> {
-  const w = Number(svg.getAttribute("width"));
-  const h = Number(svg.getAttribute("height"));
+function svgDimensions(svg: SVGSVGElement): { width: number; height: number } {
+  const viewBox = svg.viewBox.baseVal;
+  const width = Number(svg.getAttribute("width")) || viewBox.width || svg.clientWidth;
+  const height = Number(svg.getAttribute("height")) || viewBox.height || svg.clientHeight;
+  if (!(width > 0) || !(height > 0)) throw new Error("谱面页面尺寸无效");
+  return { width, height };
+}
+
+/** Render one page with Bravura embedded so PNG/PDF output matches the SVG preview. */
+async function svgToCanvas(
+  svg: SVGSVGElement,
+  scale: number,
+  transparent: boolean,
+): Promise<HTMLCanvasElement> {
+  const { width, height } = svgDimensions(svg);
   const clone = svg.cloneNode(true) as SVGSVGElement;
   clone.setAttribute("xmlns", SVG_NS);
-  clone.removeAttribute("style");
+  clone.setAttribute("width", String(width));
+  clone.setAttribute("height", String(height));
 
   const style = document.createElementNS(SVG_NS, "style");
   style.textContent =
@@ -36,30 +50,53 @@ async function svgToBytes(svg: SVGSVGElement, scale: number): Promise<Uint8Array
   clone.insertBefore(style, clone.firstChild);
 
   const svgText = new XMLSerializer().serializeToString(clone);
-  const url = "data:image/svg+xml;charset=utf-8," + encodeURIComponent(svgText);
+  const url = URL.createObjectURL(new Blob([svgText], { type: "image/svg+xml;charset=utf-8" }));
 
   const img = new Image();
-  await new Promise<void>((res, rej) => {
-    img.onload = () => res();
-    img.onerror = () => rej(new Error("svg image load failed"));
-    img.src = url;
-  });
+  try {
+    await new Promise<void>((resolve, reject) => {
+      img.onload = () => resolve();
+      img.onerror = () => reject(new Error("谱面 SVG 无法转换为图片"));
+      img.src = url;
+    });
+  } finally {
+    URL.revokeObjectURL(url);
+  }
 
   const canvas = document.createElement("canvas");
-  canvas.width = Math.round(w * scale);
-  canvas.height = Math.round(h * scale);
+  canvas.width = Math.max(1, Math.round(width * scale));
+  canvas.height = Math.max(1, Math.round(height * scale));
   const ctx = canvas.getContext("2d")!;
-  ctx.fillStyle = "#fff";
-  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  if (!transparent) {
+    ctx.fillStyle = "#fff";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+  }
   ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+  return canvas;
+}
 
-  const blob = await new Promise<Blob | null>((res) => canvas.toBlob(res, "image/png"));
-  if (!blob) throw new Error("toBlob failed");
+async function canvasToBytes(
+  canvas: HTMLCanvasElement,
+  type: "image/png" | "image/jpeg",
+  quality?: number,
+): Promise<Uint8Array> {
+  const blob = await new Promise<Blob | null>((resolve) =>
+    canvas.toBlob(resolve, type, quality));
+  if (!blob) throw new Error(`${type} 编码失败`);
   return new Uint8Array(await blob.arrayBuffer());
 }
 
+async function svgToBytes(
+  svg: SVGSVGElement,
+  scale: number,
+  transparent = false,
+): Promise<Uint8Array> {
+  return canvasToBytes(await svgToCanvas(svg, scale, transparent), "image/png");
+}
+
 function baseName(app: App): string {
-  return app.painter.score.title.split("\n")[0] || "未命名";
+  return (app.painter.score.title.split("\n")[0] || "未命名")
+    .replace(/[<>:"/\\|?*\u0000-\u001f]/g, "_");
 }
 
 export async function exportCurrentPagePng(app: App): Promise<void> {
@@ -67,13 +104,229 @@ export async function exportCurrentPagePng(app: App): Promise<void> {
   if (!wrap) return;
   const svg = wrap.querySelector("svg") as SVGSVGElement | null;
   if (!svg) return;
-  const bytes = await svgToBytes(svg, 2);
+  const bytes = await svgToBytes(svg, 2, true);
   await saveBytes(bytes, `${baseName(app)}-第${app.pageIndex + 1}页.png`, "image/png");
+}
+
+interface PngExportOptions {
+  zip: boolean;
+  transparent: boolean;
+}
+
+function choosePngExportOptions(pageCount: number): Promise<PngExportOptions | null> {
+  return new Promise((resolve) => {
+    const overlay = document.createElement("div");
+    overlay.className = "modal-overlay";
+    const box = document.createElement("div");
+    box.className = "modal-box";
+    const title = document.createElement("div");
+    title.className = "modal-title";
+    title.textContent = `导出 PNG（共 ${pageCount} 页）`;
+
+    const transparent = document.createElement("input");
+    transparent.type = "checkbox";
+    transparent.checked = true;
+    const transparentRow = document.createElement("label");
+    transparentRow.className = "modal-row";
+    transparentRow.append(
+      Object.assign(document.createElement("span"), { textContent: "透明背景" }),
+      transparent,
+    );
+
+    const zip = document.createElement("input");
+    zip.type = "checkbox";
+    zip.checked = pageCount > 1;
+    const zipRow = document.createElement("label");
+    zipRow.className = "modal-row";
+    zipRow.append(
+      Object.assign(document.createElement("span"), { textContent: "压缩为一个 ZIP 文件" }),
+      zip,
+    );
+    const hint = document.createElement("div");
+    hint.className = "modal-hint";
+    hint.textContent = "关闭 ZIP 时每一页会分别保存；浏览器可能会询问是否允许下载多个文件。";
+
+    const footer = document.createElement("div");
+    footer.className = "modal-footer";
+    const cancel = document.createElement("button");
+    cancel.textContent = "取消";
+    const confirm = document.createElement("button");
+    confirm.textContent = "导出";
+    footer.append(cancel, confirm);
+    box.append(title, transparentRow, zipRow, hint, footer);
+    overlay.append(box);
+    document.body.append(overlay);
+
+    const close = (value: PngExportOptions | null) => {
+      overlay.remove();
+      resolve(value);
+    };
+    cancel.onclick = () => close(null);
+    confirm.onclick = () => close({
+      zip: zip.checked,
+      transparent: transparent.checked,
+    });
+    overlay.onclick = (event) => {
+      if (event.target === overlay) close(null);
+    };
+  });
+}
+
+function scorePageSvgs(app: App): Array<{ page: number; svg: SVGSVGElement }> {
+  return app.pageEls.flatMap((wrap, page) => {
+    const svg = wrap.querySelector("svg") as SVGSVGElement | null;
+    return svg ? [{ page, svg }] : [];
+  });
+}
+
+export async function exportAllPagesPng(app: App): Promise<void> {
+  const pages = scorePageSvgs(app);
+  if (pages.length === 0) throw new Error("当前没有可导出的谱面页面");
+  const options = await choosePngExportOptions(pages.length);
+  if (!options) return;
+
+  const name = baseName(app);
+  const files: Record<string, Uint8Array> = {};
+  for (const page of pages) {
+    files[`${name}-第${page.page + 1}页.png`] = await svgToBytes(
+      page.svg,
+      2,
+      options.transparent,
+    );
+  }
+  if (options.zip) {
+    await saveBytes(
+      zipSync(files, { level: 6 }),
+      `${name}-PNG.zip`,
+      "application/zip",
+    );
+    return;
+  }
+  for (const [filename, bytes] of Object.entries(files)) {
+    await saveBytes(bytes, filename, "image/png");
+  }
+}
+
+interface PdfRasterPage {
+  jpeg: Uint8Array;
+  pixelWidth: number;
+  pixelHeight: number;
+  pageWidth: number;
+  pageHeight: number;
+}
+
+function concatBytes(chunks: readonly Uint8Array[]): Uint8Array {
+  const length = chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0);
+  const result = new Uint8Array(length);
+  let offset = 0;
+  for (const chunk of chunks) {
+    result.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return result;
+}
+
+function buildRasterPdf(pages: readonly PdfRasterPage[]): Uint8Array {
+  const encoder = new TextEncoder();
+  const text = (value: string) => encoder.encode(value);
+  const objectCount = 2 + pages.length * 3;
+  const offsets = new Array<number>(objectCount + 1).fill(0);
+  const chunks: Uint8Array[] = [];
+  let length = 0;
+  const append = (chunk: Uint8Array) => {
+    chunks.push(chunk);
+    length += chunk.byteLength;
+  };
+  const writeObject = (number: number, body: readonly Uint8Array[]) => {
+    offsets[number] = length;
+    append(text(`${number} 0 obj\n`));
+    for (const chunk of body) append(chunk);
+    append(text("\nendobj\n"));
+  };
+
+  append(text("%PDF-1.4\n%JPEDITOR\n"));
+  writeObject(1, [text("<< /Type /Catalog /Pages 2 0 R >>")]);
+  const pageNumbers = pages.map((_page, index) => 3 + index * 3);
+  writeObject(2, [text(
+    `<< /Type /Pages /Count ${pages.length} /Kids [${pageNumbers.map((n) => `${n} 0 R`).join(" ")}] >>`,
+  )]);
+
+  pages.forEach((page, index) => {
+    const pageObject = 3 + index * 3;
+    const contentObject = pageObject + 1;
+    const imageObject = pageObject + 2;
+    const width = Math.round(page.pageWidth * 1000) / 1000;
+    const height = Math.round(page.pageHeight * 1000) / 1000;
+    writeObject(pageObject, [text(
+      `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${width} ${height}] `
+      + `/Resources << /ProcSet [/PDF /ImageC] /XObject << /Im0 ${imageObject} 0 R >> >> `
+      + `/Contents ${contentObject} 0 R >>`,
+    )]);
+    const content = text(`q\n${width} 0 0 ${height} 0 0 cm\n/Im0 Do\nQ`);
+    writeObject(contentObject, [
+      text(`<< /Length ${content.byteLength} >>\nstream\n`),
+      content,
+      text("\nendstream"),
+    ]);
+    writeObject(imageObject, [
+      text(
+        `<< /Type /XObject /Subtype /Image /Width ${page.pixelWidth} `
+        + `/Height ${page.pixelHeight} /ColorSpace /DeviceRGB `
+        + `/BitsPerComponent 8 /Filter /DCTDecode /Length ${page.jpeg.byteLength} >>\nstream\n`,
+      ),
+      page.jpeg,
+      text("\nendstream"),
+    ]);
+  });
+
+  const xrefOffset = length;
+  append(text(`xref\n0 ${objectCount + 1}\n0000000000 65535 f \n`));
+  for (let object = 1; object <= objectCount; object++) {
+    append(text(`${String(offsets[object]).padStart(10, "0")} 00000 n \n`));
+  }
+  append(text(
+    `trailer\n<< /Size ${objectCount + 1} /Root 1 0 R >>\n`
+    + `startxref\n${xrefOffset}\n%%EOF\n`,
+  ));
+  return concatBytes(chunks);
+}
+
+export async function exportScorePdf(app: App): Promise<void> {
+  const pages = scorePageSvgs(app);
+  if (pages.length === 0) throw new Error("当前没有可导出的谱面页面");
+  const rasterPages: PdfRasterPage[] = [];
+  for (const page of pages) {
+    const { width, height } = svgDimensions(page.svg);
+    const canvas = await svgToCanvas(page.svg, 2, false);
+    rasterPages.push({
+      jpeg: await canvasToBytes(canvas, "image/jpeg", 0.96),
+      pixelWidth: canvas.width,
+      pixelHeight: canvas.height,
+      pageWidth: width,
+      pageHeight: height,
+    });
+  }
+  await saveBytes(
+    buildRasterPdf(rasterPages),
+    `${baseName(app)}.pdf`,
+    "application/pdf",
+  );
 }
 
 export async function exportMidi(app: App): Promise<void> {
   const bytes = scoreToMidi(app.painter.score, { partVolumes: app.partVolumes });
   await saveBytes(bytes, `${baseName(app)}.mid`, "audio/midi");
+}
+
+export async function exportMusicXml(app: App): Promise<void> {
+  const text = app.mode === "mixed" && app.mixedXmlText
+    ? app.mixedXmlText
+    : scoreToMusicXml(app.painter.score);
+  await saveBytes(
+    new TextEncoder().encode(text),
+    `${baseName(app)}.musicxml`,
+    "application/vnd.recordare.musicxml+xml",
+  );
 }
 
 export async function exportPptx(app: App): Promise<void> {
@@ -251,16 +504,20 @@ export function showExportDialog(app: App): void {
         await fn();
       } catch (e) {
         console.error(e);
+        window.alert(`导出失败：${e instanceof Error ? e.message : String(e)}`);
       }
     };
     list.append(btn);
   };
   if (app.mode === "mixed") {
     item("混排 PDF", () => exportMixedPdf(app));
+    item("MusicXML", () => exportMusicXml(app));
   } else {
-    item("PNG（当前页）", () => exportCurrentPagePng(app));
+    item("PNG（全部页面）", () => exportAllPagesPng(app));
+    item("PDF（全部页面）", () => exportScorePdf(app));
     item("PPTX（矢量）", () => exportPptx(app));
     item("MIDI", () => exportMidi(app));
+    item("MusicXML", () => exportMusicXml(app));
     item("键盘谱 TXT", () => exportTextScore(app, "keyboard"));
     item("数字谱 TXT", () => exportTextScore(app, "number"));
     item("JPW 简谱（.jpwabc）", () => exportTextScore(app, "jpw"));

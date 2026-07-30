@@ -498,22 +498,23 @@ function durationShape(duration: number, triplet: TripletMark | null): { beats: 
   let beams = 4;
   let cells = Math.max(1, Math.round(duration * (1 << beams)));
   while (beams > 0 && cells % 2 === 0) { cells /= 2; beams--; }
+  if (cells === 3 && beams === 0) {
+    return { beats: 2, beams: 0, dot: 1, fraction: new Fraction(3) };
+  }
   if (cells === 3 && beams > 0) {
     return { beats: 1, beams: beams - 1, dot: 1, fraction: new Fraction(3, 2 * (1 << (beams - 1))) };
   }
   return { beats: cells, beams, dot: 0, fraction: new Fraction(cells, 1 << beams) };
 }
 
-/** Split binary-grid durations into tokens accepted by the JPW grammar (no mixed '_' and '-'). */
+/** Split binary-grid durations into canonical JPW values, including long dotted notes. */
 function splitNormalDuration(duration: number): number[] {
   const pieces: number[] = [];
   let left = Math.round(duration * 16) / 16;
-  if (left >= 1) {
-    const wholeQuarters = Math.floor(left + 1e-8);
-    pieces.push(wholeQuarters);
-    left -= wholeQuarters;
-  }
-  const candidates = [0.75, 0.5, 0.375, 0.25, 0.1875, 0.125, 0.09375, 0.0625];
+  const candidates = [
+    4, 3, 2, 1.5, 1,
+    0.75, 0.5, 0.375, 0.25, 0.1875, 0.125, 0.09375, 0.0625,
+  ];
   for (const candidate of candidates) {
     while (left >= candidate - 1e-8) {
       pieces.push(candidate);
@@ -524,11 +525,15 @@ function splitNormalDuration(duration: number): number[] {
   return pieces;
 }
 
-function splitMetricalDuration(duration: number, start: number): number[] {
+function splitMetricalDuration(
+  duration: number,
+  start: number,
+  beatDuration = 1,
+): number[] {
   const candidates = [
     { value: 4, alignment: 4 },
-    { value: 3, alignment: 4 },
-    { value: 2, alignment: 2 },
+    { value: 3, alignment: 1 },
+    { value: 2, alignment: 1 },
     { value: 1.5, alignment: 2 },
     { value: 1, alignment: 1 },
     { value: 0.75, alignment: 1 },
@@ -547,8 +552,17 @@ function splitMetricalDuration(duration: number, start: number): number[] {
   while (remaining > 1e-8 && guard++ < 1024) {
     const written = candidates.find((candidate) => {
       const cell = position / candidate.alignment;
+      const beatIndex = Math.floor((position + 1e-8) / beatDuration);
+      const availableInBeat = beatDuration * (beatIndex + 1) - position;
+      const crossesSimpleBeatAsDottedQuarter =
+        Math.abs(candidate.value - 1.5) <= 1e-8
+        && beatDuration < 1.5 - 1e-8;
       return candidate.value <= remaining + 1e-8
-        && Math.abs(cell - Math.round(cell)) <= 1e-8;
+        && (
+          (!crossesSimpleBeatAsDottedQuarter
+            && Math.abs(cell - Math.round(cell)) <= 1e-8)
+          || candidate.value <= availableInBeat + 1e-8
+        );
     });
     const value = written?.value ?? Math.min(remaining, 1 / 16);
     pieces.push(value);
@@ -609,11 +623,12 @@ function addSegment(
   fifths: number,
   triplet: TripletMark | null,
   preserveSourceRhythmSpelling = false,
+  beatDuration = 1,
 ): Chord[] {
   if (triplet) return [addChord(measure, start, duration, pitches, fifths, triplet)];
   const pieces = preserveSourceRhythmSpelling
     ? splitNormalDuration(duration)
-    : splitMetricalDuration(duration, start);
+    : splitMetricalDuration(duration, start, beatDuration);
   const chords: Chord[] = [];
   let position = start;
   for (const piece of pieces) {
@@ -749,6 +764,11 @@ function makePart(
   const eventLastChord = new Map<QuantizedChord, Chord>();
   for (let mi = 0; mi < bounds.length; mi++) {
     const bound = bounds[mi];
+    const beatDuration = bound.beatType === 8
+      && bound.beats >= 6
+      && bound.beats % 3 === 0
+      ? 1.5
+      : 4 / bound.beatType;
     const measure = new Measure(mi);
     measure.position = new Fraction(Math.round(bound.start * 48), 48);
     measure.time = new Time(bound.beats, bound.beatType);
@@ -770,6 +790,7 @@ function makePart(
           fifths,
           null,
           preserveSourceRhythmSpelling,
+          beatDuration,
         );
       }
       const eventChords = addSegment(
@@ -780,6 +801,7 @@ function makePart(
         fifths,
         event.triplet,
         preserveSourceRhythmSpelling,
+        beatDuration,
       );
       const previous = eventLastChord.get(event);
       if (previous && eventChords[0]) linkTiedChords(previous, eventChords[0]);
@@ -800,6 +822,7 @@ function makePart(
         fifths,
         null,
         preserveSourceRhythmSpelling,
+        beatDuration,
       );
     }
     measure.init({ keepChords: true, primaryVoice: true });

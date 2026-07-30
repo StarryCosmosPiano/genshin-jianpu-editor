@@ -44,6 +44,12 @@ export interface SlashTempoMark {
 
 export interface SlashScoreOptions {
   kind: SlashScoreKind;
+  /** Keyboard TXT only: show A-Z key labels without changing pitch semantics. */
+  keyboardKeyLabels?: boolean;
+  /** Keyboard-key view only: print tied continuation pitches as visual 0s. */
+  keyboardTieAsZero?: boolean;
+  /** Keyboard-key view only: hide tied continuation pitch labels entirely. */
+  keyboardHideTieLabels?: boolean;
   /** V1..VN; an unmarked pitch belongs to the last/default voice VN. */
   voiceCount: number;
   /** One shared label is printed to the left of a multi-voice brace. */
@@ -88,6 +94,9 @@ export interface SlashMeterSuggestion {
 
 export interface SlashScoreAnalysis {
   detectedKind: SlashScoreKind;
+  keyboardKeyLabels: boolean;
+  keyboardTieAsZero: boolean;
+  keyboardHideTieLabels: boolean;
   voiceCount: number;
   measureCount: number;
   commentCount: number;
@@ -194,6 +203,9 @@ interface SourceLines {
 
 interface Directives {
   kind: SlashScoreKind | null;
+  keyboardKeyLabels: boolean | null;
+  keyboardTieAsZero: boolean | null;
+  keyboardHideTieLabels: boolean | null;
   voiceCount: number | null;
   instrumentName: string;
   beats: number | null;
@@ -497,6 +509,9 @@ function readDirectives(text: string): Directives {
   const hasNumberHeader = /(?:^|\n)\s*数字谱\s*(?:\n|$)/i.test(text);
   const result: Directives = {
     kind: hasKeyboardHeader ? "keyboard" : hasNumberHeader ? "number" : null,
+    keyboardKeyLabels: null,
+    keyboardTieAsZero: null,
+    keyboardHideTieLabels: null,
     voiceCount: null,
     instrumentName: "",
     beats: null,
@@ -590,6 +605,7 @@ function readDirectives(text: string): Directives {
       type Stored = Partial<SlashScoreOptions> & {
         vc?: number; i?: string;
         k?: "k" | "n"; n?: string; u?: string; c?: string; a?: string; l?: string;
+        kl?: boolean; kz?: boolean; kh?: boolean;
         bpm?: number; f?: number; m?: [number, number]; s?: Record<string, SlashDurationDivision>;
         bu?: TempoBeatUnit;
         sp?: SlashDurationDivision | null; nd?: SlashDurationDivision | null;
@@ -603,6 +619,18 @@ function readDirectives(text: string): Directives {
       const value = JSON.parse(stored[1]) as Stored;
       const storedKind = value.kind ?? (value.k === "k" ? "keyboard" : value.k === "n" ? "number" : undefined);
       if (storedKind === "keyboard" || storedKind === "number") result.kind = storedKind;
+      const storedKeyboardKeyLabels = value.keyboardKeyLabels ?? value.kl;
+      if (typeof storedKeyboardKeyLabels === "boolean") {
+        result.keyboardKeyLabels = storedKeyboardKeyLabels;
+      }
+      const storedKeyboardTieAsZero = value.keyboardTieAsZero ?? value.kz;
+      if (typeof storedKeyboardTieAsZero === "boolean") {
+        result.keyboardTieAsZero = storedKeyboardTieAsZero;
+      }
+      const storedKeyboardHideTieLabels = value.keyboardHideTieLabels ?? value.kh;
+      if (typeof storedKeyboardHideTieLabels === "boolean") {
+        result.keyboardHideTieLabels = storedKeyboardHideTieLabels;
+      }
       const storedVoiceCount = value.voiceCount ?? value.vc;
       if (Number.isFinite(storedVoiceCount)) {
         result.voiceCount = clamp(Math.round(storedVoiceCount!), 1, MAX_SLASH_VOICES);
@@ -930,6 +958,9 @@ export function analyzeSlashScore(text: string): SlashScoreAnalysis {
   const voiceCount = directive.voiceCount ?? inferSlashVoiceCount(text, detectedKind);
   return {
     detectedKind,
+    keyboardKeyLabels: directive.keyboardKeyLabels ?? false,
+    keyboardTieAsZero: directive.keyboardTieAsZero ?? false,
+    keyboardHideTieLabels: directive.keyboardHideTieLabels ?? false,
     voiceCount,
     measureCount,
     commentCount: lines.comments.length,
@@ -963,6 +994,9 @@ export function analyzeSlashScore(text: string): SlashScoreAnalysis {
 export function defaultSlashScoreOptions(kind: SlashScoreKind, analysis?: SlashScoreAnalysis): SlashScoreOptions {
   return {
     kind,
+    keyboardKeyLabels: analysis?.keyboardKeyLabels ?? false,
+    keyboardTieAsZero: analysis?.keyboardTieAsZero ?? false,
+    keyboardHideTieLabels: analysis?.keyboardHideTieLabels ?? false,
     voiceCount: analysis?.voiceCount ?? 1,
     instrumentName: "钢琴",
     title: analysis?.title ?? "",
@@ -1592,6 +1626,15 @@ function optionsWithDirectives(text: string, base: SlashScoreOptions): SlashScor
     // This lets a user deliberately reinterpret “点=八分” as 16th notes, or
     // supply a meter for a continuous score with no measure separators.
     kind: base.kind ?? directive.kind ?? "number",
+    keyboardKeyLabels: base.keyboardKeyLabels
+      ?? directive.keyboardKeyLabels
+      ?? false,
+    keyboardTieAsZero: base.keyboardTieAsZero
+      ?? directive.keyboardTieAsZero
+      ?? false,
+    keyboardHideTieLabels: base.keyboardHideTieLabels
+      ?? directive.keyboardHideTieLabels
+      ?? false,
     voiceCount: clamp(
       Math.round(base.voiceCount ?? directive.voiceCount ?? inferSlashVoiceCount(
         text,
@@ -1968,9 +2011,17 @@ function continuationRoot(event: TimedEvent): TimedEvent {
 
 const METRICAL_DURATION_VALUES = [
   { value: 4, alignment: 4 },
-  { value: 3, alignment: 4 },
-  { value: 2, alignment: 2 },
-  { value: 1.5, alignment: 2 },
+  // A dotted half may begin on any quarter-note beat as long as it remains
+  // inside the measure. This lets a quarter + half continuation tail collapse
+  // into one readable three-beat continuation.
+  { value: 3, alignment: 1 },
+  // Continuation tails may combine two adjacent quarter-note beats into one
+  // half note from any exact beat, not only beats 1 and 3 of a 4/4 measure.
+  { value: 2, alignment: 1 },
+  // A dotted quarter is readable from every exact quarter-note beat.  A
+  // quarter followed by its tied eighth continuation therefore collapses to
+  // one dotted quarter instead of retaining a gray eighth at the next beat.
+  { value: 1.5, alignment: 1 },
   { value: 1, alignment: 1 },
   { value: 0.75, alignment: 1 },
   { value: 0.5, alignment: 0.5 },
@@ -2008,7 +2059,16 @@ function metricalContinuationStarts(
     const availableInBeat = Math.max(0, nextBeat - local);
     const written = METRICAL_DURATION_VALUES.find((candidate) => {
       const cell = local / candidate.alignment;
+      // For a 1¾-beat span, quarter + tied dotted-eighth is clearer than
+      // dotted-quarter + tied sixteenth.  Use the dotted quarter when it
+      // exactly consumes the requested 1½ beats, not when it leaves that
+      // unnecessarily short tail.
+      const leavesShortTail =
+        Math.abs(candidate.value - 1.5) <= 1e-8
+        && available > 1.5 + 1e-8
+        && available < 2 - 1e-8;
       return candidate.value <= available + 1e-8
+        && !leavesShortTail
         && (
           Math.abs(cell - Math.round(cell)) <= 1e-8
           || candidate.value <= availableInBeat + 1e-8
@@ -2155,12 +2215,26 @@ function addIndependentVoiceContinuations(
         && continuationRoot(event) === attack
         && event.start > attack.start + 1e-8
         && event.start < nextStart - 1e-8);
-      const requiredStarts = metricalContinuationStarts(
-        attack.start,
-        nextStart,
-        measureDuration,
-        groupDuration,
-      );
+      // Slash-group edges describe the compact TXT time grid, not mandatory
+      // printed tie boundaries. Re-spell the complete sustained span against
+      // the meter: a beat-aligned quarter + quarter becomes one half note and
+      // a beat-aligned quarter + dotted-half becomes one whole note. The
+      // metrical splitter still retains an internal boundary when the sound
+      // starts off-beat or genuinely crosses a beat/bar in a value that cannot
+      // be represented by one normal or dotted note.
+      const spanEdges = [attack.start, nextStart];
+      const requiredStarts: number[] = [];
+      for (let span = 0; span + 1 < spanEdges.length; span++) {
+        const spanStart = spanEdges[span];
+        const spanEnd = spanEdges[span + 1];
+        if (span > 0) requiredStarts.push(spanStart);
+        requiredStarts.push(...metricalContinuationStarts(
+          spanStart,
+          spanEnd,
+          measureDuration,
+          groupDuration,
+        ));
+      }
       const requiredKey = new Set(requiredStarts.map((value) => Math.round(value * 192)));
 
       // A repeated spelling of the same voice/pitch describes one sustained
@@ -2557,9 +2631,13 @@ function makePickupRest(measure: Measure, position: Fraction, duration: Fraction
     beams--;
   }
   let dot = 0;
-  if (cells === 3 && beams > 0) {
-    cells = 1;
-    beams--;
+  if (cells === 3) {
+    if (beams > 0) {
+      cells = 1;
+      beams--;
+    } else {
+      cells = 2;
+    }
     dot = 1;
   }
   const chord = new Chord(measure);
@@ -2812,6 +2890,13 @@ export function parseSlashScore(text: string, baseOptions: SlashScoreOptions): S
     measure.newPage = false;
   }));
   applyNoteTimingEdits(imported.score, options.noteTimingEdits ?? [], "slash");
+  if (options.kind === "keyboard" && options.keyboardKeyLabels) {
+    applyKeyboardKeyLabels(
+      imported.score,
+      options.keyboardTieAsZero ?? false,
+      options.keyboardHideTieLabels ?? false,
+    );
+  }
   return {
     score: imported.score,
     summary: {
@@ -2840,6 +2925,45 @@ function slashPitch(pitch: number, fifths: number): { degree: number; octave: nu
     }
   }
   return best;
+}
+
+/** Apply a notation-only keyboard-key view. The numeric pitch spelling stays
+ *  intact so ties, playback, source selection and JPW/MIDI export are unchanged. */
+function applyKeyboardKeyLabels(
+  score: Score,
+  tieAsZero: boolean,
+  hideTieLabels: boolean,
+): void {
+  const apply = (note: Note, fifths: number, continuation = false): void => {
+    if (note.rest) return;
+    const value = slashPitch(note.pitch, fifths);
+    const rowIndex = clamp(value.octave + 1, 0, KEYBOARD_ROWS.length - 1);
+    note.displayText = KEYBOARD_ROWS[rowIndex][value.degree];
+    note.displayOctave = value.octave < -1
+      ? value.octave + 1
+      : value.octave > 1 ? value.octave - 1 : 0;
+    note.displayHidden = continuation && hideTieLabels;
+    if (continuation && tieAsZero && !hideTieLabels) {
+      note.displayText = "0";
+      note.displayOctave = 0;
+      note.displayAlter = " ";
+    }
+  };
+  for (const part of score.parts) {
+    for (const measure of part.measures) {
+      for (const entry of measure.entries) {
+        if (!(entry instanceof Chord)) continue;
+        for (const note of entry.notes) {
+          apply(
+            note,
+            measure.key.fifths,
+            note.tieEnd || entry.transparentContinuation || entry.generatedTimingContinuation,
+          );
+        }
+        for (const note of entry.graceNotes) apply(note, measure.key.fifths);
+      }
+    }
+  }
 }
 
 function accidentalPrefix(accidental: number): string {
@@ -3524,11 +3648,16 @@ export function scoreToSlashScore(
       const hasNewSound = attacks.some((event) =>
         event.chords.some((chord) =>
           chord.notes.some((note) => !note.rest)));
-      if (durationNotation?.emptyGroupsAsRests && !hasNewSound) {
-        segments.push(" - ");
+      if (!hasNewSound) {
+        segments.push(durationNotation?.emptyGroupsAsRests
+          ? " - "
+          : durationText(groupDuration) || symbol);
         continue;
       }
-      if (inGroup.length === 0) { segments.push("-"); continue; }
+      if (inGroup.length === 0) {
+        segments.push(durationText(groupDuration) || symbol);
+        continue;
+      }
       if (midiExport?.subdivisionMode) {
         segments.push(subdividedGroupText(
           inGroup,
@@ -3572,7 +3701,7 @@ export function scoreToSlashScore(
         cursor = Math.max(cursor, eventEnd);
       });
       if (cursor < end - 1e-8) appendMarkers(end - cursor);
-      segments.push(out || "-");
+      segments.push(out || durationText(groupDuration) || symbol);
     }
     lines.push(segments.join("/") + "/");
   }
@@ -3603,6 +3732,9 @@ export function embedSlashScoreOptions(text: string, options: SlashScoreOptions)
     v: 2,
     vc: clamp(Math.round(options.voiceCount || 1), 1, MAX_SLASH_VOICES),
     k: options.kind === "keyboard" ? "k" : "n",
+    kl: options.keyboardKeyLabels ?? false,
+    kz: options.keyboardTieAsZero ?? false,
+    kh: options.keyboardHideTieLabels ?? false,
     n: options.title,
     bpm: options.tempoBpm,
     bu: options.tempoBeatUnit,

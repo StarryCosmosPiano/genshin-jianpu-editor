@@ -16,6 +16,7 @@ interface ModalOptions {
   cancelText?: string;
   boxClass?: string;
   onCancel?: () => void;
+  backdropAction?: () => "apply" | "cancel" | "stay";
 }
 
 function modal(title: string, body: HTMLElement, onOk: () => void, options: ModalOptions = {}): void {
@@ -45,7 +46,14 @@ function modal(title: string, body: HTMLElement, onOk: () => void, options: Moda
   };
   cancel.onclick = cancelAndClose;
   overlay.onclick = (e) => {
-    if (e.target === overlay) cancelAndClose();
+    if (e.target !== overlay) return;
+    const action = options.backdropAction?.() ?? "cancel";
+    if (action === "apply") {
+      onOk();
+      close();
+    } else if (action === "cancel") {
+      cancelAndClose();
+    }
   };
   ok.onclick = () => {
     onOk();
@@ -105,6 +113,16 @@ export function showOptionsDialog(app: App): void {
   portrait.textContent = "纵向";
   portrait.selected = app.pageH > app.pageW;
   direction.append(landscape, portrait);
+  const codePaneSide = document.createElement("select");
+  const codeLeft = document.createElement("option");
+  codeLeft.value = "left";
+  codeLeft.textContent = "左侧";
+  codeLeft.selected = app.codePaneSide === "left";
+  const codeRight = document.createElement("option");
+  codeRight.value = "right";
+  codeRight.textContent = "右侧";
+  codeRight.selected = app.codePaneSide === "right";
+  codePaneSide.append(codeLeft, codeRight);
   const fs = document.createElement("input");
   fs.type = "number";
   fs.min = "12";
@@ -134,6 +152,7 @@ export function showOptionsDialog(app: App): void {
     labeled("当前谱子类型", documentFormat),
     labeled("谱面比例", sel),
     labeled("页面方向", direction),
+    labeled("文本编辑器位置", codePaneSide),
   );
   if (app.mode === "jp" && app.painter.score.piano) {
     body.append(labeled("乐器名称", instrumentName));
@@ -400,6 +419,12 @@ export function showOptionsDialog(app: App): void {
       body.append(labeled(app.getPartLabel(i), s));
     }
   }
+  let dirty = false;
+  const markDirty = () => {
+    dirty = true;
+  };
+  body.addEventListener("input", markDirty);
+  body.addEventListener("change", markDirty);
   modal("选项", body, () => {
     if (app.documentFormat !== "jpw") {
       app.setSlashVoiceSettings(
@@ -432,10 +457,19 @@ export function showOptionsDialog(app: App): void {
     }
     app.applyRenderSettings({ pageW: w, pageH: h, fontSize, titleSize, creditSize, color: argb >>> 0 });
     if (app.mode === "mixed") void app.setMixedHideBarNumber(hideBarNum.checked);
+    app.setCodePaneSide(codePaneSide.value === "right" ? "right" : "left");
     if (documentFormat.value !== app.documentFormat) {
       void app.changeDocumentFormat(documentFormat.value as "jpw" | "keyboard" | "number");
     }
-  }, { boxClass: "options-box" });
+  }, {
+    boxClass: "options-box",
+    backdropAction: () => {
+      if (!dirty) return "cancel";
+      return window.confirm("选项尚未保存，是否立即保存并应用？")
+        ? "apply"
+        : "stay";
+    },
+  });
 }
 
 type NumericStyleKey = NumericEngravingStyleKey;
@@ -605,19 +639,22 @@ export function showEngravingStyleDialog(app: App): void {
   previewSvg.setAttribute("aria-label", "全局简谱排版独立实时预览");
   preview.append(previewSvg);
 
+  const workspace = document.createElement("div");
+  workspace.className = "engraving-workspace";
   const controls = document.createElement("div");
   controls.className = "engraving-controls";
   const numericInputs = new Map<NumericStyleKey, HTMLInputElement>();
   const outputs = new Map<NumericStyleKey, HTMLOutputElement>();
   const formatters = new Map<NumericStyleKey, (value: number) => string>();
 
-  const section = (title: string): HTMLDivElement => {
-    const el = document.createElement("div");
+  const section = (title: string): HTMLDetailsElement => {
+    const el = document.createElement("details");
     el.className = "engraving-section";
-    const h = document.createElement("div");
-    h.className = "engraving-section-title";
-    h.textContent = title;
-    el.append(h);
+    el.open = controls.childElementCount === 0;
+    const summary = document.createElement("summary");
+    summary.className = "engraving-section-title";
+    summary.textContent = title;
+    el.append(summary);
     controls.append(el);
     return el;
   };
@@ -766,7 +803,8 @@ export function showEngravingStyleDialog(app: App): void {
   reset.type = "button";
   reset.className = "engraving-reset";
   reset.textContent = "恢复默认参数";
-  body.append(hint, preview, controls, reset);
+  workspace.append(controls, preview);
+  body.append(hint, workspace, reset);
 
   const readStyle = (): EngravingStyle => {
     const value = {
@@ -823,6 +861,14 @@ export function showEngravingStyleDialog(app: App): void {
     app.setEngravingStyle(readStyle(), true);
   }, {
     okText: "应用到整个软件",
+    cancelText: "取消",
     boxClass: "engraving-box",
+    backdropAction: () => {
+      const dirty = JSON.stringify(readStyle()) !== JSON.stringify(original);
+      if (!dirty) return "cancel";
+      return window.confirm("排版参数尚未应用，是否立即应用到整个软件？")
+        ? "apply"
+        : "stay";
+    },
   });
 }

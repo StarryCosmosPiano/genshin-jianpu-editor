@@ -60,8 +60,14 @@ prelude_end:Prelude_end;
 Prelude_beg: LBRACE ControlOptions? ;
 Prelude_end: RBRACE ControlOptions? ;
 
-fragment 
-Duration : '-'+ | ('_'+ '.'*) | ('.'* '_'+) | '.'+ ;
+fragment
+Duration
+    : ('-'+ '.'*)
+    | ('.'* '-'+)
+    | ('_'+ '.'*)
+    | ('.'* '_'+)
+    | '.'+
+    ;
 
 Note : SlurStart* ControlOptions? Tuplet? Articulations? Grace? (Pitch | Chord) Duration? ControlOptions? RBRACE*;
 fragment SlurStart : '(' | '{('  ((',' Float?)|( '0:0,' Float ',' Integer )) '}' ;
@@ -113,4 +119,3 @@ LINE_COMMENT
     ;
 
 WS : [ \t\r\n]+ -> skip ; // skip spaces, tabs, newlines
-

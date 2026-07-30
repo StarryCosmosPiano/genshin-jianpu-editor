@@ -115,6 +115,12 @@ export interface MidiImportOptions {
   trackAssignments?: MidiTrackAssignment[];
   /** Editor text produced after conversion. Slash formats merge all hands into one vertical-chord staff. */
   outputFormat?: MidiOutputFormat;
+  /** Keyboard TXT output only: render key names on the staff instead of 1-7. */
+  keyboardKeyLabels?: boolean;
+  /** Keyboard-key view only: show tied continuation labels as visual 0s. */
+  keyboardTieAsZero?: boolean;
+  /** Keyboard-key view only: hide tied continuation labels; takes precedence over 0. */
+  keyboardHideTieLabels?: boolean;
   /** Meaning assigned to curly/square groups in generated keyboard/number text. */
   slashBraceMode?: MidiSlashGroupMode;
   slashBracketMode?: MidiSlashGroupMode;

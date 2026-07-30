@@ -2,7 +2,7 @@
 // Mirrors EditorController in CodeEditor.kt (doBind/tryLoad/updateLayout/paint/load/doSave).
 
 import { EditorView, keymap, lineNumbers } from "@codemirror/view";
-import { Compartment, EditorState, EditorSelection } from "@codemirror/state";
+import { Compartment, EditorState, EditorSelection, Prec } from "@codemirror/state";
 import { defaultKeymap, history, historyKeymap, undo } from "@codemirror/commands";
 import {
   jpwHighlighter,
@@ -15,7 +15,7 @@ import {
 } from "./highlight";
 import { JpwFile, LayoutSection } from "../jpword/jpwfile";
 import { fromJpw } from "../score/jpwimport";
-import { Chord, Note as ScoreNote, PlayItem, TempoMark } from "../score/score";
+import { Chord, Note as ScoreNote, PlayItem, Score, TempoMark } from "../score/score";
 import { JinpuPainter } from "../layout/painter";
 import { JpNumber, JpOctaveDot, Lyric as LayoutLyric, NoteEntry, TextFrame, type PageItem } from "../layout/layout";
 import {
@@ -40,6 +40,11 @@ import { recognizeImage, recognizeMusicppDetailed, agyAvailable, renderRecogniti
 import type { Binary, RecognizedScore } from "../omr";
 import { analyzeMidi, midiToScore, parseMidi } from "../midi";
 import { showMidiImportDialog } from "./midi-dialog";
+import {
+  showImportFailureDialog,
+  showMusicXmlImportDialog,
+  type MusicXmlImportOptions,
+} from "./musicxml-dialog";
 import {
   analyzeSlashScore,
   defaultSlashScoreOptions,
@@ -211,8 +216,12 @@ export class App {
   engravingStyle: EngravingStyle = normalizeEngravingStyle();
   mixedHideBarNumber = false; // 混排：隐藏小节号
   zoom = 1; // 谱面显示缩放（应用到 #score-pane 的 --score-zoom）
+  previewLocked = false;
+  codePaneSide: "left" | "right" = "left";
+  codePaneCollapsed = false;
   private meta: MetaData;
   private debounceTimer: ReturnType<typeof setTimeout> | undefined;
+  private previewDirty = false;
   private zoomSaveTimer: ReturnType<typeof setTimeout> | undefined;
   private selectedEls = new Set<SVGGElement>();
   private _sourceNotes: JpwSourceNote[] = [];
@@ -231,6 +240,7 @@ export class App {
   private _player: ScorePlayer | null = null;
   private _playBtnEl: HTMLButtonElement | null = null;
   private _stopBtnEl: HTMLButtonElement | null = null;
+  private _previewLockBtnEl: HTMLButtonElement | null = null;
   /** Per-part linear volume in [0,1]; index = part index. Missing = 1 (full). */
   partVolumes: number[] = [];
   playbackSoundSource: PlaybackSoundSource = "default";
@@ -316,15 +326,28 @@ export class App {
   }
 
   syncRhythmGridToolbar(): void {
-    const control = document.getElementById("rhythm-grid-control");
-    if (!control) return;
-    const selected = this.engravingStyle.rhythmGuideMode === "manual"
-      ? this.engravingStyle.rhythmGuideDivision
-      : null;
-    control.dataset.mode = selected === null ? "auto" : "manual";
     const limits = this.documentFormat === "jpw"
       ? { base: 64, visibleMaximum: 64, enabledMaximum: 64, hasSubdivision: true }
       : this.slashTimingGridLimits();
+    let selected = this.engravingStyle.rhythmGuideMode === "manual"
+      ? this.engravingStyle.rhythmGuideDivision
+      : null;
+    if (this.documentFormat !== "jpw"
+      && selected !== null
+      && selected > limits.enabledMaximum) {
+      const clamped = limits.enabledMaximum as RhythmGuideDivision;
+      selected = clamped;
+      this.engravingStyle = normalizeEngravingStyle({
+        ...this.engravingStyle,
+        rhythmGuideMode: "manual",
+        rhythmGuideDivision: clamped,
+      });
+      this.painter.layout.options.applyEngravingStyle(this.engravingStyle);
+      this.saveSettings();
+    }
+    const control = document.getElementById("rhythm-grid-control");
+    if (!control) return;
+    control.dataset.mode = selected === null ? "auto" : "manual";
     control.querySelectorAll<HTMLButtonElement>("button[data-rhythm-division]").forEach((button) => {
       const division = parseInt(button.dataset.rhythmDivision ?? "", 10);
       const active = selected !== null && division === selected;
@@ -379,6 +402,8 @@ export class App {
         textVoiceColoring: boolean;
         scoreVoiceColoring: boolean;
         showInvisibleVoiceMarkers: boolean;
+        codePaneSide: "left" | "right";
+        codePaneCollapsed: boolean;
         partVolumes: number[];
         playbackSoundSource: PlaybackSoundSource;
         selectedSoundfontId: string;
@@ -409,6 +434,12 @@ export class App {
       if (s.showInvisibleVoiceMarkers !== undefined) {
         this.showInvisibleVoiceMarkers = s.showInvisibleVoiceMarkers;
       }
+      if (s.codePaneSide === "left" || s.codePaneSide === "right") {
+        this.codePaneSide = s.codePaneSide;
+      }
+      if (typeof s.codePaneCollapsed === "boolean") {
+        this.codePaneCollapsed = s.codePaneCollapsed;
+      }
       if (Array.isArray(s.partVolumes)) {
         this.partVolumes = s.partVolumes.map((value) =>
           Number.isFinite(value) ? Math.max(0, Math.min(1, value)) : 1);
@@ -436,6 +467,7 @@ export class App {
       }
       this.configurePainter(this.painter);
       this.syncRhythmGridToolbar();
+      this.syncCodePaneLayout();
     } catch {
       // corrupt storage — ignore
     }
@@ -457,6 +489,8 @@ export class App {
         textVoiceColoring: this.textVoiceColoring,
         scoreVoiceColoring: this.scoreVoiceColoring,
         showInvisibleVoiceMarkers: this.showInvisibleVoiceMarkers,
+        codePaneSide: this.codePaneSide,
+        codePaneCollapsed: this.codePaneCollapsed,
         partVolumes: this.partVolumes,
         playbackSoundSource: this.playbackSoundSource,
         selectedSoundfontId: this.selectedSoundfontId,
@@ -486,6 +520,69 @@ export class App {
   }
   private _applyZoom(): void {
     this.scorePane.style.setProperty("--score-zoom", String(this.zoom));
+  }
+
+  setPreviewLockBtn(element: HTMLButtonElement): void {
+    this._previewLockBtnEl = element;
+    this.syncPreviewLockButton();
+  }
+
+  togglePreviewLock(): void {
+    this.previewLocked = !this.previewLocked;
+    clearTimeout(this.debounceTimer);
+    this.syncPreviewLockButton();
+    if (this.previewLocked) {
+      this.setStatus("谱面已锁定：继续编辑文本不会触发实时重排");
+      return;
+    }
+    const needsReload = this.previewDirty;
+    this.previewDirty = false;
+    if (needsReload) {
+      const ok = this.reload(this.getText());
+      this.setStatus(ok ? "谱面已解锁并更新到最新文本" : "谱面已解锁，但最新文本暂时无法解析");
+    } else {
+      this.setStatus("谱面已解锁：恢复实时预览");
+    }
+  }
+
+  private syncPreviewLockButton(): void {
+    const button = this._previewLockBtnEl ?? document.getElementById("btn-preview-lock") as HTMLButtonElement | null;
+    if (!button) return;
+    button.classList.toggle("active", this.previewLocked);
+    button.setAttribute("aria-pressed", String(this.previewLocked));
+    button.textContent = this.previewLocked ? "解锁谱面" : "锁定谱面";
+    button.title = this.previewLocked
+      ? "当前停止文本实时重排；点击后更新并恢复预览"
+      : "暂停文本编辑引起的实时重排，便于流畅录入";
+  }
+
+  setCodePaneSide(side: "left" | "right"): void {
+    if (this.codePaneSide === side) return;
+    this.codePaneSide = side;
+    this.syncCodePaneLayout();
+    this.saveSettings();
+  }
+
+  toggleCodePane(): void {
+    this.codePaneCollapsed = !this.codePaneCollapsed;
+    this.syncCodePaneLayout();
+    this.saveSettings();
+  }
+
+  private syncCodePaneLayout(): void {
+    const body = document.getElementById("body");
+    const toggle = document.getElementById("code-pane-toggle") as HTMLButtonElement | null;
+    if (!body) return;
+    body.dataset.codePaneSide = this.codePaneSide;
+    body.classList.toggle("code-pane-collapsed", this.codePaneCollapsed);
+    if (toggle) {
+      const pointsTowardPane = this.codePaneSide === "left" ? "▶" : "◀";
+      const pointsTowardScore = this.codePaneSide === "left" ? "◀" : "▶";
+      toggle.textContent = this.codePaneCollapsed ? pointsTowardPane : pointsTowardScore;
+      toggle.title = this.codePaneCollapsed ? "展开文本编辑器" : "隐藏文本编辑器";
+      toggle.setAttribute("aria-expanded", String(!this.codePaneCollapsed));
+    }
+    if (this.view) requestAnimationFrame(() => this.view.requestMeasure());
   }
 
   mountEditor(parent: HTMLElement, initialText: string): void {
@@ -525,9 +622,9 @@ export class App {
           scoreSourceHighlighter,
           slashTimingDiagnosticHighlighter,
           slashVoiceHighlighter,
-          EditorView.domEventHandlers({
+          Prec.high(EditorView.domEventHandlers({
             keydown: (event) => this.onEditorKeyDown(event),
-          }),
+          })),
           updateListener,
           this._readOnlyCompartment.of(EditorState.readOnly.of(false)),
           EditorView.lineWrapping,
@@ -538,6 +635,7 @@ export class App {
         ],
       }),
     });
+    this.syncCodePaneLayout();
     this.reload(initialText);
   }
 
@@ -563,6 +661,11 @@ export class App {
 
   private scheduleReload(): void {
     clearTimeout(this.debounceTimer);
+    if (this.previewLocked) {
+      this.previewDirty = true;
+      this.syncPreviewLockButton();
+      return;
+    }
     this.debounceTimer = setTimeout(() => this.reload(this.getText()), 200);
   }
 
@@ -639,6 +742,7 @@ export class App {
         + "文本行和对应谱面小节已标红，悬停行尾警告可查看原因",
       );
     }
+    this.previewDirty = false;
     return true;
   }
 
@@ -1528,7 +1632,10 @@ export class App {
     const ranges = this.view.state.selection.ranges;
     const sources = this._sourceNotes.filter((source) => ranges.some((range) =>
       range.empty
-        ? range.head >= source.from && range.head < source.to
+        // A caret is a position between characters, not a text selection.
+        // Do not select a one-character score note merely because the caret
+        // sits on its left edge after crossing an invisible voice marker.
+        ? range.head > source.from && range.head < source.to
         : range.from < source.to && range.to > source.from));
     this.clearSelectedItems();
     for (const source of sources) {
@@ -1576,7 +1683,173 @@ export class App {
   }
 
   private onEditorKeyDown(event: KeyboardEvent): boolean {
-    return this.handleVoiceShortcut(event);
+    if (this.handleVoiceShortcut(event)) return true;
+    return this.handleInvisibleVoiceMarkerKey(event);
+  }
+
+  /** Treat U+2063 prefixes as part of the following pitch. Cursor movement
+   *  skips the invisible run in one press, and deleting a marked pitch removes
+   *  its prefix at the same time instead of leaving orphan markers behind. */
+  private handleInvisibleVoiceMarkerKey(event: KeyboardEvent): boolean {
+    if (this.documentFormat === "jpw" || !this.slashOptions
+      || event.altKey || event.ctrlKey || event.metaKey) return false;
+    const selection = this.view.state.selection;
+    const doc = this.view.state.doc;
+    const markedSources = this._sourceNotes.filter((source) =>
+      (source.markerCount ?? 0) > 0 && source.markerFrom !== undefined);
+    const nextCodePoint = (position: number): number => {
+      if (position >= doc.length) return doc.length;
+      const first = doc.sliceString(position, Math.min(doc.length, position + 1))
+        .charCodeAt(0);
+      const second = position + 1 < doc.length
+        ? doc.sliceString(position + 1, position + 2).charCodeAt(0)
+        : 0;
+      return position + (first >= 0xd800 && first <= 0xdbff
+        && second >= 0xdc00 && second <= 0xdfff ? 2 : 1);
+    };
+    const previousCodePoint = (position: number): number => {
+      if (position <= 0) return 0;
+      const last = doc.sliceString(position - 1, position).charCodeAt(0);
+      const before = position > 1
+        ? doc.sliceString(position - 2, position - 1).charCodeAt(0)
+        : 0;
+      return position - (last >= 0xdc00 && last <= 0xdfff
+        && before >= 0xd800 && before <= 0xdbff ? 2 : 1);
+    };
+    if ((event.key === "ArrowLeft" || event.key === "ArrowRight")
+      && !event.shiftKey && selection.ranges.every((range) => range.empty)) {
+      const direction = event.key === "ArrowRight" ? 1 : -1;
+      let changed = false;
+      const ranges = selection.ranges.map((range) => {
+        let head = range.head;
+        const source = markedSources.find((candidate) => {
+          const firstVisibleEnd = Math.min(
+            candidate.to,
+            nextCodePoint(candidate.from),
+          );
+          return direction > 0
+            ? head >= candidate.markerFrom! && head <= candidate.from
+            : head > candidate.markerFrom! && head <= firstVisibleEnd;
+        });
+        if (source) {
+          head = direction > 0
+            ? Math.min(source.to, nextCodePoint(source.from))
+            : head <= source.from
+              ? previousCodePoint(source.markerFrom!)
+              : source.markerFrom!;
+        } else if (direction > 0) {
+          while (head < doc.length
+            && doc.sliceString(head, head + 1) === SLASH_VOICE_SEPARATOR) head++;
+        } else {
+          while (head > 0
+            && doc.sliceString(head - 1, head) === SLASH_VOICE_SEPARATOR) head--;
+        }
+        changed ||= head !== range.head;
+        return EditorSelection.cursor(head);
+      });
+      if (!changed) return false;
+      event.preventDefault();
+      event.stopPropagation();
+      this.view.dispatch({
+        selection: EditorSelection.create(ranges, selection.mainIndex),
+      });
+      return true;
+    }
+    if ((event.key !== "Delete" && event.key !== "Backspace") || event.shiftKey) return false;
+
+    const requested: Array<{ from: number; to: number }> = [];
+    let markerOnlySelection = false;
+    let needsAtomicHandling = false;
+    for (const range of selection.ranges) {
+      if (!range.empty) {
+        const selectedSources = markedSources.filter((source) =>
+          range.from < source.to && range.to > source.from);
+        const intersectsMarker = markedSources.some((source) =>
+          range.from < source.from && range.to > source.markerFrom!);
+        needsAtomicHandling ||= selectedSources.length > 0 || intersectsMarker;
+        const selectedAtoms = new Set(selectedSources);
+        const expanded = {
+          from: selectedSources.length > 0
+            ? Math.min(range.from, ...selectedSources.map((source) => source.markerFrom!))
+            : range.from,
+          to: selectedSources.length > 0
+            ? Math.max(range.to, ...selectedSources.map((source) => source.to))
+            : range.to,
+        };
+        let cursor = expanded.from;
+        const protectedMarkers = markedSources
+          .filter((source) => !selectedAtoms.has(source)
+            && source.markerFrom! < expanded.to && source.from > expanded.from)
+          .map((source) => ({
+            from: Math.max(expanded.from, source.markerFrom!),
+            to: Math.min(expanded.to, source.from),
+          }))
+          .filter((marker) => marker.to > marker.from)
+          .sort((left, right) => left.from - right.from);
+        for (const marker of protectedMarkers) {
+          if (cursor < marker.from) requested.push({ from: cursor, to: marker.from });
+          cursor = Math.max(cursor, marker.to);
+          markerOnlySelection = true;
+        }
+        if (cursor < expanded.to) requested.push({ from: cursor, to: expanded.to });
+        continue;
+      }
+
+      const head = range.head;
+      const markerAtCaret = markedSources.find((candidate) =>
+        head > candidate.markerFrom! && head <= candidate.from);
+      if (event.key === "Backspace" && markerAtCaret) {
+        event.preventDefault();
+        event.stopPropagation();
+        const previous = previousCodePoint(markerAtCaret.markerFrom!);
+        if (previous < markerAtCaret.markerFrom!) {
+          this.view.dispatch({
+            changes: {
+              from: previous,
+              to: markerAtCaret.markerFrom!,
+              insert: "",
+            },
+            selection: EditorSelection.cursor(previous),
+          });
+        } else {
+          this.view.dispatch({
+            selection: EditorSelection.cursor(markerAtCaret.markerFrom!),
+          });
+        }
+        return true;
+      }
+      const source = markedSources.find((candidate) => event.key === "Backspace"
+        ? head > candidate.from && head <= candidate.to
+        : head >= candidate.markerFrom! && head < candidate.to);
+      if (source) {
+        needsAtomicHandling = true;
+        requested.push({ from: source.markerFrom!, to: source.to });
+      }
+    }
+    if (!needsAtomicHandling) return false;
+    if (requested.length === 0) {
+      if (!markerOnlySelection) return false;
+      event.preventDefault();
+      event.stopPropagation();
+      this.setStatus("声部隐形标记会随对应音符一起删除，不能单独删除");
+      return true;
+    }
+
+    const merged: Array<{ from: number; to: number }> = [];
+    for (const range of requested
+      .filter((item) => item.to > item.from)
+      .sort((left, right) => left.from - right.from || left.to - right.to)) {
+      const previous = merged[merged.length - 1];
+      if (previous && range.from <= previous.to) previous.to = Math.max(previous.to, range.to);
+      else merged.push({ ...range });
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    this.view.dispatch({
+      changes: merged.map((range) => ({ ...range, insert: "" })),
+    });
+    this.setStatus(`已删除 ${requested.length} 个音符及其声部隐形标记`);
+    return true;
   }
 
   private handleVoiceShortcut(event: KeyboardEvent): boolean {
@@ -2484,9 +2757,12 @@ export class App {
 
   // ---------------- file I/O ----------------
   /** Decode/import supported score formats. MIDI pauses for an analyze/quantize dialog. */
-  async importBytes(bytes: Uint8Array, name: string): Promise<void> {
-    // 任何新导入都使上一次的识别叠加产物失效（识别结果由 recognizeBytes 在本调用之后重设）。
-    this._clearRecognition();
+  async importBytes(
+    bytes: Uint8Array,
+    name: string,
+    settings?: { skipMusicXmlDialog?: boolean },
+  ): Promise<void> {
+    const originalName = name;
     if (/\.(mid|midi)$/i.test(name)) {
       try {
         const parsed = parseMidi(bytes);
@@ -2498,6 +2774,7 @@ export class App {
           return;
         }
         const { score, summary } = midiToScore(parsed, options);
+        this._clearRecognition();
         this.mixedXmlText = null;
         this._mixedPainter = null;
         if (this._mixedBtnEl) this._mixedBtnEl.disabled = true;
@@ -2528,6 +2805,10 @@ export class App {
           }, slashVoiceCount);
           const slashAnalysis = analyzeSlashScore(slashText);
           const slashOptions = defaultSlashScoreOptions(outputFormat, slashAnalysis);
+          slashOptions.keyboardKeyLabels = outputFormat === "keyboard"
+            && (options.keyboardKeyLabels ?? false);
+          slashOptions.keyboardTieAsZero = options.keyboardTieAsZero ?? false;
+          slashOptions.keyboardHideTieLabels = options.keyboardHideTieLabels ?? false;
           slashOptions.voiceCount = slashVoiceCount;
           slashOptions.instrumentName = score.instrumentName.trim()
             || score.parts[0]?.instrumentName.trim()
@@ -2571,8 +2852,7 @@ export class App {
         if (summary.warnings.length) details.push(summary.warnings.join("；"));
         this.setStatus(`MIDI 导入完成：${details.join("，")}`);
       } catch (e) {
-        console.error("MIDI 导入失败", e);
-        this.setStatus("MIDI 导入失败：" + (e instanceof Error ? e.message : String(e)));
+        this._reportImportFailure("MIDI", e);
       }
       return;
     }
@@ -2589,6 +2869,7 @@ export class App {
           this.setStatus("已取消斜杠谱导入");
           return;
         }
+        this._clearRecognition();
         this._prepareEditableJpMode();
         this._applyImportedSlash(source, options);
         const summary = parseSlashScore(source, options).summary;
@@ -2604,8 +2885,7 @@ export class App {
         if (summary.warnings.length) details.push(summary.warnings.join("；"));
         this.setStatus(`斜杠谱导入完成：${details.join("，")}`);
       } catch (e) {
-        console.error("斜杠谱导入失败", e);
-        this.setStatus("斜杠谱导入失败：" + (e instanceof Error ? e.message : String(e)));
+        this._reportImportFailure("斜杠谱", e);
       }
       return;
     }
@@ -2619,59 +2899,253 @@ export class App {
         bytes = new TextEncoder().encode(xml);
         name = name.replace(/\.abc$/i, ".musicxml");
       } catch (e) {
-        console.error("ABC 转换失败", e);
-        this.setStatus("ABC 转换失败：" + (e instanceof Error ? e.message : String(e)));
+        this._reportImportFailure("ABC", e);
         return;
       }
     }
     if (/\.(xml|musicxml)$/i.test(name)) {
-      const xml = new TextDecoder(
-        bytes[0] === 0xff || bytes[0] === 0xfe ? "utf-16" : "utf-8",
-      ).decode(bytes);
-      this.mixedXmlText = xml;
-      this._mixedPainter = null; // reset so next toggleMixed re-loads
-      if (this._mixedBtnEl) this._mixedBtnEl.disabled = false;
+      try {
+        const xml = new TextDecoder(
+          bytes[0] === 0xff || bytes[0] === 0xfe ? "utf-16" : "utf-8",
+        ).decode(bytes);
+        const score = loadMusicXml(xml);
+        const soundingNotes = score.parts.flatMap((part) =>
+          part.measures.flatMap((measure) =>
+            measure.entries.flatMap((entry) =>
+              entry instanceof Chord
+                ? [...entry.notes, ...entry.graceNotes].filter(
+                  (note) => !note.rest && !note.softDeleted,
+                )
+                : [])));
+        if (soundingNotes.length === 0) {
+          throw new Error("文件中没有可导入的有效音符");
+        }
+        const defaultMixed = !isPianoMusicXml(xml) && isMultiPartXml(xml);
+        const options = settings?.skipMusicXmlDialog
+          ? this._defaultMusicXmlImportOptions(score, defaultMixed)
+          : await showMusicXmlImportDialog(score, originalName, defaultMixed);
+        if (!options) {
+          this.setStatus("已取消 MusicXML 导入");
+          return;
+        }
+        this._applyMusicXmlImportOptions(score, options);
+        const { text, meta } = scoreToJpwabcWithMeta(score);
+        let preparedSlash: {
+          text: string;
+          options: SlashScoreOptions;
+        } | null = null;
+        if (options.outputFormat === "keyboard" || options.outputFormat === "number") {
+          const voiceCount = Math.max(
+            1,
+            Math.min(MAX_SLASH_VOICES, score.parts.length),
+          );
+          const slashText = scoreToSlashScore(
+            score,
+            options.outputFormat,
+            options.textDivision,
+            ".",
+            {
+              braceMode: options.slashBraceMode,
+              bracketMode: options.slashBracketMode,
+              ordering: options.slashOrdering,
+            },
+            voiceCount,
+          );
+          const slashAnalysis = analyzeSlashScore(slashText);
+          const slashOptions = defaultSlashScoreOptions(
+            options.outputFormat,
+            slashAnalysis,
+          );
+          slashOptions.keyboardKeyLabels =
+            options.outputFormat === "keyboard" && options.keyboardKeyLabels;
+          slashOptions.keyboardTieAsZero = options.keyboardTieAsZero;
+          slashOptions.keyboardHideTieLabels = options.keyboardHideTieLabels;
+          slashOptions.voiceCount = voiceCount;
+          slashOptions.instrumentName = score.instrumentName.trim()
+            || score.parts[0]?.instrumentName.trim()
+            || "钢琴";
+          slashOptions.title = score.title;
+          slashOptions.subtitle = score.subtitle;
+          slashOptions.composer = score.composer;
+          slashOptions.arranger = score.arranger;
+          slashOptions.lyricist = score.lyricist;
+          slashOptions.tempoBpm = score.tempoBpm;
+          slashOptions.tempoBeatUnit = score.tempoBeatUnit;
+          slashOptions.fifths = options.fifths;
+          slashOptions.beats = options.beats;
+          slashOptions.beatType = options.beatType;
+          slashOptions.braceMode = options.slashBraceMode;
+          slashOptions.bracketMode = options.slashBracketMode;
+          slashOptions.ordering = options.slashOrdering;
+          slashOptions.tempoMarks = score.tempoMarks.map((mark) => ({
+            measure: mark.measure,
+            offset: mark.offset.toFloat(),
+            kind: mark.kind,
+            bpm: mark.bpm,
+          }));
+          preparedSlash = { text: slashText, options: slashOptions };
+        }
+        let preparedMixedPainter: MixedPainter | null = null;
+        if (options.outputFormat === "mixed") {
+          preparedMixedPainter = new MixedPainter();
+          preparedMixedPainter.hideBarNumber = this.mixedHideBarNumber;
+          await preparedMixedPainter.load(xml);
+          for (let page = 0; page < preparedMixedPainter.pageCount; page++) {
+            preparedMixedPainter.renderPage(page);
+          }
+        }
+        this._clearRecognition();
+        this._prepareEditableJpMode();
+        this.filePath = null;
+        this._browserSaveHandle = null;
+        this._hasSavedCurrent = false;
 
-      // 多声部（SATB 等）默认进入混排；钢琴双谱表则保留在可编辑的
-      // 双行简谱模式，由 loadMusicXml 拆成 RH/LH 两个 Part。
-      const autoMixed = this.mode !== "mixed" && !isPianoMusicXml(xml) && isMultiPartXml(xml);
-      if (this.mode === "mixed" || autoMixed) {
-        if (autoMixed) {
+        this._lastImportMeta = meta;
+        this._applyImportedJp(text);
+        this.mixedXmlText = xml;
+        this._mixedPainter = preparedMixedPainter;
+        if (this._mixedBtnEl) this._mixedBtnEl.disabled = false;
+
+        if (options.outputFormat === "mixed") {
           this.mode = "mixed";
           this._setMixedLayout(true);
           if (this._mixedBtnEl) this._mixedBtnEl.textContent = "简谱";
+          await this._renderMixedPages(true);
+        } else if (preparedSlash) {
+          this._applyImportedSlash(preparedSlash.text, preparedSlash.options);
         }
-        // 仍填充编辑器的简谱转换文本，便于切回「简谱」（best-effort）
-        try {
-          const score = loadMusicXml(xml);
-          this.filePath = null;
-          this._applyImportedJp(scoreToJpwabc(score));
-        } catch (e) {
-          console.error("jp import (for toggle) failed", e);
-        }
-        void this._renderMixedPages();
-        return;
+        const outputName = options.outputFormat === "mixed"
+          ? "MusicXML 五线谱混排"
+          : options.outputFormat === "jpw"
+            ? "JPW 简谱"
+            : options.outputFormat === "keyboard" ? "键盘谱" : "数字谱";
+        this.setStatus(
+          `MusicXML 导入完成：${score.parts.length} 个声部，`
+          + `${score.parts[0]?.measures.length ?? 0} 小节，${outputName}`,
+        );
+      } catch (e) {
+        this._reportImportFailure("MusicXML", e);
       }
-
-      const score = loadMusicXml(xml);
-      this.filePath = null; // imported; save as new .jpwabc
-      const { text, meta } = scoreToJpwabcWithMeta(score);
-      this._lastImportMeta = meta; // 供 recognizeBytes（OMR）接管为 _recogMeta
-      this._applyImportedJp(text);
+      return;
     } else {
-      this.mixedXmlText = null;
-      this._mixedPainter = null;
-      if (this._mixedBtnEl) this._mixedBtnEl.disabled = true;
-      this._disablePhrase();
-      if (this.mode === "mixed") {
-        this.mode = "jp";
-        this._setMixedLayout(false);
-        if (this._mixedBtnEl) this._mixedBtnEl.textContent = "混排";
+      try {
+        const text = decodeJpwabc(bytes);
+        if (/\.jpwabc$/i.test(name) && !JpwFile.fromString(text)) {
+          throw new Error("JPW 文件缺少有效的 .Title 或 .Voice 段落");
+        }
+        this._clearRecognition();
+        this.mixedXmlText = null;
+        this._mixedPainter = null;
+        if (this._mixedBtnEl) this._mixedBtnEl.disabled = true;
+        this._disablePhrase();
+        if (this.mode === "mixed") {
+          this.mode = "jp";
+          this._setMixedLayout(false);
+          if (this._mixedBtnEl) this._mixedBtnEl.textContent = "混排";
+        }
+        this.documentFormat = "jpw";
+        this.slashOptions = null;
+        this.setText(text);
+      } catch (e) {
+        this._reportImportFailure("JPW", e);
       }
-      this.documentFormat = "jpw";
-      this.slashOptions = null;
-      this.setText(decodeJpwabc(bytes));
     }
+  }
+
+  private _defaultMusicXmlImportOptions(
+    score: Score,
+    defaultMixed: boolean,
+  ): MusicXmlImportOptions {
+    const firstMeasure = score.parts[0]?.measures[0];
+    return {
+      outputFormat: defaultMixed ? "mixed" : "jpw",
+      textDivision: 16,
+      title: score.title,
+      subtitle: score.subtitle,
+      composer: score.composer,
+      arranger: score.arranger,
+      lyricist: score.lyricist,
+      instrumentNames: score.parts.map((part, index) =>
+        part.instrumentName.trim()
+        || score.instrumentName.trim()
+        || (score.piano ? "钢琴" : `乐器 ${index + 1}`)),
+      fifths: firstMeasure?.key.fifths ?? 0,
+      beats: firstMeasure?.time.beats ?? 4,
+      beatType: firstMeasure?.time.beatType ?? 4,
+      tempoBpm: score.tempoBpm,
+      tempoBeatUnit: score.tempoBeatUnit,
+      keyboardKeyLabels: false,
+      keyboardTieAsZero: false,
+      keyboardHideTieLabels: false,
+      slashBraceMode: "grace",
+      slashBracketMode: "triplet",
+      slashOrdering: "pitch-asc",
+    };
+  }
+
+  private _applyMusicXmlImportOptions(
+    score: Score,
+    options: MusicXmlImportOptions,
+  ): void {
+    score.title = options.title;
+    score.subtitle = options.subtitle;
+    score.composer = options.composer;
+    score.arranger = options.arranger;
+    score.lyricist = options.lyricist;
+    for (const [type, value] of [
+      ["composer", options.composer],
+      ["arranger", options.arranger],
+      ["lyricist", options.lyricist],
+    ] as const) {
+      if (value) score.creator.set(type, value);
+      else score.creator.delete(type);
+    }
+    score.tempoBpm = options.tempoBpm;
+    score.tempoBeatUnit = options.tempoBeatUnit;
+    const openingTempo = score.tempoMarks.find((mark) =>
+      mark.kind === "tempo" && mark.measure === 0 && mark.offset.equals(0));
+    if (openingTempo) {
+      openingTempo.bpm = options.tempoBpm;
+      openingTempo.beatUnit = options.tempoBeatUnit;
+    }
+
+    const voiceByInstrument = new Map<string, number>();
+    score.parts.forEach((part, index) => {
+      const instrument = options.instrumentNames[index]?.trim()
+        || (score.piano ? "钢琴" : `乐器 ${index + 1}`);
+      part.instrumentName = instrument;
+      const voice = (voiceByInstrument.get(instrument) ?? 0) + 1;
+      voiceByInstrument.set(instrument, voice);
+      part.voiceIndex = voice;
+    });
+    if (score.piano) {
+      const instrument = options.instrumentNames[0]?.trim() || "钢琴";
+      score.instrumentName = instrument;
+      for (const part of score.parts) part.instrumentName = instrument;
+    } else {
+      score.ensemble = score.parts.length > 1;
+    }
+
+    for (const part of score.parts) {
+      let updateKey = true;
+      let updateTime = true;
+      part.measures.forEach((measure, index) => {
+        if (index > 0 && measure.keyChange) updateKey = false;
+        if (index > 0 && measure.timeChange) updateTime = false;
+        if (updateKey) measure.key.fifths = options.fifths;
+        if (updateTime) {
+          measure.time.beats = options.beats;
+          measure.time.beatType = options.beatType;
+        }
+      });
+    }
+  }
+
+  private _reportImportFailure(kind: string, error: unknown): void {
+    console.error(`${kind} 导入失败`, error);
+    const message = error instanceof Error ? error.message : String(error);
+    this.setStatus(`导入失败：${message}`);
+    showImportFailureDialog(kind, error);
   }
 
   /** 导入 MusicXML/OMR 得到的默认（原始排版）文本：缓存以便乐句排版无损切回，并启用切换按钮。 */
@@ -3001,12 +3475,12 @@ export class App {
     document.getElementById("body")?.classList.toggle("mixed", on);
   }
 
-  private async _renderMixedPages(): Promise<void> {
+  private async _renderMixedPages(alreadyLoaded = false): Promise<void> {
     if (!this._mixedPainter) {
       this._mixedPainter = new MixedPainter();
     }
     this._mixedPainter.hideBarNumber = this.mixedHideBarNumber;
-    if (this.mixedXmlText) {
+    if (this.mixedXmlText && !alreadyLoaded) {
       await this._mixedPainter.load(this.mixedXmlText);
     }
     // Portrait paper sized from the MusicXML page dimensions.
@@ -3188,7 +3662,11 @@ export class App {
       const t0 = performance.now();
       if (method === "musicpp") {
         const { musicxml, bin, score } = await recognizeMusicppDetailed(picked.bytes, picked.mime);
-        await this.importBytes(new TextEncoder().encode(musicxml), "omr.musicxml"); // 先导入（会清旧识别）
+        await this.importBytes(
+          new TextEncoder().encode(musicxml),
+          "omr.musicxml",
+          { skipMusicXmlDialog: true },
+        ); // 先导入（会清旧识别）
         this._recogBin = bin; // 再设本次识别产物
         this._recogScore = score;
         this._recogMeta = this._lastImportMeta; // 接管导入时序列化产出的代码区间映射
@@ -3197,7 +3675,11 @@ export class App {
         this.setStatus(`识别完成（${label}，${((performance.now() - t0) / 1000).toFixed(1)}s）`);
       } else {
         const { musicxml, ms } = await recognizeImage(method, picked);
-        await this.importBytes(new TextEncoder().encode(musicxml), "omr.musicxml");
+        await this.importBytes(
+          new TextEncoder().encode(musicxml),
+          "omr.musicxml",
+          { skipMusicXmlDialog: true },
+        );
         this.setStatus(`识别完成（${label}，${(ms / 1000).toFixed(1)}s）`);
       }
     } catch (e) {
