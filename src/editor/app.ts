@@ -1134,6 +1134,42 @@ export class App {
           }
         }
       }
+      // Beat diagnostics deliberately include one glyph of horizontal
+      // breathing room. Adjacent bad beats therefore touch or overlap; merge
+      // those intervals after geometry is known so the page shows one clean
+      // continuous warning band instead of several stacked red outlines.
+      const boxes = [...overlay.querySelectorAll<SVGRectElement>(
+        ".slash-measure-error-box",
+      )].sort((leftBox, rightBox) =>
+        Number(leftBox.getAttribute("y")) - Number(rightBox.getAttribute("y"))
+        || Number(leftBox.getAttribute("x")) - Number(rightBox.getAttribute("x")));
+      let previous: SVGRectElement | null = null;
+      for (const box of boxes) {
+        if (!previous) {
+          previous = box;
+          continue;
+        }
+        const previousTop = Number(previous.getAttribute("y"));
+        const previousHeight = Number(previous.getAttribute("height"));
+        const top = Number(box.getAttribute("y"));
+        const height = Number(box.getAttribute("height"));
+        const previousLeft = Number(previous.getAttribute("x"));
+        const previousRight = previousLeft + Number(previous.getAttribute("width"));
+        const left = Number(box.getAttribute("x"));
+        const right = left + Number(box.getAttribute("width"));
+        const sameStaff = Math.abs(previousTop - top) <= 0.5
+          && Math.abs(previousHeight - height) <= 0.5;
+        if (sameStaff && left <= previousRight + 0.5) {
+          const mergedLeft = Math.min(previousLeft, left);
+          const mergedRight = Math.max(previousRight, right);
+          previous.setAttribute("x", String(mergedLeft));
+          previous.setAttribute("width", String(mergedRight - mergedLeft));
+          previous.setAttribute("data-beat-index", "merged");
+          box.remove();
+        } else {
+          previous = box;
+        }
+      }
       if (overlay.childElementCount > 0) svg.appendChild(overlay);
     }
   }
@@ -2342,6 +2378,7 @@ export class App {
       ...this.slashOptions,
       symbolDurations: { ...this.slashOptions.symbolDurations },
       tempoMarks: this.slashOptions.tempoMarks?.map((mark) => ({ ...mark })) ?? [],
+      keyChanges: this.slashOptions.keyChanges?.map((change) => ({ ...change })) ?? [],
     };
     const next = await showSlashScoreSettingsDialog(this.getText(), current);
     if (!next) {
@@ -2413,6 +2450,7 @@ export class App {
       ...appliedOptions,
       symbolDurations: { ...appliedOptions.symbolDurations },
       tempoMarks: appliedOptions.tempoMarks?.map((mark) => ({ ...mark })) ?? [],
+      keyChanges: appliedOptions.keyChanges?.map((change) => ({ ...change })) ?? [],
     };
     this.setText(embedSlashScoreOptions(text, this.slashOptions));
     this.setStatus(
@@ -2983,6 +3021,12 @@ export class App {
             kind: mark.kind,
             bpm: mark.bpm,
           }));
+          slashOptions.keyChanges = score.parts[0]?.measures
+            .filter((measure) => measure.index > 0 && measure.keyChange)
+            .map((measure) => ({
+              measure: measure.index,
+              fifths: measure.key.fifths,
+            })) ?? [];
           preparedSlash = { text: slashText, options: slashOptions };
         }
         let preparedMixedPainter: MixedPainter | null = null;

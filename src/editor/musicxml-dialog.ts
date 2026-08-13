@@ -57,6 +57,12 @@ function option(value: string, text: string, selected = false): HTMLOptionElemen
   return el;
 }
 
+function displayKeyName(name: string): string {
+  return name.startsWith("#") || name.startsWith("b")
+    ? `${name.slice(1)}${name[0]}`
+    : name;
+}
+
 function slashGroupSelect(value: MidiSlashGroupMode): HTMLSelectElement {
   const select = document.createElement("select");
   select.append(
@@ -70,25 +76,48 @@ function slashGroupSelect(value: MidiSlashGroupMode): HTMLSelectElement {
 }
 
 function inferredTextDivision(score: Score): MidiQuantizeDivision {
-  let shortest = Number.POSITIVE_INFINITY;
+  const divisions = [4, 8, 16, 32, 64] as const;
+  let finest: MidiQuantizeDivision = 4;
+  const requiredDivision = (
+    value: number,
+    dotted: boolean,
+    triplet: boolean,
+  ): MidiQuantizeDivision => {
+    if (!Number.isFinite(value) || value <= 1e-8) return 4;
+    const closeToInteger = (candidate: number): boolean =>
+      Math.abs(candidate - Math.round(candidate)) <= 1e-6;
+    for (const division of divisions) {
+      const unit = 4 / division;
+      if (closeToInteger(value / unit)) return division;
+      if (dotted && closeToInteger(value / (unit * 1.5))) return division;
+      if (triplet && closeToInteger(value / (unit * 2 / 3))) return division;
+    }
+    return 64;
+  };
+  const consider = (value: number, dotted = false, triplet = false): void => {
+    finest = Math.max(finest, requiredDivision(value, dotted, triplet)) as MidiQuantizeDivision;
+  };
   for (const part of score.parts) {
     for (const measure of part.measures) {
+      const attacks: Array<{ position: number; triplet: boolean }> = [];
       for (const entry of measure.entries) {
         if (!entry.duration || entry.duration.compareTo(new Fraction(0)) <= 0) continue;
-        let quarters = entry.duration.toFloat();
-        if (entry instanceof Chord && entry.notes.some((note) =>
-          note.tuplet !== null || note.tupletBegin || note.tupletEnd)) {
-          quarters *= 1.5;
+        const isTuplet = entry instanceof Chord && entry.notes.some((note) =>
+          note.tuplet !== null || note.tupletBegin || note.tupletEnd);
+        consider(entry.duration.toFloat(), entry instanceof Chord && entry.dot > 0, isTuplet);
+        if (entry instanceof Chord) {
+          attacks.push({ position: entry.position.toFloat(), triplet: isTuplet });
         }
-        shortest = Math.min(shortest, quarters);
+      }
+      attacks.sort((left, right) => left.position - right.position);
+      let previous = 0;
+      for (const attack of attacks) {
+        consider(attack.position - previous, false, attack.triplet);
+        previous = attack.position;
       }
     }
   }
-  if (!Number.isFinite(shortest) || shortest >= 1) return 4;
-  if (shortest >= 0.5) return 8;
-  if (shortest >= 0.25) return 16;
-  if (shortest >= 0.125) return 32;
-  return 64;
+  return finest;
 }
 
 function noteCount(score: Score): number {
@@ -248,7 +277,7 @@ export function showMusicXmlImportDialog(
     for (let fifths = -7; fifths <= 7; fifths++) {
       key.append(option(
         String(fifths),
-        `1=${MusicCommon.keys[fifths + 7]}`,
+        `1=${displayKeyName(MusicCommon.keys[fifths + 7])}`,
         fifths === (firstMeasure?.key.fifths ?? 0),
       ));
     }

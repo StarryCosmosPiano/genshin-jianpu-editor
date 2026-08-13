@@ -19,7 +19,9 @@ import {
   PlaySpecKind,
   Score,
   StartStopDiscontinue,
+  TempoMark,
   TimePosition,
+  type TempoBeatUnit,
 } from "./score";
 
 // ---------------- DOM helpers ----------------
@@ -52,6 +54,13 @@ function has(parent: Element, tag: string): boolean {
 interface MState {
   pos: Fraction; // raw (un-divided) running position within measure
   noteEnd: Fraction;
+}
+
+interface ImportedTempoEvent {
+  measure: number;
+  offset: Fraction;
+  bpm: number;
+  beatUnit: TempoBeatUnit;
 }
 
 function noteDuration(noteEl: Element): Fraction {
@@ -238,8 +247,8 @@ function parseBarline(m: Measure, blEl: Element, st: MState): void {
   }
 }
 
-function parseSound(snd: Element, pd: PlayData, mid: number, st: MState, div: number): void {
-  const tick = new TimePosition(mid, st.noteEnd.divInt(div));
+function parseSound(snd: Element, pd: PlayData, mid: number, offset: Fraction): void {
+  const tick = new TimePosition(mid, offset);
   const coda = snd.getAttribute("coda");
   const segno = snd.getAttribute("segno");
   if (coda) pd.coda.set(coda, tick);
@@ -252,6 +261,73 @@ function parseSound(snd: Element, pd: PlayData, mid: number, st: MState, div: nu
   if (tocoda) { const s = new JumpSpec(PlaySpecKind.ToCoda); s.value = tocoda; pd.jumpTo.set(tick, s); }
 }
 
+function numericAttribute(element: Element, name: string): number | null {
+  const value = Number(element.getAttribute(name));
+  return Number.isFinite(value) && value > 0 ? value : null;
+}
+
+function metronomeTempo(direction: Element): { bpm: number; beatUnit: TempoBeatUnit } | null {
+  const directionType = elem(direction, "direction-type");
+  const metronome = directionType ? elem(directionType, "metronome") : null;
+  if (!metronome) return null;
+  const perMinute = Number(txt(metronome, "per-minute"));
+  if (!Number.isFinite(perMinute) || perMinute <= 0) return null;
+  const rawUnit = normText(txt(metronome, "beat-unit"))?.toLowerCase() ?? "quarter";
+  const dotted = has(metronome, "beat-unit-dot");
+  if (rawUnit === "eighth" && !dotted) {
+    return { bpm: perMinute / 2, beatUnit: "eighth" };
+  }
+  if (rawUnit === "quarter" && dotted) {
+    return { bpm: perMinute * 1.5, beatUnit: "dotted-quarter" };
+  }
+  if (rawUnit === "quarter") return { bpm: perMinute, beatUnit: "quarter" };
+  const quarterLength: Record<string, number> = {
+    whole: 4,
+    half: 2,
+    eighth: 0.5,
+    "16th": 0.25,
+    "32nd": 0.125,
+  };
+  const length = quarterLength[rawUnit];
+  if (!length) return null;
+  return { bpm: perMinute * length * (dotted ? 1.5 : 1), beatUnit: "quarter" };
+}
+
+function rememberTempo(
+  tempos: ImportedTempoEvent[] | null,
+  event: ImportedTempoEvent,
+): void {
+  if (!tempos) return;
+  const existing = tempos.findIndex((item) =>
+    item.measure === event.measure && item.offset.equals(event.offset));
+  if (existing >= 0) tempos[existing] = event;
+  else tempos.push(event);
+}
+
+function parseDirection(
+  direction: Element,
+  pd: PlayData,
+  mid: number,
+  st: MState,
+  div: number,
+  tempos: ImportedTempoEvent[] | null,
+): void {
+  const rawOffset = intOf(direction, "offset") ?? 0;
+  const offset = st.noteEnd.plus(new Fraction(rawOffset)).divInt(div);
+  const sound = elem(direction, "sound");
+  if (sound) parseSound(sound, pd, mid, offset);
+  const metronome = metronomeTempo(direction);
+  const soundBpm = sound ? numericAttribute(sound, "tempo") : null;
+  if (soundBpm !== null || metronome) {
+    rememberTempo(tempos, {
+      measure: mid,
+      offset,
+      bpm: soundBpm ?? metronome!.bpm,
+      beatUnit: metronome?.beatUnit ?? "quarter",
+    });
+  }
+}
+
 function loadMeasure(
   m: Measure,
   measureEl: Element,
@@ -259,6 +335,7 @@ function loadMeasure(
   div: number,
   tmp: ParserTemp,
   staffFilter: number | null,
+  tempos: ImportedTempoEvent[] | null,
 ): void {
   if (/^(?:yes|true|1)$/i.test(measureEl.getAttribute("implicit") ?? "")) {
     m.pickup = true;
@@ -273,40 +350,80 @@ function loadMeasure(
   for (const item of Array.from(measureEl.children)) {
     switch (item.tagName) {
       case "note": onNote(m, item, tmp, div, st, staffFilter); break;
-      case "backup": st.pos = st.pos.minus(new Fraction(intOf(item, "duration") ?? 0)); st.noteEnd = st.pos; break;
-      case "forward": st.pos = st.pos.plus(new Fraction(intOf(item, "duration") ?? 0)); st.noteEnd = st.pos; break;
+      // MusicXML backup/forward are relative to the current cursor, which is
+      // the end of the preceding non-chord note. Using `st.pos` here starts
+      // one duration too early and can put an entire lower staff at a negative
+      // offset; JPW happened to hide that because its serializer is sequential,
+      // while keyboard/number TXT correctly discarded those negative attacks.
+      case "backup": st.pos = st.noteEnd.minus(new Fraction(intOf(item, "duration") ?? 0)); st.noteEnd = st.pos; break;
+      case "forward": st.pos = st.noteEnd.plus(new Fraction(intOf(item, "duration") ?? 0)); st.noteEnd = st.pos; break;
       case "attributes": parseAttribute(m, item); break;
       case "print": parsePrint(m, item); break;
       case "barline": st.pos = st.noteEnd; parseBarline(m, item, st); break;
-      case "sound": st.pos = st.noteEnd; parseSound(item, tmp.playData, m.index, st, div); break;
-      case "direction": {
-        st.pos = st.noteEnd;
-        const snd = elem(item, "sound");
-        if (snd) parseSound(snd, tmp.playData, m.index, st, div);
+      case "sound": {
+        const offset = st.noteEnd.divInt(div);
+        parseSound(item, tmp.playData, m.index, offset);
+        const bpm = numericAttribute(item, "tempo");
+        if (bpm !== null) rememberTempo(tempos, {
+          measure: m.index,
+          offset,
+          bpm,
+          beatUnit: "quarter",
+        });
         break;
       }
+      case "direction": parseDirection(item, tmp.playData, m.index, st, div, tempos); break;
     }
   }
 }
 
 // ---------------- Part ----------------
-function loadPart(part: Part, partEl: Element, pd: PlayData, staffFilter: number | null = null): void {
+function loadPart(
+  part: Part,
+  partEl: Element,
+  pd: PlayData,
+  staffFilter: number | null = null,
+  tempos: ImportedTempoEvent[] | null = null,
+): void {
   const measureEls = elems(partEl, "measure");
-  const firstAttr = measureEls[0] ? elem(measureEls[0], "attributes") : null;
-  const div = firstAttr ? intOf(firstAttr, "divisions") ?? 1 : 1;
+  let div = 1;
   let pos = new Fraction(0);
   const tmp = new ParserTemp(pd);
   let cur: Measure | null = null;
   measureEls.forEach((mel, mid) => {
+    const attr = elem(mel, "attributes");
+    const nextDiv = attr ? intOf(attr, "divisions") : null;
+    if (nextDiv !== null && nextDiv > 0) div = nextDiv;
     const mea = new Measure(mid);
     mea.position = pos;
-    loadMeasure(mea, mel, cur, div, tmp, staffFilter);
+    loadMeasure(mea, mel, cur, div, tmp, staffFilter, tempos);
     part.measures.push(mea);
     tmp.pairTuplet();
     pos = pos.plus(mea.duration);
     cur = mea;
   });
   tmp.pairTie();
+}
+
+function applyImportedTempos(score: Score, imported: ImportedTempoEvent[]): void {
+  const tempos = [...imported].sort((left, right) =>
+    left.measure - right.measure || left.offset.compareTo(right.offset));
+  if (tempos.length === 0) return;
+  const opening = tempos.find((item) => item.measure === 0 && item.offset.equals(0));
+  if (opening) {
+    score.tempoBpm = opening.bpm;
+    score.tempoBeatUnit = opening.beatUnit;
+  }
+  score.tempoMarks = tempos.flatMap((item) => {
+    if (item === opening) return [];
+    const mark = new TempoMark();
+    mark.measure = item.measure;
+    mark.offset = item.offset;
+    mark.kind = "tempo";
+    mark.bpm = item.bpm;
+    mark.beatUnit = item.beatUnit;
+    return [mark];
+  });
 }
 
 function staffCount(partEl: Element): number {
@@ -475,6 +592,7 @@ export function loadMusicXml(xmlText: string): Score {
   if (err) throw new Error("MusicXML 解析失败: " + err.textContent);
   const root = doc.documentElement; // score-partwise
   const score = new Score();
+  const importedTempos: ImportedTempoEvent[] = [];
 
   score.title = extractScoreTitle(root);
   const movementTitle = normText(txt(root, "movement-title"));
@@ -520,7 +638,7 @@ export function loadMusicXml(xmlText: string): Score {
     const right = new Part();
     right.hand = "right";
     right.voiceIndex = 1;
-    loadPart(right, partEls[0], score.playData, 1);
+    loadPart(right, partEls[0], score.playData, 1, importedTempos);
     const left = new Part();
     left.hand = "left";
     left.voiceIndex = 2;
@@ -533,7 +651,7 @@ export function loadMusicXml(xmlText: string): Score {
     const right = new Part();
     right.hand = "right";
     right.voiceIndex = 1;
-    loadPart(right, partEls[0], score.playData);
+    loadPart(right, partEls[0], score.playData, null, importedTempos);
     const left = new Part();
     left.hand = "left";
     left.voiceIndex = 2;
@@ -559,6 +677,7 @@ export function loadMusicXml(xmlText: string): Score {
           partEl,
           score.parts.length === 0 ? score.playData : new PlayData(),
           staves > 1 ? staff : undefined,
+          score.parts.length === 0 ? importedTempos : null,
         );
         score.parts.push(part);
       }
@@ -577,6 +696,7 @@ export function loadMusicXml(xmlText: string): Score {
       }
     }
   }
+  applyImportedTempos(score, importedTempos);
   for (const part of score.parts) {
     for (const m of part.measures) {
       m.init(score.piano || score.ensemble

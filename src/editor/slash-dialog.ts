@@ -519,6 +519,7 @@ export function showSlashScoreImportDialog(
       bracketMode: bracketMode.value as SlashGroupMode,
       ordering: ordering.value as NonNullable<SlashScoreOptions["ordering"]>,
       tempoMarks: initial.tempoMarks?.map((mark) => ({ ...mark })) ?? [],
+      keyChanges: initial.keyChanges?.map((change) => ({ ...change })) ?? [],
     });
 
     let dirty = false;

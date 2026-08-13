@@ -226,7 +226,12 @@ function updateTimeInf(p: Part): void {
   }
 }
 
-function makePart(sec: VoiceSection, key: Key, ts: Time): Part {
+function makePart(
+  sec: VoiceSection,
+  key: Key,
+  ts: Time,
+  keyChanges: ReadonlyMap<number, number> = new Map(),
+): Part {
   const res = new Part();
   res.hand = sec.hand;
   res.instrumentName = sec.instrumentName ?? "";
@@ -242,6 +247,7 @@ function makePart(sec: VoiceSection, key: Key, ts: Time): Part {
   let mid = 0;
   let currentTime = new Time(ts.beats, ts.beatType);
   let pendingTimeChange = false;
+  let currentFifths = key.fifths;
 
   for (const e of data.entry_list()) {
     const noteCtx = e.note();
@@ -250,11 +256,20 @@ function makePart(sec: VoiceSection, key: Key, ts: Time): Part {
     const timeCtx = e.timesig();
     if (noteCtx) {
       if (mea === null || newMeasure) {
+        const changedFifths = keyChanges.get(mid);
+        if (changedFifths !== undefined) currentFifths = changedFifths;
+        stat.basePitch = MusicCommon.getBasePitchOfKey({
+          fifths: currentFifths,
+          name: "",
+        } as Key);
+        stat.fifths = currentFifths;
+        stat.alter = {};
         mea = new Measure(mid);
         mea.time = new Time(currentTime.beats, currentTime.beatType);
         mea.timeChange = mid > 0 && pendingTimeChange;
         mea.key = new Key();
-        mea.key.fifths = key.fifths;
+        mea.key.fifths = currentFifths;
+        mea.keyChange = mid > 0 && changedFifths !== undefined;
         pendingTimeChange = false;
         mid++;
         res.measures.push(mea);
@@ -320,13 +335,28 @@ function makePart(sec: VoiceSection, key: Key, ts: Time): Part {
   return res;
 }
 
+function parseKeyChanges(text: string | null): Map<number, number> {
+  const result = new Map<number, number>();
+  for (const token of text?.split(";") ?? []) {
+    const match = /^(\d+)\s*=\s*([^;]+)$/.exec(token.trim());
+    if (!match) continue;
+    const measure = parseInt(match[1], 10) - 1;
+    const raw = match[2].trim();
+    const numeric = /^-?\d+$/.test(raw) ? parseInt(raw, 10) : null;
+    const fifths = numeric ?? MusicCommon.keyNameToFifth(raw);
+    if (measure <= 0 || fifths < -7 || fifths > 7) continue;
+    result.set(measure, fifths);
+  }
+  return result;
+}
+
 function applyTitleAnnotations(
   score: Score,
   tempoText: string | null,
   arpeggioText: string | null,
 ): void {
   for (const token of tempoText?.split(";") ?? []) {
-    const match = /^(\d+)@([^=]+)=(accel|rit|tempo)(?::(\d+))?$/.exec(token.trim());
+    const match = /^(\d+)@([^=]+)=(accel|rit|tempo)(?::(\d+(?:\.\d+)?))?$/.exec(token.trim());
     if (!match) continue;
     const measure = parseInt(match[1], 10) - 1;
     const offset = Fraction.fromString(match[2]);
@@ -335,7 +365,7 @@ function applyTitleAnnotations(
     mark.measure = measure;
     mark.offset = offset;
     mark.kind = match[3] as TempoMark["kind"];
-    mark.bpm = match[4] ? Math.max(1, parseInt(match[4], 10)) : null;
+    mark.bpm = match[4] ? Math.max(0.1, parseFloat(match[4])) : null;
     if (mark.kind === "tempo" && mark.bpm === null) continue;
     score.tempoMarks.push(mark);
   }
@@ -386,6 +416,7 @@ export function fromJpw(f: JpwFile): Score | null {
   ts.beats = parseInt(tmArr[0], 10);
   const kk = new Key();
   kk.fifths = MusicCommon.keyNameToFifth(key);
+  const keyChanges = parseKeyChanges(title?.keyChanges ?? null);
   const voices = f.getVoices();
   if (voices.length === 0) return null;
   const ensembleVoices = voices.filter((voice) => voice.instrumentName !== null && voice.voiceIndex !== null);
@@ -402,7 +433,7 @@ export function fromJpw(f: JpwFile): Score | null {
       groupOrder.get(a.instrumentName!)! - groupOrder.get(b.instrumentName!)! ||
       a.voiceIndex! - b.voiceIndex!,
     );
-    for (const voice of ordered) res.parts.push(makePart(voice, kk, ts));
+    for (const voice of ordered) res.parts.push(makePart(voice, kk, ts, keyChanges));
     res.ensemble = true;
     applyTitleAnnotations(res, title?.tempoMarks ?? null, title?.arpeggios ?? null);
     const primary = res.parts[0];
@@ -424,7 +455,7 @@ export function fromJpw(f: JpwFile): Score | null {
   if (piano && (!rightVoice || !leftVoice)) {
     throw new Error("钢琴简谱需要同时包含 .Voice.RH 和 .Voice.LH");
   }
-  const part = makePart((piano ? rightVoice : f.getVoice())!, kk, ts);
+  const part = makePart((piano ? rightVoice : f.getVoice())!, kk, ts, keyChanges);
   const lrc = f.getLyric();
   let pass = 0;
   if (lrc !== null) {
@@ -433,7 +464,7 @@ export function fromJpw(f: JpwFile): Score | null {
   }
   res.parts.push(part);
   if (piano) {
-    const left = makePart(leftVoice!, kk, ts);
+    const left = makePart(leftVoice!, kk, ts, keyChanges);
     res.parts.push(left);
     res.piano = true;
     if (!res.instrumentName.trim()) res.instrumentName = "钢琴";

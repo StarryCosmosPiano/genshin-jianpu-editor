@@ -1,5 +1,6 @@
 import { Fraction } from "../common/fraction";
 import {
+  AccidentalStat,
   Chord,
   formatTempoBpm,
   Measure,
@@ -42,6 +43,12 @@ export interface SlashTempoMark {
   bpm: number | null;
 }
 
+export interface SlashKeyChange {
+  /** Zero-based notated measure index. */
+  measure: number;
+  fifths: number;
+}
+
 export interface SlashScoreOptions {
   kind: SlashScoreKind;
   /** Keyboard TXT only: show A-Z key labels without changing pitch semantics. */
@@ -80,6 +87,8 @@ export interface SlashScoreOptions {
   ordering?: MidiSlashOrdering;
   /** MIDI tempo annotations retained inside the editable TXT settings comment. */
   tempoMarks?: SlashTempoMark[];
+  /** Mid-score key signatures retained inside the editable TXT settings comment. */
+  keyChanges?: SlashKeyChange[];
   /** Direct score-pane rhythmic edits retained inside the TXT settings comment. */
   noteTimingEdits?: NoteTimingEditData[];
 }
@@ -121,6 +130,7 @@ export interface SlashScoreAnalysis {
   suggestedBracketMode: SlashGroupMode;
   ordering: MidiSlashOrdering;
   tempoMarks: SlashTempoMark[];
+  keyChanges: SlashKeyChange[];
   noteTimingEdits: NoteTimingEditData[];
   /** One long score line contains several measures and must be split from the chosen meter. */
   continuous: boolean;
@@ -227,6 +237,7 @@ interface Directives {
   bracketMode: SlashGroupMode | null;
   ordering: MidiSlashOrdering;
   tempoMarks: SlashTempoMark[];
+  keyChanges: SlashKeyChange[];
   noteTimingEdits: NoteTimingEditData[];
 }
 
@@ -242,8 +253,6 @@ interface TimedEvent {
   writtenDurations?: number[];
   /** Leading duration in a slash group continues this preceding event. */
   continuationOf?: TimedEvent;
-  /** A repeated source pitch explicitly starts this continuation segment. */
-  sourcePitchContinuation?: boolean;
   /** A voice-only boundary added for readable sustain; it has no source token. */
   syntheticContinuation?: boolean;
   /** Non-metrical notes printed before this event. */
@@ -533,6 +542,7 @@ function readDirectives(text: string): Directives {
     bracketMode: null,
     ordering: "pitch-asc",
     tempoMarks: [],
+    keyChanges: [],
     noteTimingEdits: [],
   };
   const meter = /(?:^|\n)\s*(\d{1,2})\s*\/\s*(2|4|8|16)\s*拍?/m.exec(text);
@@ -614,6 +624,7 @@ function readDirectives(text: string): Directives {
         b?: "n" | "g" | "s" | "a" | "t"; q?: "n" | "g" | "s" | "a" | "t";
         o?: MidiSlashOrdering;
         tm?: SlashTempoMark[];
+        kc?: SlashKeyChange[];
         ne?: NoteTimingEditData[];
       };
       const value = JSON.parse(stored[1]) as Stored;
@@ -708,11 +719,24 @@ function readDirectives(text: string): Directives {
           const measure = Math.round(Number(mark.measure));
           const offset = Number(mark.offset);
           const kind = mark.kind;
-          const bpm = mark.bpm === null ? null : Math.round(Number(mark.bpm));
+          const bpm = mark.bpm === null
+            ? null
+            : Math.round(Number(mark.bpm) * 10) / 10;
           if (!Number.isFinite(measure) || measure < 0 || !Number.isFinite(offset) || offset < 0) return [];
           if (kind !== "accel" && kind !== "rit" && kind !== "tempo") return [];
           if (kind === "tempo" && (!Number.isFinite(bpm) || (bpm ?? 0) < 1)) return [];
           return [{ measure, offset, kind, bpm }];
+        });
+      }
+      const storedKeyChanges = value.keyChanges ?? value.kc;
+      if (Array.isArray(storedKeyChanges)) {
+        result.keyChanges = storedKeyChanges.flatMap((change) => {
+          if (!change || typeof change !== "object") return [];
+          const measure = Math.round(Number(change.measure));
+          const fifths = Math.round(Number(change.fifths));
+          if (!Number.isFinite(measure) || measure <= 0) return [];
+          if (!Number.isFinite(fifths) || fifths < -7 || fifths > 7) return [];
+          return [{ measure, fifths }];
         });
       }
       result.noteTimingEdits = normalizeNoteTimingEdits(value.noteTimingEdits ?? value.ne);
@@ -986,6 +1010,7 @@ export function analyzeSlashScore(text: string): SlashScoreAnalysis {
     suggestedBracketMode: bracketMode,
     ordering: directive.ordering,
     tempoMarks: directive.tempoMarks,
+    keyChanges: directive.keyChanges,
     noteTimingEdits: directive.noteTimingEdits,
     continuous,
   };
@@ -1018,6 +1043,7 @@ export function defaultSlashScoreOptions(kind: SlashScoreKind, analysis?: SlashS
     bracketMode: analysis?.suggestedBracketMode ?? "triplet",
     ordering: analysis?.ordering ?? "pitch-asc",
     tempoMarks: analysis?.tempoMarks.map((mark) => ({ ...mark })) ?? [],
+    keyChanges: analysis?.keyChanges.map((change) => ({ ...change })) ?? [],
     noteTimingEdits: analysis?.noteTimingEdits.map((edit) => ({ ...edit })) ?? [],
   };
 }
@@ -1667,6 +1693,7 @@ function optionsWithDirectives(text: string, base: SlashScoreOptions): SlashScor
     bracketMode: base.bracketMode ?? directive.bracketMode ?? "triplet",
     ordering: base.ordering ?? directive.ordering,
     tempoMarks: base.tempoMarks ?? directive.tempoMarks,
+    keyChanges: base.keyChanges ?? directive.keyChanges,
     noteTimingEdits: base.noteTimingEdits?.length
       ? base.noteTimingEdits
       : directive.noteTimingEdits,
@@ -1992,13 +2019,6 @@ function splitTimedEventsByVoice(
     Number(Boolean(left.continuationOf)) - Number(Boolean(right.continuationOf)));
 }
 
-function sameTimedPitches(left: TimedEvent, right: TimedEvent): boolean {
-  const a = [...left.pitches].sort((x, y) => x - y);
-  const b = [...right.pitches].sort((x, y) => x - y);
-  return a.length > 0 && a.length === b.length
-    && a.every((pitch, index) => pitch === b[index]);
-}
-
 function continuationRoot(event: TimedEvent): TimedEvent {
   let result = event;
   const visited = new Set<TimedEvent>();
@@ -2132,7 +2152,6 @@ function splitVoicedWrittenDurations(
         end: cursor + duration,
         writtenDurations: [duration],
         continuationOf: previous,
-        sourcePitchContinuation: undefined,
         syntheticContinuation: true,
         gracePitches: undefined,
         arpeggio: false,
@@ -2158,10 +2177,12 @@ function splitVoicedWrittenDurations(
 
 /**
  * TXT has one public time axis, while every marked voice sustains independently.
- * Preserve an explicitly repeated pitch as a written gray continuation inside
- * the same slash group, and add a source-less continuation at the group edge
- * when a voice has to ring into the next group. A same pitch in a later slash
- * group or measure remains a new black attack.
+ * Every explicitly written pitch is a new attack, even when it repeats the
+ * preceding pitch in the same slash group. Only the otherwise empty span until
+ * that voice's next written attack is sustained, with source-less continuation
+ * columns added at metrical boundaries. This distinction is required for a
+ * JPW -> TXT round-trip: an explicitly repeated W remains a black W, while the
+ * W generated at the following beat boundary is the gray tied destination.
  */
 function addIndependentVoiceContinuations(
   events: readonly TimedEvent[],
@@ -2178,33 +2199,12 @@ function addIndependentVoiceContinuations(
   const groupsPerMeasure = Math.max(1, compound ? options.beats / 3 : options.beats);
   const groupDuration = measureDuration / groupsPerMeasure;
   const scoreEnd = Math.max(measureDuration, measures * measureDuration);
-  const gridGroupKey = (time: number): string => {
-    const measure = Math.max(0, Math.floor((time + 1e-8) / measureDuration));
-    const local = time - measure * measureDuration;
-    const group = Math.max(0, Math.floor((local + 1e-8) / groupDuration));
-    return `${measure}:${group}`;
-  };
-  const eventGroupKey = (event: TimedEvent): string =>
-    event.sourceGroupKey ?? gridGroupKey(event.start);
-
   for (let voice = 0; voice < options.voiceCount; voice++) {
     const ordered = result
       .filter((event) => (event.voiceIndex ?? options.voiceCount - 1) === voice)
       .sort((left, right) =>
         left.start - right.start
         || Number(Boolean(left.continuationOf)) - Number(Boolean(right.continuationOf)));
-
-    let previousWrittenAttack: TimedEvent | null = null;
-    for (const event of ordered) {
-      if (event.continuationOf) continue;
-      if (previousWrittenAttack
-        && eventGroupKey(previousWrittenAttack) === eventGroupKey(event)
-        && sameTimedPitches(previousWrittenAttack, event)) {
-        event.continuationOf = previousWrittenAttack;
-        event.sourcePitchContinuation = true;
-      }
-      previousWrittenAttack = event;
-    }
 
     const attacks = ordered.filter((event) => !event.continuationOf);
     attacks.forEach((attack, index) => {
@@ -2237,10 +2237,9 @@ function addIndependentVoiceContinuations(
       }
       const requiredKey = new Set(requiredStarts.map((value) => Math.round(value * 192)));
 
-      // A repeated spelling of the same voice/pitch describes one sustained
-      // sound. Keep a visible continuation only at a boundary required by the
-      // metric spelling. Inside one beat, adjacent sixteenths therefore merge
-      // into an eighth/dotted eighth even when both source tokens exist.
+      // Source-less continuations are notation scaffolding. Keep only the
+      // boundaries required by the metric spelling; explicitly written pitch
+      // events are attacks and therefore never members of this chain.
       for (const continuation of chain) {
         if (!requiredKey.has(Math.round(continuation.start * 192))) {
           removed.add(continuation);
@@ -2418,7 +2417,6 @@ function applySlashContinuations(score: Score, events: readonly TimedEvent[]): v
   chords.sort((a, b) => a.start - b.start || a.end - b.end);
 
   const eventLastChord = new Map<TimedEvent, Chord>();
-  const sourceBackedContinuations = new Set<Chord>();
   for (const event of events) {
     const pitches = [...event.pitches].sort((a, b) => a - b);
     const voice = clamp(event.voiceIndex ?? 0, 0, Math.max(0, score.parts.length - 1));
@@ -2454,11 +2452,8 @@ function applySlashContinuations(score: Score, events: readonly TimedEvent[]): v
       for (let index = 0; index < matching.length; index++) {
         const item = matching[index];
         item.chord.transparentContinuation = true;
-        item.chord.generatedTimingContinuation =
-          !(event.sourcePitchContinuation && index === 0);
-        if (event.sourcePitchContinuation && index === 0) {
-          sourceBackedContinuations.add(item.chord);
-        }
+        item.chord.generatedTimingContinuation = true;
+        item.chord.persistGeneratedContinuation = true;
         // A continuation split into several notated values is one tie chain,
         // not the generic slur used by the MIDI readability simplifier.
         item.chord.slurStart = false;
@@ -2508,15 +2503,17 @@ function applySlashContinuations(score: Score, events: readonly TimedEvent[]): v
     } else {
       item.chord.transparentContinuation = false;
       item.chord.generatedTimingContinuation = false;
+      item.chord.persistGeneratedContinuation = false;
     }
   }
 
-  // Only an explicitly repeated source pitch owns a text range; every other
-  // tied tail is generated, gray, and excluded from text-selection matching.
+  // Every continuation here is source-less: explicitly written repeated
+  // pitches remain normal attacks. Generated gray tails are excluded from
+  // source-text selection matching.
   for (const item of chords) {
     if (!item.chord.transparentContinuation) continue;
-    item.chord.generatedTimingContinuation =
-      !sourceBackedContinuations.has(item.chord);
+    item.chord.generatedTimingContinuation = true;
+    item.chord.persistGeneratedContinuation = true;
   }
 }
 
@@ -2587,10 +2584,41 @@ function applySlashTempoMarks(score: Score, marks: readonly SlashTempoMark[]): v
     mark.offset = new Fraction(Math.round(source.offset * 192), 192);
     mark.kind = source.kind;
     mark.bpm = source.kind === "tempo" && source.bpm !== null
-      ? Math.max(1, Math.round(source.bpm))
+      ? Math.max(0.1, Math.round(source.bpm * 10) / 10)
       : null;
     return [mark];
   });
+}
+
+function applySlashKeyChanges(
+  score: Score,
+  openingFifths: number,
+  changes: readonly SlashKeyChange[],
+): void {
+  const byMeasure = new Map<number, number>();
+  for (const change of changes) {
+    const measure = Math.round(change.measure);
+    const fifths = clamp(Math.round(change.fifths), -7, 7);
+    if (measure > 0) byMeasure.set(measure, fifths);
+  }
+  for (const part of score.parts) {
+    let fifths = clamp(Math.round(openingFifths), -7, 7);
+    for (const measure of part.measures) {
+      const changed = byMeasure.get(measure.index);
+      if (changed !== undefined) fifths = changed;
+      measure.key.fifths = fifths;
+      measure.keyChange = measure.index > 0 && changed !== undefined;
+      const accidental = new AccidentalStat(fifths);
+      const chords = measure.entries
+        .filter((entry): entry is Chord => entry instanceof Chord)
+        .sort((left, right) => left.position.compareTo(right.position));
+      for (const chord of chords) {
+        for (const note of [...chord.graceNotes, ...chord.notes]) {
+          if (!note.rest) note.init(fifths, accidental);
+        }
+      }
+    }
+  }
 }
 
 function finestQuantize(options: SlashScoreOptions): MidiQuantizeDivision {
@@ -2861,6 +2889,7 @@ export function parseSlashScore(text: string, baseOptions: SlashScoreOptions): S
   applySlashContinuations(imported.score, voicedEvents);
   applySlashOrnaments(imported.score, voicedEvents);
   applySlashTempoMarks(imported.score, options.tempoMarks ?? []);
+  applySlashKeyChanges(imported.score, options.fifths, options.keyChanges ?? []);
   const pickupRestDivision = (options.noteDivision ?? Math.min(
     64,
     Math.max(4, ...Object.values(effectiveMappings(options))),
@@ -3458,7 +3487,10 @@ function applyMidiSlashGestures(
 }
 
 function keyName(fifths: number): string {
-  return MusicCommon.keys[clamp(fifths + 7, 0, 14)];
+  const name = MusicCommon.keys[clamp(fifths + 7, 0, 14)];
+  return name.startsWith("#") || name.startsWith("b")
+    ? `${name.slice(1)}${name[0]}`
+    : name;
 }
 
 function slashGroupDirective(label: "花括号" | "方括号", mode: SlashGroupMode): string {
@@ -3756,6 +3788,9 @@ export function embedSlashScoreOptions(text: string, options: SlashScoreOptions)
   if (options.lyricist) stored.l = options.lyricist;
   if (options.tempoMarks?.length) {
     stored.tm = options.tempoMarks.map((mark) => ({ ...mark }));
+  }
+  if (options.keyChanges?.length) {
+    stored.kc = options.keyChanges.map((change) => ({ ...change }));
   }
   if (options.noteTimingEdits?.length) {
     stored.ne = normalizeNoteTimingEdits(options.noteTimingEdits).map((edit) => ({ ...edit }));

@@ -258,6 +258,12 @@ export class Chord extends Entry {
   notes: Note[] = [];
   /** Synthetic tied segment created from a persisted rhythmic edit. */
   generatedTimingContinuation = false;
+  /**
+   * Keep this generated continuation when materializing the current Score as
+   * JPW. Slash-score voice sustains are real notation produced from compact
+   * TXT, unlike timing-edit overlays that must serialize their original chord.
+   */
+  persistGeneratedContinuation = false;
   /** Original editable source order, retained when a timing edit reorders attacks. */
   timingSourceIndex: number | null = null;
   /** Pre-edit notation used when the transformed score is serialized again. */

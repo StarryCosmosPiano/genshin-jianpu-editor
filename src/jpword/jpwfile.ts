@@ -281,6 +281,9 @@ export class TitleSection extends Section {
   get tempoMarks(): string | null {
     return this.getValue("TempoMarks");
   }
+  get keyChanges(): string | null {
+    return this.getValue("KeyChanges");
+  }
   get arpeggios(): string | null {
     return this.getValue("Arpeggios");
   }

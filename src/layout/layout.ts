@@ -511,7 +511,7 @@ export class KeySig extends Entry {
     const tf = new TextFrame();
     tf.color = opt.color;
     tf.y = -opt.numberSize;
-    tf.text = `转1=${name}`;
+    tf.text = `1=${name}`;
     tf.font = opt.lrcFont.scaled(0.6);
     const w = tf.measureText();
     tf.x = -w / 2;

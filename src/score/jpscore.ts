@@ -19,6 +19,12 @@ function escape(s: string): string {
   return s.replace(/\n/g, "\\n");
 }
 
+function displayKeyName(name: string): string {
+  return name.startsWith("#") || name.startsWith("b")
+    ? `${name.slice(1)}${name[0]}`
+    : name;
+}
+
 function ensembleVoiceSection(part: Part, partIndex: number): string {
   const instrument = (part.instrumentName.trim() || `乐器 ${partIndex + 1}`)
     .replace(/[\r\n]+/g, " ")
@@ -40,7 +46,8 @@ function serializationPosition(entry: Entry): import("../common/fraction").Fract
 function serializationEntries(part: Part, measure: Measure): Entry[] {
   const ordinary = measure.entries.filter((entry) =>
     !(entry instanceof Chord
-      && (entry.generatedTimingContinuation || entry.timingOriginal !== null)));
+      && ((entry.generatedTimingContinuation && !entry.persistGeneratedContinuation)
+        || entry.timingOriginal !== null)));
   const restored = part.measures.flatMap((candidate) =>
     candidate.entries.filter((entry): entry is Chord =>
       entry instanceof Chord
@@ -279,7 +286,7 @@ class JpScore {
     this.lines.push(`Instrument = {${escape(scr.instrumentName)}}`);
     const firstMea = scr.parts[0].measures[0];
     const tm = firstMea.time;
-    const key = firstMea.key.name;
+    const key = displayKeyName(firstMea.key.name);
     this.lines.push(`KeyAndMeters = {1=${key},${tm.beats}/${tm.beatType}}`);
     this.lines.push(`Tempo = {${formatTempoBpm(scr.tempoBpm)}}`);
     if (scr.tempoBeatUnit !== "quarter") {
@@ -288,11 +295,18 @@ class JpScore {
     if (scr.tempoMarks.length > 0) {
       const marks = scr.tempoMarks.map((mark) => {
         const value = mark.kind === "tempo" && mark.bpm !== null
-          ? `${mark.kind}:${Math.max(1, Math.round(mark.bpm))}`
+          ? `${mark.kind}:${formatTempoBpm(mark.bpm)}`
           : mark.kind;
         return `${mark.measure + 1}@${mark.offset.toString()}=${value}`;
       });
       this.lines.push(`TempoMarks = {${marks.join(";")}}`);
+    }
+    const keyChanges = scr.parts[0]?.measures
+      .filter((measure) => measure.index > 0 && measure.keyChange)
+      .map((measure) => `${measure.index + 1}=${displayKeyName(measure.key.name)}`)
+      ?? [];
+    if (keyChanges.length > 0) {
+      this.lines.push(`KeyChanges = {${keyChanges.join(";")}}`);
     }
     const arpeggios: string[] = [];
     scr.parts.forEach((part, partIndex) => {
@@ -345,7 +359,7 @@ class JpScore {
     switch (nt.jpAlter) {
       case "n": str += "#b"; break;
       case "b": case "#": str += nt.jpAlter; break;
-      case " ": case "": case " ": break;
+      case " ": case "": case "\0": break;
       default: throw new Error("bad jpAlter");
     }
     str += nt.number;
