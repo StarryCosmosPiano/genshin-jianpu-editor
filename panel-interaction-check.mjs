@@ -38,7 +38,8 @@ const snapshot = () => content.evaluate((scroll) => ({
 }));
 
 try {
-  await page.goto(`http://127.0.0.1:${server.address().port}/`, { waitUntil: "networkidle" });
+  const testUrl = process.env.APP_TEST_URL || `http://127.0.0.1:${server.address().port}/`;
+  await page.goto(testUrl, { waitUntil: "networkidle" });
   await page.waitForFunction(() => window.__app?.painter?.layout?.options);
   const defaults = await page.evaluate(() => ({
     width: window.__app.engravingStyle.braceWidthScale,
@@ -84,6 +85,71 @@ try {
   const keyboardAfter = await snapshot();
   assert(Math.abs(keyboardAfter.top - keyboardBefore.top) <= 2 && keyboardAfter.reserve > 0,
     `keyboard collapse did not retain the scroll position: ${JSON.stringify({ keyboardBefore, keyboardAfter })}`);
+
+  // At minimum window height the real collapsed content is almost as tall as
+  // the retained viewport. Grow back past that content length: scrollHeight
+  // is then clamped by clientHeight, so measuring it would lose the anchor.
+  const resizeGrip = pane.locator(".inspector-resize-grip");
+  await resizeGrip.focus();
+  for (let step = 0; step < 48; step++) await resizeGrip.press("ArrowUp");
+  await content.evaluate((scroll) => { scroll.scrollTop = 300; });
+  await page.waitForTimeout(30);
+  const smallWindow = await snapshot();
+  assert(Math.abs(smallWindow.top - 300) <= 2,
+    `small window could not retain the manual scroll: ${JSON.stringify(smallWindow)}`);
+  for (let step = 0; step < 48; step++) await resizeGrip.press("ArrowDown");
+  const grownWindow = await snapshot();
+  assert(Math.abs(grownWindow.top - smallWindow.top) <= 2 && grownWindow.reserve > smallWindow.reserve,
+    `growing the window jumped above the retained view: ${JSON.stringify({ smallWindow, grownWindow })}`);
+
+  // A short section can leave real content below the retained position after
+  // the floating window is made shorter. Wheel motion must reach that content
+  // instead of being blocked by the old spacer guard.
+  await content.evaluate((scroll) => { scroll.scrollTop = 0; });
+  await firstSummary.evaluate((summary) => summary.click());
+  await page.waitForTimeout(30);
+  const lastSummary = pane.locator(".engraving-section > summary").last();
+  await lastSummary.click();
+  await content.evaluate((scroll) => { scroll.scrollTop = scroll.scrollHeight; });
+  const shortBefore = await snapshot();
+  const anchorBefore = await lastSummary.evaluate((summary) => summary.getBoundingClientRect().top);
+  await lastSummary.click();
+  await page.waitForTimeout(30);
+  const shortAfter = await snapshot();
+  assert(Math.abs(shortAfter.top - shortBefore.top) <= 2 && shortAfter.reserve > 0,
+    `collapsing a visible lower section jumped to the top: ${JSON.stringify({ shortBefore, shortAfter })}`);
+  const anchorAfter = await lastSummary.evaluate((summary) => ({
+    top: summary.getBoundingClientRect().top,
+    focused: document.activeElement === summary,
+  }));
+  assert(Math.abs(anchorAfter.top - anchorBefore) <= 2 && anchorAfter.focused,
+    `collapse moved the visible summary or focus: ${JSON.stringify({ anchorBefore, anchorAfter })}`);
+  await resizeGrip.focus();
+  for (let step = 0; step < 20; step++) await resizeGrip.press("ArrowUp");
+  const resized = await snapshot();
+  assert(Math.abs(resized.top - shortAfter.top) <= 2,
+    `resizing lost the retained scroll position: ${JSON.stringify({ shortAfter, resized })}`);
+  const realBottom = resized.height - resized.viewport - resized.reserve;
+  assert(realBottom > resized.top + 40,
+    `fixture needs real content below the retained position: ${JSON.stringify({ resized, realBottom })}`);
+  const box = await content.boundingBox();
+  assert(box);
+  await page.mouse.move(box.x + box.width - 30, box.y + box.height / 2);
+  await page.mouse.wheel(0, 75);
+  await page.waitForTimeout(50);
+  const wheeled = await snapshot();
+  assert(wheeled.top > resized.top + 20 && wheeled.top <= realBottom + 2,
+    `wheel cannot reach real content after resize: ${JSON.stringify({ resized, wheeled, realBottom })}`);
+  await lastSummary.evaluate((summary) => summary.click());
+  await page.waitForTimeout(30);
+  const expanded = await snapshot();
+  assert(Math.abs(expanded.top - wheeled.top) <= 2,
+    `reopening the section lost the visible anchor: ${JSON.stringify({ wheeled, expanded })}`);
+  await page.mouse.wheel(0, 75);
+  await page.waitForTimeout(50);
+  assert((await snapshot()).top > expanded.top + 20,
+    "wheel cannot move down after reopening the section");
+  await pane.locator(".inspector-reset").click();
   await pane.locator(".inspector-close").click();
 
   await page.evaluate(() => window.__app.setEngravingStyle({

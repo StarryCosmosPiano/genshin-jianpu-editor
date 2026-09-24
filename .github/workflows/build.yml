@@ -4,12 +4,18 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: '更新现有桌面 Release 的标签；留空仅部署在线版'
+        required: false
+        default: ''
+        type: string
   release:
     types: [published]
 
 jobs:
   build:
-    if: github.event_name == 'release'
+    if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
     permissions:
       contents: write
     strategy:
@@ -27,6 +33,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
 
       - name: Setup Node
         uses: actions/setup-node@v5
@@ -47,6 +55,17 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Resolve existing version release
+        id: release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.release_tag }}
+        run: |
+          node -e "const v=require('./package.json').version;if(process.env.RELEASE_TAG!=='yuanqin-v'+v)throw new Error('Release tag does not match the application version')"
+          release_id="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" --jq .id)"
+          echo "id=${release_id}" >> "$GITHUB_OUTPUT"
+
       - name: Type check
         run: npx tsc --noEmit
 
@@ -62,16 +81,13 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tagName: ${{ github.event.release.tag_name }}
-          releaseName: ${{ github.event.release.name }}
-          releaseBody: ${{ github.event.release.body }}
-          releaseDraft: false
-          prerelease: ${{ github.event.release.prerelease }}
+          releaseId: ${{ steps.release.outputs.id }}
+          releaseAssetNamePattern: Yuanqin.Editor_[version]_[arch][setup][ext]
           args: --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
 
-  # Web 版在 main 更新或手动触发时部署到 GitHub Pages；release 标签只构建桌面安装包。
+  # main/空标签的手动运行部署网页；发布事件/指定标签只更新桌面安装包。
   pages-build:
-    if: github.event_name != 'release'
+    if: github.event_name != 'release' && inputs.release_tag == ''
     runs-on: ubuntu-latest
     permissions:
       contents: read

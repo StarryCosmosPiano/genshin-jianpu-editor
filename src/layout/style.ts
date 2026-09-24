@@ -108,6 +108,26 @@ export const DEFAULT_ENGRAVING_STYLE: Readonly<EngravingStyle> = Object.freeze({
   finalBarlineGap: 2.8,
 });
 
+export const ENGRAVING_STYLE_SETTINGS_VERSION = 1;
+
+/** Old installations persisted the entire style, including the former brace
+ * defaults. Update that exact pair once while preserving every other setting
+ * and any brace value the user changed. */
+export function restorePersistedEngravingStyle(
+  value: Partial<EngravingStyle> | null | undefined,
+  version: unknown,
+): { style: EngravingStyle; needsVersionSave: boolean } {
+  const needsVersionSave = !(typeof version === "number" && Number.isFinite(version)
+    && version >= ENGRAVING_STYLE_SETTINGS_VERSION);
+  const legacyDefaults = needsVersionSave
+    && value?.braceWidthScale === 0.7 && value.braceStrokeWidth === 0.5;
+  const source = legacyDefaults
+    ? { ...value, braceWidthScale: DEFAULT_ENGRAVING_STYLE.braceWidthScale,
+      braceStrokeWidth: DEFAULT_ENGRAVING_STYLE.braceStrokeWidth }
+    : value;
+  return { style: normalizeEngravingStyle(source), needsVersionSave };
+}
+
 export type NumericEngravingStyleKey = Exclude<
   keyof EngravingStyle,
   "numberBold" | "tieContinuationGray" | "rhythmicSpacingEnabled" | "justifyLastSystem" |

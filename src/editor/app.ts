@@ -42,7 +42,9 @@ import {
   type PageItem,
 } from "../layout/layout";
 import {
+  ENGRAVING_STYLE_SETTINGS_VERSION,
   normalizeEngravingStyle,
+  restorePersistedEngravingStyle,
   type EngravingStyle,
   type RhythmGuideDivision,
 } from "../layout/style";
@@ -725,6 +727,7 @@ export class App {
         titleSize: number; creditSize: number; color: number; zoom: number;
         mixedHideBarNumber: boolean;
         pageOrientationVersion: number;
+        engravingStyleVersion: number;
         engravingStyle: Partial<EngravingStyle>;
         slashVoiceColors: string[];
         slashVoiceColorVersion: number;
@@ -756,7 +759,10 @@ export class App {
       if (s.titleSize !== undefined) this.titleSize = s.titleSize;
       if (s.creditSize !== undefined) this.creditSize = s.creditSize;
       if (s.color !== undefined) this.color = s.color;
-      this.engravingStyle = normalizeEngravingStyle(s.engravingStyle);
+      const restoredStyle = restorePersistedEngravingStyle(
+        s.engravingStyle, s.engravingStyleVersion,
+      );
+      this.engravingStyle = restoredStyle.style;
       if (s.slashVoiceColorVersion === 2 && Array.isArray(s.slashVoiceColors)) {
         this.slashVoiceColors = this.slashVoiceColors.map((fallback, index) => {
           const value = s.slashVoiceColors?.[index];
@@ -818,6 +824,9 @@ export class App {
       this.configurePainter(this.painter);
       this.syncRhythmGridToolbar();
       this.syncCodePaneLayout();
+      // Persist the version only after every legacy setting has been read;
+      // an earlier write would replace unread fields with constructor defaults.
+      if (restoredStyle.needsVersionSave) this.saveSettings();
     } catch {
       // corrupt storage — ignore
     }
@@ -833,6 +842,7 @@ export class App {
         titleSize: this.titleSize,
         creditSize: this.creditSize,
         color: this.color,
+        engravingStyleVersion: ENGRAVING_STYLE_SETTINGS_VERSION,
         engravingStyle: this.engravingStyle,
         slashVoiceColors: this.slashVoiceColors,
         slashVoiceColorVersion: 2,
