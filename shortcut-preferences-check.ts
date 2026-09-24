@@ -1,6 +1,16 @@
 import assert from "node:assert/strict";
 import { defaultKeymap, historyKeymap } from "@codemirror/commands";
-import {
+import type { ShortcutContext } from "./src/editor/shortcuts";
+
+// Set navigator before loading shortcuts.ts, whose platform-specific Mod key
+// and CodeMirror defaults are selected when the module is initialized.
+const simulatedPlatform = process.env.SHORTCUT_TEST_PLATFORM;
+if (simulatedPlatform) {
+  Object.defineProperty(globalThis, "navigator", {
+    value: { platform: simulatedPlatform }, configurable: true,
+  });
+}
+const {
   SHORTCUT_ACTIONS,
   defaultShortcutBindings,
   findShortcutConflicts,
@@ -9,8 +19,9 @@ import {
   remapShortcutEvent,
   saveShortcutBindings,
   shortcutBindingAllowed,
-  type ShortcutContext,
-} from "./src/editor/shortcuts";
+} = await import("./src/editor/shortcuts");
+const mac = typeof navigator !== "undefined" && /Mac|iPhone|iPad/.test(navigator.platform);
+const modKey = mac ? { metaKey: true } : { ctrlKey: true };
 
 const storage = new Map<string, string>();
 Object.defineProperty(globalThis, "localStorage", { value: {
@@ -111,7 +122,7 @@ assert.equal(handleTextShortcut(key("F6"), {} as never, (canonical) => {
   return true;
 }), true);
 assert.equal(selectedShift, true, "remapped selection command preserves Shift in marker hook");
-const oldZoom = key("=", { ctrlKey: true });
+const oldZoom = key("=", modKey);
 assert.equal(mapped(oldZoom, "global"), null);
 
 const cancelledDraft = getShortcutBindings();
@@ -123,7 +134,7 @@ reassigned["voice.2"] = ["Mod+/"];
 reassigned[textSelectAll.id] = ["Alt+2"];
 assert.deepEqual(findShortcutConflicts(reassigned), []);
 saveShortcutBindings(reassigned);
-const voiceOnOldTextDefault = key("/", { ctrlKey: true });
+const voiceOnOldTextDefault = key("/", modKey);
 assert.equal(handleTextShortcut(voiceOnOldTextDefault, {} as never), false,
   "text command must release its displaced default to a configured voice command");
 const voiceMapped = mapped(voiceOnOldTextDefault, "text");
@@ -131,7 +142,7 @@ assert.equal(voiceMapped?.key, "2");
 assert.equal(voiceMapped?.code, "Digit2");
 let textOnOldVoiceDefault = false;
 assert.equal(handleTextShortcut(key("2", { altKey: true }), {} as never, (canonical) => {
-  textOnOldVoiceDefault = canonical.key === "a" && canonical.ctrlKey;
+  textOnOldVoiceDefault = canonical.key === "a" && (mac ? canonical.metaKey : canonical.ctrlKey);
   return true;
 }), true, "text command may take a voice command's old default");
 assert.equal(textOnOldVoiceDefault, true);
