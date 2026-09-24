@@ -52,6 +52,8 @@ export class JinpuPainter {
   private chordItem = new Map<Chord, { page: number; item: PageItem; verse: number }[]>();
   private highlighted: PageItem[] = [];
   private pageCache: CachedPage[] = [];
+  /** Model-only subtree bounds, built lazily after layout and reused per hit. */
+  private hitTreeBounds = new WeakMap<PageItem, Rect | null>();
 
   constructor(fontSize: number) {
     this.layout = new Layout(fontSize);
@@ -70,6 +72,7 @@ export class JinpuPainter {
     // are rebound as their pages render; old object lookups must stop here.
     this.nodeMap = new WeakMap<PageItem, SVGGElement>();
     this.itemMap = new WeakMap<Element, PageItem>();
+    this.hitTreeBounds = new WeakMap<PageItem, Rect | null>();
     this.buildChordIndex();
   }
 
@@ -238,6 +241,7 @@ export class JinpuPainter {
 
   /** Render one page group into a standalone <svg> of pageWidth x pageHeight. */
   renderPage(pageIndex: number): SVGSVGElement {
+    this.hitTreeBounds = new WeakMap<PageItem, Rect | null>();
     const svg = document.createElementNS(SVG_NS, "svg");
     svg.setAttribute("class", "score-page");
     svg.setAttribute("viewBox", `0 0 ${this.pageWidth} ${this.pageHeight}`);
@@ -248,6 +252,9 @@ export class JinpuPainter {
 
   /** Reconcile an interactive page with its previous SVG without detaching it. */
   renderCachedPage(pageIndex: number): SVGSVGElement {
+    // Incremental layout can retain PageItem identities while changing their
+    // positions or children. Rebuild lazily on the next pointer event.
+    this.hitTreeBounds = new WeakMap<PageItem, Rect | null>();
     const page = this.layout.pages[pageIndex];
     if (!page) throw new RangeError(`Page ${pageIndex} does not exist`);
     let cached = this.pageCache[pageIndex];
@@ -296,8 +303,8 @@ export class JinpuPainter {
         }
         group.insertBefore(cached.self, group.firstChild);
       }
-      cached.hit = cached.self && item.classes.has("tuplet-number")
-        ? createTupletHit(item, cached.self, group) : null;
+      cached.hit = cached.self && needsTextHit(item)
+        ? createTextHit(item, cached.self, group) : null;
       cached.visualKey = visualKey;
     } else {
       // applyScoreVoiceColors changes presentation attributes directly.
@@ -394,68 +401,105 @@ export class JinpuPainter {
 
   // ---------------- SVG picking ----------------
 
-  private calcDist(x: number, y: number, inn: Rect): number {
-    let dx = 0;
-    if (x < inn.left) dx = inn.left - x;
-    else if (x > inn.right) dx = x - inn.right;
-    let dy = 0;
-    if (y < inn.top) dy = inn.top - y;
-    else if (y > inn.bottom) dy = y - inn.bottom;
-    return dx + dy;
+  private hitTreeBound(item: PageItem): Rect | null {
+    const cached = this.hitTreeBounds.get(item);
+    if (cached !== undefined) return cached;
+    let area = itemHitBounds(item);
+    for (const child of item.children) {
+      const childArea = this.hitTreeBound(child)?.offset(child.x, child.y);
+      if (childArea) area = area ? area.union(childArea) : childArea;
+    }
+    this.hitTreeBounds.set(item, area);
+    return area;
   }
 
-  pick(root: PageItem, x: number, y: number): [PageItem | null, number] {
-    let bnd = root.bound;
-    bnd = bnd.offset(root.x, root.y);
-    const edge = 5;
-    const dist = this.calcDist(x, y, bnd);
-    if (root.children.length === 0) {
-      let outer = new Rect(bnd.left, bnd.top, bnd.right, bnd.bottom);
-      const dx = Math.min(bnd.width - edge * 2, 0) / 2;
-      const dy = Math.min(bnd.height - edge * 2, 0) / 2;
-      outer = outer.inset(dx, dy);
-      return outer.contains(x, y) ? [root, dist] : [null, dist];
-    }
-    let outer = new Rect(bnd.left, bnd.top, bnd.right, bnd.bottom);
-    outer = outer.inset(-edge, -edge);
-    if (outer.contains(x, y)) {
-      const xx = x - bnd.left;
-      const yy = y - bnd.top;
-      const items: PageItem[] = [];
-      let minDist = Number.MAX_VALUE;
-      let best: PageItem | null = null;
-      let small: PageItem | null = null;
-      for (const ch of root.children) {
-        const [p, pd] = this.pick(ch, xx, yy);
-        if (p !== null) {
-          if (pd < minDist) {
-            best = p;
-            minDist = pd;
-            items.length = 0;
-            items.push(p);
-          }
-          if (pd === minDist) items.push(p);
-          if (ch.bound.width < edge || ch.bound.height < edge) small = ch;
-        }
-      }
-      if (small !== null) return [small, 0];
-      let area = Number.MAX_VALUE;
-      for (const it of items) {
-        const a = it.bound.width * it.bound.height;
-        if (a < area) {
-          best = it;
-          area = a;
-        }
-      }
-      return [best, minDist];
-    }
-    return [null, Number.MAX_VALUE];
+  /** Candidate distance uses measured ink rather than SVG text's line box. */
+  private hitDistance(item: PageItem, localX: number, localY: number,
+    maxDistance: number): { distance: number; area: number } | null {
+    const bounds = itemHitBounds(item);
+    if (!bounds) return null;
+    const dx = Math.max(bounds.left - localX, 0, localX - bounds.right);
+    const dy = Math.max(bounds.top - localY, 0, localY - bounds.bottom);
+    const distance = Math.hypot(dx, dy);
+    if (distance > maxDistance) return null;
+    const paintDistance = item instanceof GraphicPath || item instanceof GraphicLine
+      ? this.geometryHit(item, localX, localY, maxDistance) : 0;
+    if (paintDistance === null) return null;
+    return { distance: Math.max(distance, paintDistance),
+      area: Math.max(0, bounds.width * bounds.height) };
   }
 
-  pickPage(page: number, pos: Point): PageItem | null {
-    const pg = this.layout.pages[page];
-    const [p] = this.pick(pg, pos.x, pos.y);
-    return p;
+  /** SVG path bounds can contain a large empty interior (a slur, for example).
+   * Ask the already-mounted shape whether its paint is actually near the hit. */
+  private geometryHit(item: GraphicPath | GraphicLine, x: number, y: number,
+    maxDistance: number): number | null {
+    const self = this.nodeMap.get(item)?.firstElementChild as SVGGeometryElement | null;
+    if (!self || typeof self.isPointInStroke !== "function") return 0;
+    const painted = (px: number, py: number): boolean => {
+      const point = new DOMPoint(px, py);
+      return (item instanceof GraphicPath && item.fill && self.isPointInFill(point))
+        || ((item instanceof GraphicLine || item.stroke) && self.isPointInStroke(point));
+    };
+    if (painted(x, y)) return 0;
+    if (maxDistance <= 0) return null;
+    // A few local probes give narrow strokes a modest click tolerance without
+    // admitting the entire path bounding box as a hit region.
+    for (const radius of [maxDistance / 2, maxDistance]) {
+      for (let index = 0; index < 8; index++) {
+        const angle = index * Math.PI / 4;
+        if (painted(x + Math.cos(angle) * radius, y + Math.sin(angle) * radius)) return radius;
+      }
+    }
+    return null;
+  }
+
+  /** Find the nearest painted item within a score-space tolerance. Zero means
+   * strict ink hit; empty layout groups never become candidates. */
+  pickPage(page: number, pos: Point, maxDistance = 3): PageItem | null {
+    const root = this.layout.pages[page];
+    if (!root) return null;
+    let bestItem: PageItem | null = null;
+    let bestDistance = Number.POSITIVE_INFINITY;
+    let bestArea = Number.POSITIVE_INFINITY;
+    const walk = (item: PageItem, x: number, y: number): void => {
+      const localX = x - item.x;
+      const localY = y - item.y;
+      const treeBound = this.hitTreeBound(item);
+      if (!treeBound || !treeBound.inset(-maxDistance, -maxDistance).contains(localX, localY)) return;
+      const hit = this.hitDistance(item, localX, localY, maxDistance);
+      if (hit && (hit.distance < bestDistance - 1e-8
+        || (Math.abs(hit.distance - bestDistance) <= 1e-8 && hit.area < bestArea))) {
+        bestItem = item;
+        bestDistance = hit.distance;
+        bestArea = hit.area;
+      }
+      for (const child of item.children) walk(child, localX, localY);
+    };
+    walk(root, pos.x, pos.y);
+    return bestItem;
+  }
+
+  /** DOM target breaks ties only after passing the same measured-ink test as
+   * geometric candidates. Browser text line-box targets cannot steal notes. */
+  pickPageAtPointer(page: number, pos: Point, target: EventTarget | null,
+    maxDistance = 3): PageItem | null {
+    const geometric = this.pickPage(page, pos, maxDistance);
+    const direct = this.pageItemForTarget(target);
+    const root = this.layout.pages[page];
+    if (!direct || !root) return geometric;
+    if (direct === root) return geometric;
+    let ancestor: PageItem | null = direct;
+    while (ancestor && ancestor !== root) ancestor = ancestor.parent;
+    if (ancestor !== root) return geometric;
+    const origin = direct.pos(root);
+    const directHit = this.hitDistance(direct,
+      pos.x - root.x - origin.x, pos.y - root.y - origin.y, maxDistance);
+    if (!directHit) return geometric;
+    if (!geometric) return direct;
+    const geoOrigin = geometric.pos(root);
+    const geoHit = this.hitDistance(geometric,
+      pos.x - root.x - geoOrigin.x, pos.y - root.y - geoOrigin.y, maxDistance);
+    return !geoHit || directHit.distance <= geoHit.distance + 1e-8 ? direct : geometric;
   }
 }
 
@@ -471,16 +515,17 @@ function syncAttribute(element: Element, name: string, value: string | null): vo
 
 function pageItemVisualKey(item: PageItem): string {
   const hidden = item.classes.has("notation-hidden-label");
-  const hit = item.classes.has("tuplet-number");
-  const hitBounds = hit ? [item.bound.left, item.bound.top, item.bound.width, item.bound.height] : null;
+  const textBounds = needsTextHit(item) ? textHitBounds(item) : null;
+  const hitBounds = textBounds
+    ? [textBounds.left, textBounds.top, textBounds.width, textBounds.height] : null;
   if (item instanceof GraphicPath) {
     return JSON.stringify(["path", item.d, item.fill, item.fill ? colorToCss(item.fillColor) : null,
       item.stroke, item.stroke ? colorToCss(item.strokeColor) : null,
-      item.stroke ? item.strokeWidth : null, hidden, hit, hitBounds]);
+      item.stroke ? item.strokeWidth : null, hidden, hitBounds]);
   }
   if (item instanceof GraphicLine) {
     return JSON.stringify(["line", item.p0.x, item.p0.y, item.p1.x, item.p1.y,
-      colorToCss(item.strokeColor), item.strokeWidth, hidden, hit, hitBounds]);
+      colorToCss(item.strokeColor), item.strokeWidth, hidden, hitBounds]);
   }
   if (item instanceof TextFrame) {
     return JSON.stringify(["text", item.text,
@@ -488,22 +533,59 @@ function pageItemVisualKey(item: PageItem): string {
       item.font.size, item.font.bold, colorToCss(item.color),
       item.strokeWidth > 0 ? colorToCss(item.strokeColor) : null,
       item.strokeWidth, item.strokeWidth > 0 && item.nonScalingStroke,
-      hidden, hit, hitBounds]);
+      hidden, hitBounds]);
   }
   return "group";
 }
 
-function createTupletHit(item: PageItem, self: SVGElement, group: SVGGElement): SVGRectElement {
+function textHitBounds(item: PageItem): Rect | null {
+  if (!(item instanceof TextFrame) || !item.text || item.classes.has("notation-hidden-label")) return null;
+  // SMuFL bounds use a font baseline with positive Y pointing UP, while SVG
+  // text is painted with positive Y pointing DOWN. Layout retains the legacy
+  // metric box, so convert it here for both pointer geometry and the DOM hit
+  // rectangle. Using it unchanged puts a tuplet 3 / mordent's target below
+  // the visible ink. Do not move the glyph or change score spacing.
+  if (item instanceof SmuflText) {
+    const fontBounds = item.bound;
+    return new Rect(fontBounds.left, -fontBounds.bottom, fontBounds.right, -fontBounds.top);
+  }
+  // SVG getBBox is a full line box for many CJK fonts. Ordinary text uses
+  // layout's cached tight vertical ink measurement, already in SVG space.
+  return item.font.charBound(item.text);
+}
+
+/** Only Bravura's large SVG line box needs an extra DOM hit surface. Plain
+ * note text keeps its original DOM shape for large scores and uses the tight
+ * model bound only when the picker validates a candidate. */
+function needsTextHit(item: PageItem): boolean {
+  return item instanceof SmuflText && !!textHitBounds(item);
+}
+
+function itemHitBounds(item: PageItem): Rect | null {
+  const textBounds = textHitBounds(item);
+  if (textBounds) return textBounds;
+  if (item instanceof GraphicPath) {
+    if (!item.fill && !item.stroke) return null;
+    return item.stroke ? item.bound.inset(-item.strokeWidth / 2, -item.strokeWidth / 2) : item.bound;
+  }
+  if (item instanceof GraphicLine) {
+    return item.bound.inset(-item.strokeWidth / 2, -item.strokeWidth / 2);
+  }
+  return null;
+}
+
+function createTextHit(item: PageItem, self: SVGElement, group: SVGGElement): SVGRectElement {
   self.setAttribute("pointer-events", "none");
   const hit = document.createElementNS(SVG_NS, "rect");
-  const bounds = item.bound;
+  const bounds = textHitBounds(item)!;
   hit.setAttribute("x", String(bounds.left));
   hit.setAttribute("y", String(bounds.top));
   hit.setAttribute("width", String(bounds.width));
   hit.setAttribute("height", String(bounds.height));
   hit.setAttribute("fill", "transparent");
   hit.setAttribute("pointer-events", "all");
-  group.insertBefore(hit, self.nextSibling);
+  if (self.nextSibling) group.insertBefore(hit, self.nextSibling);
+  else group.appendChild(hit);
   return hit;
 }
 
@@ -526,7 +608,7 @@ function indexCachedPageItem(item: PageItem, group: SVGGElement): CachedPageItem
   const elements = Array.from(group.children);
   const drawsSelf = item instanceof GraphicPath || item instanceof GraphicLine || item instanceof TextFrame;
   const self = drawsSelf ? elements.shift() as SVGElement : null;
-  const hit = self && item.classes.has("tuplet-number")
+  const hit = self && needsTextHit(item)
     ? elements.shift() as SVGRectElement : null;
   return {
     item,
@@ -556,12 +638,10 @@ export function renderPageItem(
       self.setAttribute("visibility", "hidden");
     }
     g.appendChild(self);
-    if (item.classes.has("tuplet-number")) {
-      // Bravura's SVG text hit box includes a large blank descent. When the
-      // numeral sits above the middle member it can intercept that note's
-      // clicks. Keep the glyph unchanged and use its tight SMuFL bounds for
-      // the selectable area instead.
-      const hit = createTupletHit(item, self, g);
+    if (needsTextHit(item)) {
+      // Bravura's SVG line box can overlap nearby notes. Only its symbols
+      // need an extra tight target; ordinary text keeps the original DOM.
+      const hit = createTextHit(item, self, g);
       itemMap?.set(hit, item);
     }
   }

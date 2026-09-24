@@ -1808,6 +1808,11 @@ function tupletAbsoluteRange(tuplet: S.Tuplet): { start: number; end: number } {
   return { start, end };
 }
 
+function sameTupletRange(left: S.Tuplet, right: S.Tuplet): boolean {
+  const a = tupletAbsoluteRange(left), b = tupletAbsoluteRange(right);
+  return Math.abs(a.start - b.start) < 1e-8 && Math.abs(a.end - b.end) < 1e-8;
+}
+
 /** Keep independent voice timing while suppressing duplicate brackets across
  * the separate rows of one piano/ensemble system. */
 function overlappingTupletSuppression(lines: readonly Line[]): Set<S.Tuplet> {
@@ -1820,6 +1825,8 @@ function overlappingTupletSuppression(lines: readonly Line[]): Set<S.Tuplet> {
       }
     }
   }
+  // Only identical real spans describe a shared visual bracket. A short
+  // triplet inside a longer one belongs to its own voice and needs its own 3.
   const clusters: S.Tuplet[][] = [];
   for (const tuplet of [...tuplets]
     .filter((item) => item.scope === "voice")
@@ -1827,23 +1834,15 @@ function overlappingTupletSuppression(lines: readonly Line[]): Set<S.Tuplet> {
       const a = tupletAbsoluteRange(left), b = tupletAbsoluteRange(right);
       return a.start - b.start || b.end - a.end;
     })) {
-    const range = tupletAbsoluteRange(tuplet);
-    const cluster = [...clusters].reverse().find((items) => {
-      const start = Math.min(...items.map((item) => tupletAbsoluteRange(item).start));
-      const end = Math.max(...items.map((item) => tupletAbsoluteRange(item).end));
-      return range.start < end - 1e-8 && range.end > start + 1e-8;
-    });
+    const cluster = clusters.find((items) => sameTupletRange(items[0], tuplet));
     if (cluster) cluster.push(tuplet);
     else clusters.push([tuplet]);
   }
   const suppressed = new Set<S.Tuplet>();
   for (const cluster of clusters) {
     if (cluster.length < 2) continue;
-    const visible = [...cluster].sort((left, right) => {
-      const a = tupletAbsoluteRange(left), b = tupletAbsoluteRange(right);
-      return (b.end - b.start) - (a.end - a.start)
-        || (left.partIndex ?? Number.MAX_SAFE_INTEGER) - (right.partIndex ?? Number.MAX_SAFE_INTEGER);
-    })[0];
+    const visible = [...cluster].sort((left, right) =>
+      (left.partIndex ?? Number.MAX_SAFE_INTEGER) - (right.partIndex ?? Number.MAX_SAFE_INTEGER))[0];
     for (const tuplet of cluster) if (tuplet !== visible) suppressed.add(tuplet);
   }
   return suppressed;
@@ -2629,28 +2628,19 @@ export class Line {
         tuplets.add(t);
       }
     }
-    // Different TXT voices can own nested/offset tuplets over the same real
-    // time.  Their timing metadata must remain independent, but engraving two
-    // brackets on top of each other is both misleading and unreadable.  Form
-    // strict-overlap clusters and draw the union once, using the longest group
-    // as the selectable representative. Merely adjacent tuplets stay separate.
+    // Distinct real ranges need distinct marks, even when the voice clocks
+    // overlap. Merge only coincident voice-local spans on this same line.
     const clusters: S.Tuplet[][] = [];
     for (const tuplet of [...tuplets].sort((left, right) => {
       const a = tupletAbsoluteRange(left), b = tupletAbsoluteRange(right);
       return a.start - b.start || b.end - a.end;
     })) {
-      const range = tupletAbsoluteRange(tuplet);
-      const previous = clusters[clusters.length - 1];
-      const previousRange = previous && previous.every((item) => item.scope === "voice")
-        ? {
-          start: Math.min(...previous.map((item) => tupletAbsoluteRange(item).start)),
-          end: Math.max(...previous.map((item) => tupletAbsoluteRange(item).end)),
-        }
-        : null;
-      if (tuplet.scope === "voice" && previousRange
-        && range.start < previousRange.end - 1e-8
-        && range.end > previousRange.start + 1e-8) {
-        previous.push(tuplet);
+      const matching = tuplet.scope === "voice"
+        ? clusters.find((items) => items.every((item) => item.scope === "voice")
+          && sameTupletRange(items[0], tuplet))
+        : undefined;
+      if (matching) {
+        matching.push(tuplet);
       } else {
         clusters.push([tuplet]);
       }

@@ -1666,6 +1666,16 @@ function firstMordentAtom(
   return token ? { from, to: token.next, pitches: [token.pitch] } : null;
 }
 
+/** Only metadata-owned ABA helpers collapse to one attack inside a shared tuplet. */
+function semanticMordentAtom(body: string, options: SlashScoreOptions): ReturnType<typeof firstMordentAtom> {
+  const owned = options.annotations?.some((annotation) => {
+    if (annotation.type !== "ornament"
+      || (annotation.kind !== "upper-mordent" && annotation.kind !== "lower-mordent")) return false;
+    return directMordentBody(body, options, annotation.part)?.kind === annotation.kind;
+  });
+  return owned ? firstMordentAtom(body, options) : null;
+}
+
 /** Return the one explicitly marked non-default voice owning every timed atom
  * in a container. Such a container is a parallel voice lane: its duration
  * starts at the current shared cursor but must not push the default voice to
@@ -1728,7 +1738,7 @@ function segmentMarkerDuration(
   braceMode: SlashBraceMode,
   noteDivision: SlashDurationDivision | null = null,
   bracketMode: SlashGroupMode = "triplet",
-  extraModes: Partial<Pick<SlashScoreOptions, "barMode" | "angleMode" | "parenMode">> = {},
+  extraModes: Partial<Pick<SlashScoreOptions, "barMode" | "angleMode" | "parenMode" | "annotations">> = {},
   parallelGroupLimit?: number,
   semanticMordent = false,
   voiceCountHint?: number,
@@ -1753,6 +1763,7 @@ function segmentMarkerDuration(
   const inferredVoiceCount = voiceCountHint ?? Math.max(1, ...[...segment.matchAll(/\u2063+/g)]
     .map((match) => compactMarkerBaseCount(match[0].length) + 1));
   const durationPitchOptions = {
+    annotations: extraModes.annotations,
     symbolDurations: mappings,
     noteDivision: null,
     braceMode,
@@ -2573,6 +2584,15 @@ export function slashPitchSources(text: string, baseOptions: SlashScoreOptions):
                 continue;
               }
               const atomContainer = slashContainerAt(raw, cursor, options);
+              if (atomContainer && atomContainer.end <= atomTo && atomContainer.spec.mode === "triplet") {
+                const atom = semanticMordentAtom(raw.slice(atomContainer.bodyFrom, atomContainer.bodyTo), options);
+                if (atom) {
+                  appendRange(atomContainer.bodyFrom + atom.from, atomContainer.bodyFrom + atom.to,
+                    eventForAtom(), false, rhythmicMode === "triplet");
+                  cursor = atomContainer.end;
+                  continue;
+                }
+              }
               if (atomContainer && atomContainer.end <= atomTo
                 && atomContainer.spec.mode === "chord") {
                   appendRange(
@@ -2863,6 +2883,16 @@ function timedContainerAtoms(
         lastPitchVoice = atom.voice;
         lastAtomWasRest = atom.rest;
         lastAtomExplicitDefault = atom.explicitDefault;
+      } else if (container.spec.mode === "triplet") {
+        const main = semanticMordentAtom(body, options);
+        if (main) {
+          const voiced = voicedPitchesIn(body.slice(main.from, main.to), options);
+          start(voiced.map(item => item.pitch), [], undefined, voiced.map(item => item.voice));
+          lastPitchEnd = -1;
+          lastPitchVoice = -1;
+          lastAtomWasRest = false;
+          lastAtomExplicitDefault = false;
+        }
       } else if (container.spec.mode === "grace" && pitches.length > 0) {
         lastPitchEnd = -1;
         lastPitchVoice = -1;
@@ -3704,7 +3734,7 @@ function parseGroup(
                 ?? (atom.explicitDuration ? atom.nominalDuration : minimumUnit);
               const duration = ordinary?.duration ?? (annotation ? printed * 2 / 3 : printed);
               const start = ordinary ? ordinary.offset - groupOffset
-                : annotation && ordinaryByVoice.size > 0
+                : annotation
                   ? annotation.offset - groupOffset
                     + annotation.members!.slice(0, memberIndex).reduce((sum, value) => sum + value * 2 / 3, 0)
                   : voiceCursors[voice] ?? aligned;
@@ -3745,10 +3775,8 @@ function parseGroup(
               || annotation.offset >= groupOffset + containerLimit - 1 / 384) continue;
             const voice = clamp(annotation.part, 0, options.voiceCount - 1);
             let memberIndex = memberIndexes.get(annotation) ?? 0;
-            let start = ordinaryByVoice.size > 0
-              ? annotation.offset - groupOffset + annotation.members!
-                .slice(0, memberIndex).reduce((sum, value) => sum + value * 2 / 3, 0)
-              : Math.max(voiceCursors[voice] ?? cursor, annotation.offset - groupOffset);
+            let start = annotation.offset - groupOffset + annotation.members!
+              .slice(0, memberIndex).reduce((sum, value) => sum + value * 2 / 3, 0);
             const annotationEnd = Math.min(containerLimit, annotation.end! - groupOffset);
             while (memberIndex < (annotation.members?.length ?? 0)
               && start < annotationEnd - 1e-9) {
@@ -4222,20 +4250,20 @@ export function slashScoreDiagnostics(
         NotationAnnotationData,
         { type: "triplet" }
       > => annotation.type === "triplet"
-        && !annotation.beatSlices
         && annotation.end !== undefined
         && annotation.measure === measureIndex
         && annotation.offset < groupOffset + targetForGroup - 1 / 192
         && annotation.end > groupOffset + 1 / 192)
         .sort((left, right) => left.offset - right.offset || right.end! - left.end!);
       if (metadataTuplets.length > 0) {
-        const clusters: Array<{ start: number; end: number }> = [];
+        const clusters: Array<{ start: number; end: number; sliced: boolean }> = [];
         for (const annotation of metadataTuplets) {
           const previous = clusters[clusters.length - 1];
           if (previous && annotation.offset < previous.end - 1e-8) {
             previous.end = Math.max(previous.end, annotation.end!);
+            previous.sliced ||= annotation.beatSlices === true;
           } else {
-            clusters.push({ start: annotation.offset, end: annotation.end! });
+            clusters.push({ start: annotation.offset, end: annotation.end!, sliced: annotation.beatSlices === true });
           }
         }
         const containers: string[] = [];
@@ -4250,7 +4278,7 @@ export function slashScoreDiagnostics(
           }
           cursor = container.end;
         }
-        const startingClusters = clusters.filter((cluster) => cluster.start >= groupOffset - 1 / 192);
+        const startingClusters = clusters.filter((cluster) => cluster.sliced || cluster.start >= groupOffset - 1 / 192);
         for (let index = 0; index < Math.min(startingClusters.length, containers.length); index++) {
           const naive = segmentMarkerDuration(
             containers[index]!,
@@ -4262,6 +4290,7 @@ export function slashScoreDiagnostics(
             undefined,
             false,
             options.voiceCount,
+            startingClusters[index]!.sliced,
           );
           // A metadata-backed bracket may cover several slash beat groups.
           // The later groups keep their ruler placeholders; only charge this
@@ -4269,7 +4298,7 @@ export function slashScoreDiagnostics(
           const cluster = startingClusters[index]!;
           const actual = cluster.end > measureLength + 1e-8
             ? cluster.end - cluster.start
-            : Math.min(cluster.end, groupOffset + targetForGroup) - cluster.start;
+            : Math.min(cluster.end, groupOffset + targetForGroup) - Math.max(cluster.start, groupOffset);
           duration += actual - naive;
         }
       }
@@ -6721,6 +6750,7 @@ function slashMordentToken(
   groups: SlashExportGroupModes,
   durationText?: (duration: number) => string,
   nominalUnit?: number,
+  embeddedInTuplet = false,
 ): string {
   // Wave ornaments use the canonical `[ABA]` spelling only when square
   // brackets are explicitly assigned to triplets.  Other triplet delimiters
@@ -6730,11 +6760,8 @@ function slashMordentToken(
     ? (["[", "]"] as const)
     : null;
   if (!tripletDelimiter) return token;
-  // An event already participating in an explicit tuplet is serialized by
-  // preserveScoreTuplets(). Re-expanding a semantic mordent from another
-  // simultaneous voice here would wrap that existing group a second time.
-  if (event.chords.some((chord) => chord.notes.some((note) =>
-    note.tupletBegin || note.tupletEnd || note.tuplet !== null))) return token;
+  // Membership belongs to the decorated chord's voice, not to every other
+  // chord sharing its printed column.
   for (let chordIndex = 0; chordIndex < event.chords.length; chordIndex++) {
     const chord = event.chords[chordIndex]!;
     const ornament = chord.ornaments.find((item) =>
@@ -6769,6 +6796,7 @@ function slashMordentToken(
     // value can disable general attached-note subdivision without exposing
     // S/A as three sounding notes.
     const triplet = `${tripletDelimiter[0]}${token}${value(neighbour)}${value(target.pitch)}${tripletDelimiter[1]}`;
+    if (embeddedInTuplet) return triplet;
     const writtenDuration = Math.min(sourceDuration, Math.max(1 / 192, nominalUnit ?? sourceDuration));
     const outerDuration = durationText?.(writtenDuration) ?? "";
     if (!outerDuration) return token;
@@ -6889,10 +6917,12 @@ function preserveScoreTuplets(
           if (source.chords.length === 0 && !(source.restVoiceIndexes?.length)) continue;
           const snapped = Math.max(start, Math.min(end - step,
             start + Math.round((source.start - start) / step) * step));
-          const key = Math.round(snapped * 192) / 192;
+          // A printed column may snap, but distinct real attacks are never
+          // merged into a chord, even when their printed positions coincide.
+          const key = Math.round(source.start * 192) / 192;
           let column = columns.get(key);
           if (!column) {
-            column = { start: key, end: key, chords: [], voiceIndexes: [], restVoiceIndexes: [] };
+            column = { start: snapped, end: snapped, chords: [], voiceIndexes: [], restVoiceIndexes: [] };
             columns.set(key, column);
           }
           column.chords.push(...source.chords);
@@ -6901,12 +6931,24 @@ function preserveScoreTuplets(
         }
         const ordered = [...columns.values()].sort((a, b) => a.start - b.start);
         let body = durationText(((ordered[0]?.start ?? end) - start) * 1.5);
+        let written = ((ordered[0]?.start ?? end) - start) * 1.5;
         ordered.forEach((column, index) => {
           let token = outputToken(column, kind, fifthsAt(column.start), voiceCount,
             ordering, groups, durationText, undefined, true) || "0";
+          token = slashMordentToken(column, token, kind, fifthsAt(column.start), voiceCount,
+            groups, undefined, undefined, true);
           token = explicitDefaultTimedToken(token, voiceCount);
           const next = ordered[index + 1]?.start ?? end;
-          body += token + durationText(Math.max(0, (next - column.start) * 1.5 - noteUnit));
+          // Distinct attacks can share a snapped position. Tight adjacency
+          // still consumes a half-cell, so debit it from the following cell
+          // instead of adding it on top of an already full beat's markers.
+          const remaining = (next - start) * 1.5 - written;
+          const nominal = noteUnit <= 1e-9 && remaining < baseUnit - 1e-8
+            ? baseUnit / 2
+            : Math.max(noteUnit, Math.floor((remaining + 1e-8) / baseUnit) * baseUnit);
+          body += token + (noteUnit <= 1e-9 && nominal < baseUnit - 1e-8
+            ? "" : durationText(Math.max(0, nominal - noteUnit)));
+          written += nominal;
         });
         events.push({ start, end, chords: [], voiceIndexes: [],
           specialToken: `${delimiter[0]}${body}${delimiter[1]}`,
@@ -7017,6 +7059,8 @@ function preserveScoreTuplets(
         undefined,
         true,
       ) || "0";
+      token = slashMordentToken(synthetic, token, kind, fifthsAt(start), voiceCount,
+        groups, undefined, undefined, true);
       if (tupleVoices.has(voiceCount)) {
         // In a mixed bracket the otherwise-unmarked default voice is
         // ambiguous with ordinary parallel material. Prefix only those
@@ -7285,6 +7329,13 @@ function preserveScoreTuplets(
           || entry.notes.some((note) => note.tuplet !== null)) continue;
         const start = entry.position.toFloat();
         const end = entry.position.plus(entry.duration ?? new Fraction(1, 192)).toFloat();
+        // Shared containers already carry every parallel attack/rest beginning
+        // inside their span. Re-inserting that rest after the bracket advances
+        // the shared cursor twice and can overfill an otherwise valid beat.
+        if (visible.some((event) => event.embeddedDuration !== undefined
+          && !event.parallelVoiceTuplet && event.specialToken !== undefined
+          && event.specialToken !== "0" && event.start <= start + 1e-8
+          && event.start + event.embeddedDuration > start + 1e-8)) continue;
         const followsSameVoiceTupletRest = measure.entries.some((candidate) =>
           candidate instanceof Chord
           && candidate.rest
@@ -7324,7 +7375,8 @@ function preserveScoreTuplets(
             continuation.restVoiceIndexes = (continuation.restVoiceIndexes ?? [])
               .filter((voice) => voice !== partIndex + 1);
             if (continuation.chords.length === 0
-              && continuation.restVoiceIndexes.length === 0) {
+              && continuation.restVoiceIndexes.length === 0
+              && (continuation.specialToken === undefined || continuation.specialToken === "0")) {
               continuation.specialToken = undefined;
             }
           }
@@ -7344,7 +7396,7 @@ function preserveScoreTuplets(
         event.end = Math.max(event.end, end);
         const voice = partIndex + 1;
         event.restVoiceIndexes = [...new Set([...(event.restVoiceIndexes ?? []), voice])];
-        if (event.chords.length === 0) event.specialToken = "0";
+        if (event.chords.length === 0 && event.specialToken === undefined) event.specialToken = "0";
       }
     });
     visible.sort((left, right) => left.start - right.start);
@@ -7982,13 +8034,18 @@ function delimiterFor(
   mode: SlashGroupMode,
   options: SlashExportGroupModes,
 ): readonly [string, string] | null {
-  const spec = slashDelimiterSpecs({
+  const specs = slashDelimiterSpecs({
     braceMode: options.braceMode,
     bracketMode: options.bracketMode,
     barMode: options.barMode,
     angleMode: options.angleMode,
     parenMode: options.parenMode,
-  }).find((candidate) => candidate.mode === mode);
+  });
+  const preferred: Partial<Record<SlashGroupMode, SlashDelimiterId>> = {
+    chord: "paren", triplet: "bracket", arpeggio: "brace", grace: "angle",
+  };
+  const spec = specs.find((candidate) => candidate.mode === mode && candidate.id === preferred[mode])
+    ?? specs.find((candidate) => candidate.mode === mode);
   return spec ? [spec.open, spec.close] : null;
 }
 
@@ -8822,6 +8879,24 @@ export function embedSlashScoreOptionsFromScore(
     if (groups.slice(first, last + 1).length === last - first + 1
       && groups.slice(first, last + 1).every((group) => delimiters.some((spec) =>
         group.includes(spec.open) && group.includes(spec.close)))) annotation.beatSlices = true;
+  }
+  // A shorter voice-owned group inside a sliced long group uses those same
+  // printed beat slices even if it never crosses a slash itself.
+  const tuplets = annotations.filter((annotation): annotation is Extract<NotationAnnotationData, { type: "triplet" }> =>
+    annotation.type === "triplet" && annotation.end !== undefined)
+    .sort((a, b) => a.measure - b.measure || a.offset - b.offset);
+  for (let first = 0; first < tuplets.length;) {
+    let end = tuplets[first]!.end!;
+    let sliced = tuplets[first]!.beatSlices === true;
+    let next = first + 1;
+    while (next < tuplets.length && tuplets[next]!.measure === tuplets[first]!.measure
+      && tuplets[next]!.offset < end - 1e-8) {
+      end = Math.max(end, tuplets[next]!.end!);
+      sliced ||= tuplets[next]!.beatSlices === true;
+      next++;
+    }
+    if (sliced) for (let member = first; member < next; member++) tuplets[member]!.beatSlices = true;
+    first = next;
   }
   const embedded = embedSlashScoreOptions(text, {
     ...options,

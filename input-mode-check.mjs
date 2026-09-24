@@ -2951,9 +2951,8 @@ KeyAndMeters = {1=C,2/4}
     throw new Error(`JPW fermata Delete did not remove the notation: ${JSON.stringify(fermataDeleted)}`);
   }
 
-  // Two voice-owned tuplets may overlap with different inner grids. Keep
-  // their independent timing objects, but engrave one longest shared bracket
-  // instead of stacking two `3` marks over the same columns.
+  // Two voice-owned tuplets may overlap with different real ranges. Keep
+  // their independent timing objects and show each range's own `3` mark.
   const overlapTupletVisual = await page.evaluate((text) => {
     const app = window.__app;
     app.setInputMode(false);
@@ -2991,8 +2990,8 @@ KeyAndMeters = {1=C,2/4}
       })),
     };
   }, `键盘谱\n4/4拍：\n点=16分音符\n[(V\u2063G).\u2063W.\u20630]N.(G\u2063W)./..../..../..../\n\n// @jpeditor {"v":2,"vc":2,"k":"k","s":{".":16},"q":"t","an":[{"type":"triplet","part":0,"voice":1,"measure":0,"offset":0.25,"scope":"voice","end":0.5,"members":[0.25,0.125],"restoreUnit":0.25},{"type":"triplet","part":1,"voice":2,"measure":0,"offset":0,"scope":"voice","end":0.5,"members":[0.25,0.25,0.25],"restoreUnit":0.5}]}\n`);
-  if (overlapTupletVisual.tuplets < 2 || overlapTupletVisual.marks !== 1) {
-    throw new Error(`overlapping voice tuplets did not share one longest bracket: ${JSON.stringify(overlapTupletVisual)}`);
+  if (overlapTupletVisual.tuplets < 2 || overlapTupletVisual.marks !== 2) {
+    throw new Error(`overlapping voice tuplets did not show both distinct brackets: ${JSON.stringify(overlapTupletVisual)}`);
   }
 
   // A tuplet with only its middle member sounding must reserve a clear

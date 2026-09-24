@@ -71,6 +71,7 @@ import {
   slashKindHint,
 } from "./file-format";
 import { parseEditableDocument } from "./document-parser";
+import { preserveUnchangedSlashGroups } from "./preserve-slash-delimiters";
 import { documentContextHistory } from "./document-history";
 import { MixedPainter } from "../mixed/painter";
 import { ScorePlayer, type InputAuditionNote, type PlayState, type Sf2PlaybackOptions } from "./player";
@@ -1774,6 +1775,19 @@ export class App {
     return created;
   }
 
+  /** Keep the click tolerance constant on screen at every score zoom. */
+  private pickScoreAtPointer(
+    pageIndex: number,
+    ctm: DOMMatrix,
+    ev: MouseEvent,
+    tolerancePixels = 3,
+  ): PageItem | null {
+    const point = new DOMPoint(ev.clientX, ev.clientY).matrixTransform(ctm.inverse());
+    const scale = Math.max(0.01, Math.min(Math.hypot(ctm.a, ctm.b), Math.hypot(ctm.c, ctm.d)));
+    return this.painter.pickPageAtPointer(pageIndex, new Point(point.x, point.y),
+      ev.target, tolerancePixels / scale);
+  }
+
   private inputHitFromPage(
     pageIndex: number,
     svg: SVGSVGElement,
@@ -1788,12 +1802,11 @@ export class App {
     const screenY = (y: number): number => ctm
       ? new DOMPoint(0, y).matrixTransform(ctm).y
       : y;
+    const exactPicked = ctm ? this.pickScoreAtPointer(pageIndex, ctm, ev, 0) : null;
     // An annotation/ornament click in input mode is an object selection, not
     // an attempt to move the rhythmic cursor to the nearest grid slot.
     if (ctm) {
-      const point = new DOMPoint(ev.clientX, ev.clientY).matrixTransform(ctm.inverse());
-      const picked = this.painter.pageItemForTarget(ev.target)
-        ?? this.painter.pickPage(pageIndex, new Point(point.x, point.y));
+      const picked = exactPicked ?? this.pickScoreAtPointer(pageIndex, ctm, ev);
       const object = picked ? this.scoreObjectHit(picked) : null;
       // A grace beam should select its source pitch just like the grace
       // number. The number itself remains a semantic grace-edit target in
@@ -1801,17 +1814,9 @@ export class App {
       if (object?.kind === "grace"
         && ev.target instanceof Element
         && ev.target.closest(".jianpu-grace-beam")) return false;
-      // The tuplet group's enclosing hit box can cover the member cells,
-      // especially when the first/last members are rests. Only select the
-      // semantic Tuplet when its bracket/number was actually clicked; let a
-      // member click continue to the exact rhythm-anchor hit testing below.
-      const clickedTupletMark = object?.kind === "tuplet"
-        && ev.target instanceof Element
-        && ev.target.closest(".tuplet-mark") !== null;
-      if (object
-        && (object.kind !== "tuplet" || clickedTupletMark)
-        && ev.target instanceof Node
-        && object.element.contains(ev.target)) {
+      // Picking verifies painted geometry, including the separate numeral
+      // and bracket strokes, so their enclosing blank rectangle cannot win.
+      if (object) {
         this.selectScoreObject(object, ev.ctrlKey || ev.metaKey || ev.shiftKey);
         ev.preventDefault();
         this.scorePane.focus({ preventScroll: true });
@@ -1876,12 +1881,9 @@ export class App {
       : noteTimingStep(division);
     const anchors = span.anchors ?? [];
     const gridAnchors = span.gridAnchors ?? [];
-    // Tuplet anchors are measured in page coordinates while the inverse SVG
-    // point can be line-local when a page has a translated root.  Do not make
-    // the member hit depend on an exact range comparison across those two
-    // spaces: choose the nearest voice-local tuplet span, then snap to its
-    // actual member anchor below.  This also keeps empty first/last members
-    // clickable when only the middle member has a painted glyph.
+    // Empty cells use the voice-local tuplet ruler only inside that group's
+    // visible range. An unrelated ordinary note later in the measure must
+    // never snap backwards into the nearest triplet.
     const tupletsForPart = (span.tupletGroups ?? [])
       .filter((group) => group.partIndex === partIndex && group.anchors.length > 0);
     const screenX = (x: number): number => ctm
@@ -1895,6 +1897,7 @@ export class App {
       return 0;
     };
     const tupletGroup = tupletsForPart
+      .filter((group) => distanceToTuplet(group) <= 3)
       .sort((left, right) => distanceToTuplet(left) - distanceToTuplet(right)
         || Math.abs(left.endX - left.startX) - Math.abs(right.endX - right.startX))[0];
     let rawOffset = Math.max(0, Math.min(length.toFloat(), scorePoint.x - span.svgRect.left));
@@ -1939,19 +1942,9 @@ export class App {
 
     let targetMeasureIndex = span.measureIndex;
     let focusPitch: number | null = null;
-    if (ctm) {
-      const point = new DOMPoint(ev.clientX, ev.clientY).matrixTransform(ctm.inverse());
-      const picked = this.painter.pickPage(pageIndex, new Point(point.x, point.y));
-      const hit = picked ? this.scoreNoteHit(picked) : null;
-      // `pickPage` intentionally has a small hit slop for ordinary score
-      // selection.  In input mode that must not turn a click on genuinely
-      // empty measure space into a nearby-note click: only let a glyph win
-      // over the ruler grid when the browser event really landed inside that
-      // rendered note group (or one of its painted descendants).
-      const directlyHitGlyph = hit !== null
-        && ev.target instanceof Node
-        && hit.element.contains(ev.target);
-      if (hit && directlyHitGlyph && span.partIndexes.includes(hit.source.partIndex)
+    if (exactPicked) {
+      const hit = this.scoreNoteHit(exactPicked);
+      if (hit && span.partIndexes.includes(hit.source.partIndex)
         && hit.visualNote.chord.measure.index === span.measureIndex) {
         // A directly clicked glyph wins over grid snapping. This preserves
         // exact tuplets and other non-grid attacks while empty space still
@@ -1964,24 +1957,10 @@ export class App {
         const hitChord = this.isInputContinuationChord(visualChord)
           ? visualChord
           : hit.source.note.chord;
-        // For a Tuplet, the painted glyph can belong to the neighbouring
-        // binary slot because empty members have no independent hit shape.
-        // Keep the exact member offset selected from its tuplet anchor; the
-        // direct glyph is still useful for the pitch lane only.
-        if (!tupletGroup) offset = hitChord.position;
+        offset = hitChord.position;
         targetMeasureIndex = hitChord.measure.index;
         focusPitch = hit.visualNote.pitch;
       }
-    }
-    // Re-assert the tuplet anchor after painted-glyph picking. A member's SVG
-    // text can be returned as the neighbouring chord by the picker's hit slop;
-    // the rhythm anchor remains the authoritative timing coordinate.
-    if (tupletGroup) {
-      const nearest = tupletGroup.anchors.reduce((best, anchor) =>
-        Math.abs(screenX(anchor.x) - ev.clientX) < Math.abs(screenX(best.x) - ev.clientX)
-          ? anchor
-          : best, tupletGroup.anchors[0]);
-      offset = new Fraction(Math.round(nearest.tick * 192), 192);
     }
     const chord = this.painter.score.parts[partIndex]?.measures[targetMeasureIndex]
       ?.entries.find((entry): entry is Chord => entry instanceof Chord
@@ -3394,12 +3373,11 @@ export class App {
     if (this.inputHitFromPage(pageIndex, svg, ev)) return;
     const ctm = svg.getScreenCTM();
     if (!ctm) return;
-    const pt = new DOMPoint(ev.clientX, ev.clientY).matrixTransform(ctm.inverse());
-    const directItem = this.painter.pageItemForTarget(ev.target);
-    const directObject = directItem ? this.scoreObjectHit(directItem) : null;
+    const picked = this.pickScoreAtPointer(pageIndex, ctm, ev);
+    const directObject = picked ? this.scoreObjectHit(picked) : null;
     const additive = ev.ctrlKey || ev.metaKey;
     // Grace-note glyphs remain pitch selections (including clicks on their
-    // tiny beams); only standalone semantic marks bypass geometric picking.
+    // tiny beams); standalone semantic marks use the same precise picker.
     if (directObject && directObject.kind !== "grace") {
       const existing = this._selectedObjects.findIndex((selection) =>
         selection.mark === directObject.mark);
@@ -3416,7 +3394,6 @@ export class App {
       this.scorePane.focus({ preventScroll: true });
       return;
     }
-    const picked = this.painter.pickPage(pageIndex, new Point(pt.x, pt.y));
     if (!picked) {
       if (additive) {
         this.scorePane.focus({ preventScroll: true });
@@ -4125,8 +4102,7 @@ export class App {
   private onPageDoubleClick(pageIndex: number, svg: SVGSVGElement, ev: MouseEvent): void {
     const ctm = svg.getScreenCTM();
     if (!ctm) return;
-    const point = new DOMPoint(ev.clientX, ev.clientY).matrixTransform(ctm.inverse());
-    const picked = this.painter.pickPage(pageIndex, new Point(point.x, point.y));
+    const picked = this.pickScoreAtPointer(pageIndex, ctm, ev);
     if (!picked) return;
     const hit = this.scoreNoteHit(picked);
     if (hit && hit.source.note.softDeleted) {
@@ -5135,7 +5111,9 @@ export class App {
         fifths: mark.fifths,
       }));
       return embedSlashScoreOptionsFromScore(
-        rewritten,
+        preserveUnchangedSlashGroups(
+          this.getText(), rewritten, this.documentFormat, serialization.options,
+        ),
         this.painter.score,
         serialization.options,
       );
