@@ -177,6 +177,13 @@ function notationXml(
     chord.arpeggioPitches === null || chord.arpeggioPitches.includes(note.pitch)
   );
   if (inArpeggio) values.push("<arpeggiate/>");
+  if (noteIndex === 0 && chord.ornaments.length > 0) {
+    const ornaments = chord.ornaments.map((ornament) =>
+      ornament.kind === "upper-mordent" ? "<inverted-mordent/>"
+        : ornament.kind === "lower-mordent" ? "<mordent/>" : "<trill-mark/>",
+    ).join("");
+    if (ornaments) values.push(`<ornaments>${ornaments}</ornaments>`);
+  }
   if (rhythm.triplet && values.length === 0 && (note.tupletBegin || note.tupletEnd)) {
     values.push(note.tupletBegin
       ? '<tuplet type="start" number="1"/>'
@@ -316,6 +323,20 @@ function tempoDirections(score: Score, measureIndex: number): string {
   return result;
 }
 
+function textDirections(score: Score, partIndex: number, measureIndex: number): string {
+  return score.textMarks
+    .filter((mark) => mark.partIndex === partIndex && mark.measure === measureIndex && mark.text.trim().length > 0)
+    .sort((left, right) => left.offset.compareTo(right.offset))
+    .map((mark) => `<direction placement="${mark.placement === "below" ? "below" : "above"}`
+      + "><direction-type><words>" + xml(mark.text) + "</words></direction-type>"
+      + `${ticks(mark.offset) > 0 ? `<offset>${ticks(mark.offset)}</offset>` : ""}</direction>`)
+    .join("");
+}
+
+function keyAttributes(fifths: number): string {
+  return `<attributes><key><fifths>${Math.max(-7, Math.min(7, Math.round(fifths)))}</fifths></key></attributes>`;
+}
+
 function barlineXml(measure: Measure, location: "left" | "right"): string {
   const style = location === "left" ? measure.leftBarline : measure.barline;
   const repeat = location === "left" ? measure.repeatForward : measure.repeatBackward;
@@ -347,6 +368,13 @@ function measureContents(score: Score, part: Part, measure: Measure, partIndex: 
   result += attributesXml(measure, measure.index === 0, clef);
   result += barlineXml(measure, "left");
   if (partIndex === 0) result += tempoDirections(score, measure.index);
+  result += textDirections(score, partIndex, measure.index);
+  const keyMarks = score.keyMarks
+    .filter((mark) => mark.measure === measure.index)
+    .sort((left, right) => left.offset.compareTo(right.offset));
+  const zeroKey = keyMarks.find((mark) => mark.offset.equals(new Fraction(0)));
+  if (zeroKey) result += keyAttributes(zeroKey.fifths);
+  let keyMarkIndex = zeroKey ? keyMarks.indexOf(zeroKey) + 1 : 0;
 
   const chords = measure.entries
     .filter((entry): entry is Chord => entry instanceof Chord && entry.duration !== undefined);
@@ -371,6 +399,10 @@ function measureContents(score: Score, part: Part, measure: Measure, partIndex: 
         result += `<forward><duration>${position - cursor}</duration></forward>`;
       } else if (position < cursor) {
         result += `<backup><duration>${cursor - position}</duration></backup>`;
+      }
+      while (keyMarkIndex < keyMarks.length && ticks(keyMarks[keyMarkIndex].offset) <= position) {
+        const keyMark = keyMarks[keyMarkIndex++];
+        if (keyMark.offset.compareTo(new Fraction(0)) > 0) result += keyAttributes(keyMark.fifths);
       }
       result += chordXml(chord, voice, measure.key.fifths);
       cursor = position + ticks(chord.duration ?? new Fraction(0));

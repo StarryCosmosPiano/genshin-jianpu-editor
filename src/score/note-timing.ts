@@ -437,10 +437,12 @@ export interface NoteTimelineMoveOptions {
   /**
    * JPW editing keeps silence explicit: moving right leaves a rest at the
    * vacated onset. Moving left may compress the preceding sound and merge at
-   * the target grid point, provided the moved tone keeps its complete written
-   * duration without overlapping the next retained attack.
+   * the target grid point. When that grid point already contains an attack,
+   * the moved tone adopts the target attack's duration.
    */
   preserveRests?: boolean;
+  /** Move the complete sounding tie chain as one logical attack. */
+  moveWholeTieChain?: boolean;
 }
 
 export interface NoteDurationExtendResult {
@@ -504,6 +506,27 @@ function makeTimelineRest(measure: Measure): Chord {
   return chord;
 }
 
+/** A rest is one rhythmic event, never a vertical chord. Older move paths
+ * could merge two rests with the same onset by appending both zero Notes;
+ * JPW then serialized that as `[00]`. Keep exactly one canonical zero while
+ * retaining the Chord's rhythmic and layout properties. */
+function collapseRestNotes(chord: Chord): void {
+  if (!chord.rest && chord.notes.some((note) => !note.rest)) return;
+  let note = chord.notes.find((candidate) => candidate.rest);
+  if (!note) {
+    note = new Note(chord);
+    note.rest = true;
+    note.number = "0";
+    note.pitch = 0;
+    note.jpAlter = " ";
+  }
+  note.chord = chord;
+  note.rest = true;
+  note.number = "0";
+  chord.notes = [note];
+  chord.rest = true;
+}
+
 function resetAttackNotation(chord: Chord): void {
   chord.generatedTimingContinuation = false;
   chord.transparentContinuation = false;
@@ -531,12 +554,21 @@ function mergeTimelineAttacks(left: Chord, right: Chord): Chord {
   const rightSounding = right.notes.some((note) => !note.rest);
   const target = leftSounding || !rightSounding ? left : right;
   const source = target === left ? right : left;
+  const mergeOrdinaryRestOnset = !leftSounding && !rightSounding
+    && [...left.notes, ...right.notes].every((note) =>
+      note.tuplet === null && !note.tupletBegin && !note.tupletEnd);
+  if (mergeOrdinaryRestOnset) {
+    // Two silence boundaries may legitimately meet after a fine-grid Alt
+    // move (the relocated note's trailing rest reaches the next beat rest).
+    // They describe one rest onset, not a two-note zero chord.
+    collapseRestNotes(target);
+  }
   if (source.notes.some((note) => !note.rest)) {
     target.notes = target.notes.filter((note) => !note.rest);
     target.rest = false;
   }
   const pitches = new Set(target.notes.filter((note) => !note.rest).map((note) => note.pitch));
-  for (const note of source.notes) {
+  for (const note of mergeOrdinaryRestOnset ? [] : source.notes) {
     if (note.rest && target.notes.some((candidate) => !candidate.rest)) continue;
     if (!note.rest && pitches.has(note.pitch)) continue;
     target.add(note);
@@ -559,6 +591,69 @@ function mergeTimelineAttacks(left: Chord, right: Chord): Chord {
   target.slurStart = target.slurStart || source.slurStart;
   target.slurEnd = target.slurEnd || source.slurEnd;
   return target;
+}
+
+/** Return the first attack and the written duration of its complete tie chain. */
+function tieChainRootAndDuration(note: Note): { root: Note; duration: Fraction } {
+  let root = note;
+  const visited = new Set<Note>();
+  while (root.tiePrev && !visited.has(root)) {
+    visited.add(root);
+    root = root.tiePrev;
+  }
+  let duration = ZERO;
+  let cursor: Note | null = root;
+  visited.clear();
+  while (cursor && !visited.has(cursor)) {
+    visited.add(cursor);
+    duration = duration.plus(cursor.chord.duration ?? MIN_DURATION);
+    cursor = cursor.tieNext;
+  }
+  return { root, duration };
+}
+
+/**
+ * Collapse equal pitches inside one vertical chord after an interactive move
+ * has been committed. During selection we deliberately keep duplicates (for
+ * example moving 3 onto [35] temporarily produces [335]); deselection calls
+ * this helper to return the score to its canonical [35] spelling.
+ */
+export function mergeDuplicateChordPitches(score: Score): number {
+  let removed = 0;
+  for (const part of score.parts) {
+    for (const measure of part.measures) {
+      for (const entry of [...measure.entries]) {
+        if (!(entry instanceof Chord) || entry.rest || isPureTieContinuation(entry)) continue;
+        const firstByPitch = new Map<number, Note>();
+        for (const note of [...entry.notes]) {
+          if (note.rest) continue;
+          const first = firstByPitch.get(note.pitch);
+          if (!first) {
+            firstByPitch.set(note.pitch, note);
+            continue;
+          }
+          for (const lyric of note.lyrics) {
+            if (!first.lyrics.some((candidate) =>
+              candidate.number === lyric.number && candidate.text === lyric.text)) {
+              first.lyrics.push(lyric);
+            }
+          }
+          detachMovedTieChain(note);
+          entry.notes = entry.notes.filter((candidate) => candidate !== note);
+          removed++;
+        }
+        if (entry.arpeggioPitches) {
+          entry.arpeggioPitches = [...new Set(entry.arpeggioPitches)].sort((a, b) => a - b);
+          if (entry.arpeggioPitches.length < 2) {
+            entry.arpeggio = false;
+            entry.arpeggioPitches = null;
+          }
+        }
+        removeChordIfEmpty(entry);
+      }
+    }
+  }
+  return removed;
 }
 
 function existingTieSegmentDurations(chord: Chord): Fraction[] {
@@ -793,6 +888,21 @@ function rebuildPartTimeline(part: Part, boundaries: readonly MeasureBoundary[])
   }
 }
 
+/** Structural arrow-key edits bake the live timeline. Once the JSON timing
+ * overlay is cleared, no Chord may keep its pre-overlay serialization
+ * snapshot or JPW output can silently restore the old duration. */
+function clearStructuralTimingSnapshots(score: Score): void {
+  for (const part of score.parts) {
+    for (const measure of part.measures) {
+      for (const entry of measure.entries) {
+        if (!(entry instanceof Chord)) continue;
+        entry.timingOriginal = null;
+        entry.timingSourceIndex = null;
+      }
+    }
+  }
+}
+
 function isPlainMergeableRest(chord: Chord): boolean {
   return isRestChord(chord)
     && chord.graceNotes.length === 0
@@ -801,7 +911,8 @@ function isPlainMergeableRest(chord: Chord): boolean {
     && !chord.slurStart
     && !chord.slurEnd
     && chord.notes.every((note) =>
-      !note.tupletBegin
+      note.tuplet === null
+      && !note.tupletBegin
       && !note.tupletEnd
       && !note.tieStart
       && !note.tieEnd);
@@ -815,6 +926,9 @@ function isPlainMergeableRest(chord: Chord): boolean {
  */
 function normalizePartRestSpelling(part: Part): void {
   for (const measure of part.measures) {
+    for (const entry of measure.entries) {
+      if (entry instanceof Chord && isPlainMergeableRest(entry)) collapseRestNotes(entry);
+    }
     const beatDuration = measureBeatDuration(measure);
     const chords = measure.entries
       .filter((entry): entry is Chord => entry instanceof Chord)
@@ -884,6 +998,13 @@ function normalizePartRestSpelling(part: Part): void {
   }
 }
 
+/** Canonicalize only ordinary rests, without rebuilding sounding tie chains.
+ * This is safe for compact TXT scores whose independent voices and tuplets
+ * have already been reconstructed by the slash-score parser. */
+export function normalizeScoreRestSpelling(score: Score): void {
+  for (const part of score.parts) normalizePartRestSpelling(part);
+}
+
 /**
  * Canonicalize JPW rhythmic spelling after import. Parenthesized repeated
  * pitches may have been serialized as one tiny segment per grid cell; keep
@@ -897,7 +1018,21 @@ export function normalizeScoreRhythmicSpelling(score: Score): void {
       measure.entries.some((entry) =>
         entry instanceof Chord
         && entry.notes.some((note) => note.tieStart || note.tieEnd)));
-    if (hasSemanticTie) {
+    // Tuplet members live on a compressed real timeline. `rebuildPartTimeline`
+    // rewrites the *whole part*, not only the semantic tie that triggered it;
+    // allowing it to run when any Tuplet is present therefore feeds an actual
+    // value such as 1/6 into the ordinary binary speller. It is then drawn as
+    // a 32nd and compressed by 3:2 again on the next JPW parse, so every input
+    // appears to halve the group and shorten the bar. Keep the complete part
+    // verbatim whenever it contains a Tuplet. The interactive Tuplet editor
+    // and JPW parser already provide canonical member/tie spelling.
+    const hasTuplet = part.measures.some((measure) =>
+      measure.entries.some((entry) =>
+        entry instanceof Chord
+        && entry.notes.some((note) => note.tuplet !== null
+          || note.tupletBegin
+          || note.tupletEnd)));
+    if (hasSemanticTie && !hasTuplet) {
       const originalNoteOrder = new Map<Chord, Note[]>();
       for (const measure of part.measures) {
         for (const entry of measure.entries) {
@@ -917,8 +1052,8 @@ export function normalizeScoreRhythmicSpelling(score: Score): void {
         }
       }
     }
-    normalizePartRestSpelling(part);
   }
+  normalizeScoreRestSpelling(score);
 }
 
 /**
@@ -934,10 +1069,13 @@ export function moveScoreNotesOnTimeline(
   options: NoteTimelineMoveOptions = {},
 ): NoteTimelineMoveResult {
   if (delta.equals(0)) return { changed: 0, blocked: 0 };
-  const selections = [...new Map(rawSelections.map((selection) => [
-    selection.note,
-    selection,
-  ])).values()];
+  const selections = [...new Map(rawSelections.map((selection) => {
+    if (!options.moveWholeTieChain || selection.grace || selection.note.rest) {
+      return [selection.note, selection] as const;
+    }
+    const chain = tieChainRootAndDuration(selection.note);
+    return [chain.root, { ...selection, note: chain.root } as NoteTimelineSelection] as const;
+  })).values()];
   const selectedNotes = new Set(selections.map((selection) => selection.note));
   const boundariesByPart = score.parts.map(boundariesOf);
   const moves: Array<{
@@ -948,6 +1086,7 @@ export function moveScoreNotesOnTimeline(
     sourceDuration: Fraction;
     duration: Fraction;
     target: Fraction;
+    wholeTieChain: boolean;
   }> = [];
   let blocked = 0;
 
@@ -970,17 +1109,30 @@ export function moveScoreNotesOnTimeline(
       blocked++;
       continue;
     }
-    const sourceDuration = selection.note.chord.duration ?? MIN_DURATION;
+    const sourceDuration = options.moveWholeTieChain
+      ? tieChainRootAndDuration(selection.note).duration
+      : selection.note.chord.duration ?? MIN_DURATION;
     let duration = sourceDuration;
-    if (options.preserveRests && delta.compareTo(ZERO) < 0) {
+    if (options.moveWholeTieChain) {
+      // A whole tie chain keeps its total sounding span. Do not shorten it to
+      // the destination attack or to the one-step gap used by single-tone
+      // chord moves.
+      const nextAttack = part.measures.flatMap((measure) => measure.entries)
+        .filter((entry): entry is Chord => entry instanceof Chord
+          && entry.notes.some((note) => !note.rest)
+          && !isPureTieContinuation(entry)
+          && entry !== selection.note.chord
+          && entry.measure.position.plus(entry.position).compareTo(target) > 0)
+        .map((entry) => entry.measure.position.plus(entry.position))
+        .sort((left, right) => left.compareTo(right))[0];
+      if (nextAttack && target.plus(duration).compareTo(nextAttack) > 0) {
+        blocked++;
+        continue;
+      }
+    } else if (options.preserveRests && delta.compareTo(ZERO) < 0) {
       const source = selection.note.chord;
       const sourceWillRemain = source.notes.some((note) =>
         !note.rest && !selectedNotes.has(note));
-      // A tone that previously moved into a longer vertical chord must be
-      // able to move back out at the currently selected grid value. Keep the
-      // unselected chord at its existing duration, but give the detached tone
-      // exactly one left-move step instead of inheriting the whole chord.
-      if (sourceWillRemain) duration = delta.timesInt(-1);
       const attacks = part.measures.flatMap((measure) =>
         measure.entries
           .filter((entry): entry is Chord =>
@@ -992,15 +1144,28 @@ export function moveScoreNotesOnTimeline(
             start: measure.position.plus(chord.position),
           })))
         .sort((left, right) => left.start.compareTo(right.start));
-      const nextBoundary = attacks.find(({ chord, start: attackStart }) =>
-        attackStart.compareTo(target) > 0
-        && (chord !== source || sourceWillRemain));
-      // The moved tone keeps its written duration. It may compress the
-      // preceding sound and merge at `target`, but it must not overlap the
-      // next attack that remains in this monophonic row.
-      if (nextBoundary && target.plus(duration).compareTo(nextBoundary.start) > 0) {
-        blocked++;
-        continue;
+      const targetIndex = attacks.findIndex(({ start: attackStart }) =>
+        attackStart.equals(target));
+      if (targetIndex >= 0) {
+        // Joining an occupied rhythmic column adopts that column's existing
+        // span. Its next attack can be the source chord that is about to be
+        // vacated; the explicit boundary inserted below preserves the value.
+        const targetEnd = attacks.slice(targetIndex + 1).find(({ start: attackStart }) =>
+          attackStart.compareTo(target) > 0)?.start ?? end;
+        duration = targetEnd.minus(target);
+      } else if (sourceWillRemain) {
+        // Detaching one tone from a chord into an empty grid column uses the
+        // active movement step and leaves the other chord tones unchanged.
+        duration = delta.timesInt(-1);
+      } else {
+        // An empty target may sit closer to a retained attack than the old
+        // written value. Compress to the available span instead of blocking.
+        const nextBoundary = attacks.find(({ chord, start: attackStart }) =>
+          attackStart.compareTo(target) > 0 && chord !== source);
+        if (nextBoundary) {
+          const available = nextBoundary.start.minus(target);
+          if (available.compareTo(duration) < 0) duration = available;
+        }
       }
     }
     moves.push({
@@ -1011,6 +1176,7 @@ export function moveScoreNotesOnTimeline(
       sourceDuration,
       duration,
       target,
+      wholeTieChain: Boolean(options.moveWholeTieChain),
     });
   }
 
@@ -1050,12 +1216,64 @@ export function moveScoreNotesOnTimeline(
       target.notes = target.notes.filter((note) => !note.rest);
       target.rest = false;
     }
-    const existing = target.notes.find((note) => !note.rest && note.pitch === move.note.pitch);
-    if (!existing) {
-      move.note.chord = target;
-      target.add(move.note);
-    }
-    if (options.preserveRests && delta.compareTo(ZERO) < 0) {
+    // Keep equal pitches as distinct selected tones until the selection is
+    // released. This makes 3 moved onto [35] visibly become [335] and lets a
+    // following arrow key move that selected tone back out again.
+    move.note.chord = target;
+    target.add(move.note);
+    if (move.wholeTieChain) {
+      // The old continuation chords were removed by detachMovedTieChain().
+      // Re-split the captured total duration at the destination so barline
+      // crossings recreate transparent segments and a continuous tie chain.
+      rewriteOneChordDuration(target, move.duration, boundaries);
+      // Explicit rests that overlap the relocated logical attack would make
+      // rebuildPartTimeline truncate the newly rebuilt continuation chain.
+      // Consume only the intersecting span: a left move can land in the
+      // second half of a voice-owned rest, and deleting that whole rest loses
+      // the untouched first half (TXT then has to invent an unvoiced `0`).
+      const chainStart = move.target;
+      const chainEnd = move.target.plus(move.duration);
+      const overlappingRests = part.measures.flatMap((measure) =>
+        measure.entries.filter((entry): entry is Chord => {
+          if (!(entry instanceof Chord) || !isRestChord(entry)) return false;
+          const start = measure.position.plus(entry.position);
+          const end = start.plus(entry.duration ?? ZERO);
+          return end.compareTo(chainStart) > 0 && start.compareTo(chainEnd) < 0;
+        }));
+      for (const rest of overlappingRests) {
+        const restStart = rest.measure.position.plus(rest.position);
+        const restEnd = restStart.plus(rest.duration ?? ZERO);
+        rest.measure.entries = rest.measure.entries.filter((entry) => entry !== rest);
+        const fragments: Array<{ start: Fraction; duration: Fraction }> = [];
+        if (restStart.compareTo(chainStart) < 0) {
+          fragments.push({ start: restStart, duration: chainStart.minus(restStart) });
+        }
+        if (restEnd.compareTo(chainEnd) > 0) {
+          fragments.push({ start: chainEnd, duration: restEnd.minus(chainEnd) });
+        }
+        fragments.forEach((fragment, index) => {
+          const boundary = boundaryAt(boundaries, fragment.start);
+          if (!boundary || fragment.duration.compareTo(ZERO) <= 0) return;
+          const targetRest = index === 0 ? rest : makeTimelineRest(boundary.measure);
+          targetRest.measure = boundary.measure;
+          targetRest.position = fragment.start.minus(boundary.start);
+          targetRest.generatedTimingContinuation = false;
+          targetRest.transparentContinuation = false;
+          collapseRestNotes(targetRest);
+          rewriteOneChordDuration(targetRest, fragment.duration, boundaries);
+        });
+      }
+      const scoreEnd = boundaries[boundaries.length - 1]?.end;
+      if (scoreEnd && chainEnd.compareTo(scoreEnd) < 0) {
+        const restBoundary = boundaryAt(boundaries, chainEnd);
+        if (restBoundary) {
+          const rest = makeTimelineRest(restBoundary.measure);
+          rest.position = chainEnd.minus(restBoundary.start);
+          rest.duration = scoreEnd.minus(chainEnd);
+          restBoundary.measure.entries.push(rest);
+        }
+      }
+    } else if (options.preserveRests && delta.compareTo(ZERO) < 0) {
       // A left-moved tone defines the duration of the chord it joins.
       setWrittenDuration(target, move.duration);
     }
@@ -1140,9 +1358,19 @@ export function moveScoreNotesOnTimeline(
   }
 
   for (const partIndex of affected) {
-    rebuildPartTimeline(score.parts[partIndex], boundariesByPart[partIndex]);
+    const part = score.parts[partIndex];
+    rebuildPartTimeline(part, boundariesByPart[partIndex]);
+    // A fine right move can release one 32nd rest immediately after an
+    // existing 32nd rest.  The rebuilt timeline is rhythmically correct but
+    // still contains two adjacent rest attacks, so compact TXT writes `00`
+    // instead of the canonical one-cell `0.` spelling.  Fuse only within the
+    // current notated beat, using the same rule as duration edits/deletion.
+    normalizePartRestSpelling(part);
   }
-  if (moves.length > 0) score.noteTimingEdits = [];
+  if (moves.length > 0) {
+    score.noteTimingEdits = [];
+    clearStructuralTimingSnapshots(score);
+  }
   return { changed: moves.length, blocked };
 }
 
@@ -1467,44 +1695,69 @@ export function resizeScoreNoteSegmentsWithRests(
     const end = start.plus(duration);
 
     if (delta.compareTo(ZERO) > 0) {
-      const following = part.measures
-        .flatMap((measure) => measure.entries)
-        .find((entry): entry is Chord =>
+      const allEntries = part.measures.flatMap((measure) => measure.entries);
+      const consumed: Array<{
+        rest: Chord;
+        start: Fraction;
+        duration: Fraction;
+        amount: Fraction;
+      }> = [];
+      let restCursor = end;
+      let amountRemaining = amount;
+      while (amountRemaining.compareTo(ZERO) > 0) {
+        const following = allEntries.find((entry): entry is Chord =>
           entry instanceof Chord
-          && isRestChord(entry)
-          && entry.measure.position.plus(entry.position).equals(end));
-      const restDuration = following?.duration;
-      if (!following || !restDuration || restDuration.compareTo(amount) < 0
+          && isPlainMergeableRest(entry)
+          && entry.measure.position.plus(entry.position).equals(restCursor));
+        const restDuration = following?.duration;
+        if (!following || !restDuration || restDuration.compareTo(ZERO) <= 0) break;
+        const used = restDuration.compareTo(amountRemaining) < 0
+          ? restDuration
+          : amountRemaining;
+        consumed.push({ rest: following, start: restCursor, duration: restDuration, amount: used });
+        restCursor = restCursor.plus(used);
+        amountRemaining = amountRemaining.minus(used);
+        if (used.compareTo(restDuration) < 0) break;
+      }
+      if (amountRemaining.compareTo(ZERO) > 0
         || chord.notes.some((note) => note.tieNext !== null)) {
         blocked++;
         continue;
       }
 
-      const restRemaining = restDuration.minus(amount);
-      const restStart = end.plus(amount);
-      if (restRemaining.compareTo(ZERO) <= 0) {
-        following.measure.entries = following.measure.entries
-          .filter((entry) => entry !== following);
-      } else {
-        const restBoundary = boundaryAt(boundaries, restStart);
-        if (!restBoundary) {
-          blocked++;
-          continue;
-        }
-        if (following.measure !== restBoundary.measure) {
-          following.measure.entries = following.measure.entries
-            .filter((entry) => entry !== following);
-          restBoundary.measure.entries.push(following);
-          following.measure = restBoundary.measure;
-        }
-        following.position = restStart.minus(restBoundary.start);
-        setWrittenDuration(following, restRemaining);
-        following.generatedTimingContinuation = false;
-      }
       if (!rewriteOneChordDuration(chord, duration.plus(amount), boundaries)) {
         blocked++;
         continue;
       }
+      for (const item of consumed) {
+        const restRemaining = item.duration.minus(item.amount);
+        if (restRemaining.compareTo(ZERO) <= 0) {
+          item.rest.measure.entries = item.rest.measure.entries
+            .filter((entry) => entry !== item.rest);
+          continue;
+        }
+        const restStart = item.start.plus(item.amount);
+        const restBoundary = boundaryAt(boundaries, restStart);
+        if (!restBoundary) continue;
+        if (item.rest.measure !== restBoundary.measure) {
+          item.rest.measure.entries = item.rest.measure.entries
+            .filter((entry) => entry !== item.rest);
+          restBoundary.measure.entries.push(item.rest);
+          item.rest.measure = restBoundary.measure;
+        }
+        item.rest.position = restStart.minus(restBoundary.start);
+        collapseRestNotes(item.rest);
+        // Fine extensions commonly leave 7/8 or 15/16 of a quarter beat.
+        // Neither is one JPW duration token.  Reuse the metrical rewriter so
+        // the remainder becomes exact binary/dotted rest pieces instead of a
+        // guessed quarter rest that changes the bar on save/reparse.
+        if (!rewriteOneChordDuration(item.rest, restRemaining, boundaries)) {
+          blocked++;
+          continue;
+        }
+        item.rest.generatedTimingContinuation = false;
+      }
+      normalizePartRestSpelling(part);
       changed++;
       continue;
     }
@@ -1542,11 +1795,18 @@ export function resizeScoreNoteSegmentsWithRests(
     rest.generatedTimingContinuation = false;
     setWrittenDuration(rest, amount);
     restBoundary.measure.entries.push(rest);
+    // Repeated fine-grid shrinking releases one short rest at a time. Merge
+    // those adjacent pieces immediately inside the beat, just as the extend
+    // path normalizes the remainder it leaves behind. Without this step a
+    // 32nd + dotted-32nd tail reached TXT as several overlapping zero atoms,
+    // eventually changing the bar length and preventing the inverse extend.
+    normalizePartRestSpelling(part);
     changed++;
   }
 
   if (changed > 0) {
     score.noteTimingEdits = [];
+    clearStructuralTimingSnapshots(score);
     for (const part of score.parts) {
       for (const measure of part.measures) sortMeasureEntries(measure);
     }

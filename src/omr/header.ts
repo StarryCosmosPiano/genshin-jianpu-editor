@@ -14,7 +14,7 @@ export interface HeaderInfo {
   credits: string[];
   /** 调号五度圈数（识别到 "1=♭B" 等时给出，否则 undefined→上游用默认 0）。 */
   fifths?: number;
-  /** 速度（♩=NN），仅进 MusicXML（当前下游导入器不读 tempo，故不进 .jpwabc）。 */
+  /** 速度（♩=NN），写入中间 MusicXML 后由 Score 导入器保留。 */
   tempo?: number;
   /** 拍号分子/分母（识别到 "4/4" 等时给出，否则 undefined→上游用默认 4/4）。 */
   beats?: number;

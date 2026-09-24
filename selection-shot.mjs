@@ -1,9 +1,9 @@
 // Browser interaction regression for score picking -> CodeMirror selections ->
-// keyboard pitch editing -> playback start anchor.
+// input-mode shortcut isolation -> playback start anchor.
 // Usage: npm run build && node selection-shot.mjs [out.png]
 import { createServer } from "node:http";
-import { readFile } from "node:fs/promises";
-import { extname, join, normalize } from "node:path";
+import { mkdir, readFile } from "node:fs/promises";
+import { dirname, extname, join, normalize } from "node:path";
 import { chromium } from "playwright";
 
 const root = join(process.cwd(), "dist");
@@ -43,6 +43,24 @@ TempoMarks = {1@1=tempo:108}
 
 try {
   await page.goto(`http://127.0.0.1:${port}/`, { waitUntil: "networkidle" });
+  const builtInMetadata = await page.evaluate(() => window.__app.getText());
+  for (const expected of [
+    "标题 = Avid - 86—不存在的战区—",
+    "副标题 = 86—Eighty Six— ED",
+    "作曲 = 泽野弘之(Hiroyuki Sawano)",
+    "编曲 = 星宇StarryCosmos",
+    "作词 = cAnON.",
+  ]) {
+    if (!builtInMetadata.includes(expected)) {
+      throw new Error(`built-in Avid metadata is missing: ${expected}\n${builtInMetadata.slice(0, 500)}`);
+    }
+  }
+  await page.evaluate((text) => {
+    const app = window.__app;
+    app.documentFormat = "jpw";
+    app.slashOptions = null;
+    app.setText(text);
+  }, fixture);
   const scoreSettingsButton = page.locator("#btn-score-settings");
   const unavailableScoreSettings = await scoreSettingsButton.evaluate((button) => ({
     unavailable: button.classList.contains("format-unavailable"),
@@ -87,20 +105,87 @@ try {
   await page.waitForFunction((text) => window.__app.getText() === text, fixture);
   await page.waitForFunction(() => document.querySelectorAll("#score-pane g.entry").length >= 8);
 
+  const paneLayout = await page.evaluate(() => {
+    const app = window.__app;
+    const code = document.querySelector("#code-workspace");
+    const score = document.querySelector("#score-pane");
+    app.setCodePaneCollapsed(false);
+    app.setCodePaneSide("right");
+    const movedRight = code.getBoundingClientRect().left >= score.getBoundingClientRect().right;
+    app.toggleCodePane();
+    const collapsed = getComputedStyle(code).display === "none"
+      && document.querySelector("#code-pane-toggle")?.getAttribute("aria-expanded") === "false";
+    app.toggleCodePane();
+    app.setCodePaneSide("left");
+    return {
+      movedRight,
+      collapsed,
+      restoredLeft: code.getBoundingClientRect().right <= score.getBoundingClientRect().left,
+    };
+  });
+  if (!paneLayout.movedRight || !paneLayout.collapsed || !paneLayout.restoredLeft) {
+    throw new Error(`collapsible/reversible editor pane layout failed: ${JSON.stringify(paneLayout)}`);
+  }
+
+  const previewLockBefore = await page.evaluate(() => {
+    const app = window.__app;
+    const before = document.querySelector("#score-pane")?.innerHTML ?? "";
+    const title = app.getText().indexOf("点选改音测试");
+    app.togglePreviewLock();
+    app.view.dispatch({ changes: { from: title, to: title + 6, insert: "锁定预览测试" } });
+    return before;
+  });
+  await page.waitForTimeout(350);
+  const previewStayedLocked = await page.evaluate((before) => ({
+    unchanged: (document.querySelector("#score-pane")?.innerHTML ?? "") === before,
+    active: document.querySelector("#btn-preview-lock")?.classList.contains("active"),
+  }), previewLockBefore);
+  if (!previewStayedLocked.unchanged || !previewStayedLocked.active) {
+    throw new Error(`preview lock did not suspend live relayout: ${JSON.stringify(previewStayedLocked)}`);
+  }
+  await page.locator("#btn-preview-lock").click();
+  await page.waitForFunction((before) =>
+    (document.querySelector("#score-pane")?.innerHTML ?? "") !== before
+    && !document.querySelector("#btn-preview-lock")?.classList.contains("active"), previewLockBefore);
+
   const liveStyleBefore = await page.evaluate(() => ({
     metaX: window.__app.engravingStyle.publicationMetaX,
     scoreHtml: document.querySelector("#score-pane")?.innerHTML ?? "",
+    source: window.__app.getText(),
   }));
   await page.locator("#btn-layout-style").click();
-  const previewBefore = await page.locator(".engraving-preview svg").evaluate((svg) => svg.innerHTML);
+  const engravingUi = await page.evaluate(() => {
+    const controls = document.querySelector(".engraving-controls");
+    const pane = document.querySelector("#inspector-pane");
+    if (!(controls instanceof HTMLElement) || !(pane instanceof HTMLElement)) return null;
+    return {
+      sectionCount: controls.querySelectorAll(":scope > details.engraving-section").length,
+      openCount: controls.querySelectorAll(":scope > details.engraving-section[open]").length,
+      floating: pane.classList.contains("inspector-floating")
+        && getComputedStyle(pane).position === "fixed"
+        && pane.getBoundingClientRect().width >= 540,
+      scoreWidth: document.querySelector("#score-pane").getBoundingClientRect().width,
+      panelId: pane.dataset.inspectorId,
+    };
+  });
+  if (!engravingUi
+    || engravingUi.sectionCount !== 7
+    || engravingUi.openCount < 1
+    || !engravingUi.floating
+    || engravingUi.scoreWidth < 500
+    || engravingUi.panelId !== "layout") {
+    throw new Error(`engraving inspector accordion is incorrect: ${JSON.stringify(engravingUi)}`);
+  }
   await page.locator('input[name="publicationMetaX"]').evaluate((input) => {
     input.value = "0.25";
     input.dispatchEvent(new Event("input", { bubbles: true }));
   });
+  await page.waitForFunction(() =>
+    Math.abs(window.__app.painter.layout.options.engravingStyle.publicationMetaX - 0.25) < 1e-8);
   const draftState = await page.evaluate((expectedMetaX) => ({
     metaX: window.__app.engravingStyle.publicationMetaX,
     scoreHtml: document.querySelector("#score-pane")?.innerHTML ?? "",
-    previewHtml: document.querySelector(".engraving-preview svg")?.innerHTML ?? "",
+    source: window.__app.getText(),
     hasNewControls: [
       "publicationTitleX",
       "publicationTitleYOffset",
@@ -112,18 +197,18 @@ try {
     expectedMetaX,
   }), liveStyleBefore.metaX);
   if (draftState.metaX !== liveStyleBefore.metaX
-    || draftState.scoreHtml !== liveStyleBefore.scoreHtml
-    || draftState.previewHtml === previewBefore
+    || draftState.scoreHtml === liveStyleBefore.scoreHtml
+    || draftState.source !== liveStyleBefore.source
     || !draftState.hasNewControls) {
-    throw new Error(`engraving draft leaked into the live score: ${JSON.stringify({
+    throw new Error(`engraving draft did not preview on the live score: ${JSON.stringify({
       liveMetaBefore: liveStyleBefore.metaX,
       draftMeta: draftState.metaX,
       scoreChanged: draftState.scoreHtml !== liveStyleBefore.scoreHtml,
-      previewChanged: draftState.previewHtml !== previewBefore,
+      sourceChanged: draftState.source !== liveStyleBefore.source,
       hasNewControls: draftState.hasNewControls,
     })}`);
   }
-  await page.getByRole("button", { name: "应用到整个软件" }).click();
+  await page.getByRole("button", { name: "应用到全部简谱" }).click();
   await page.waitForFunction(() =>
     Math.abs(window.__app.engravingStyle.publicationMetaX - 0.25) < 1e-8);
   const appliedStyle = await page.evaluate((beforeHtml) => ({
@@ -149,10 +234,16 @@ try {
     throw new Error(`single score selection did not sync to the editor: ${JSON.stringify(state)}`);
   }
 
+  const ordinarySelectionText = await page.evaluate(() => window.__app.getText());
   await page.keyboard.press("5");
-  await page.waitForFunction(() => /\.Voice\s+5 2/.test(window.__app.getText()));
+  await page.keyboard.press("ArrowRight");
+  await page.keyboard.press("Control+ArrowRight");
+  await page.waitForTimeout(100);
+  if (await page.evaluate(() => window.__app.getText()) !== ordinarySelectionText) {
+    throw new Error("ordinary score selection accepted input-only digit/timing shortcuts");
+  }
   await page.keyboard.press("ArrowUp");
-  await page.waitForFunction(() => /\.Voice\s+5' 2/.test(window.__app.getText()));
+  await page.waitForFunction(() => /\.Voice\s+1' 2/.test(window.__app.getText()));
 
   await noteText("2").click({ modifiers: ["Control"] });
   state = await page.evaluate(() => ({
@@ -161,7 +252,7 @@ try {
       window.__app.view.state.doc.sliceString(range.from, range.to)).sort(),
     sourceHighlights: document.querySelectorAll(".cm-score-source-selection").length,
   }));
-  if (state.selectedSvg !== 2 || state.source.join("|") !== "2|5'" || state.sourceHighlights < 2) {
+  if (state.selectedSvg !== 2 || state.source.join("|") !== "1'|2" || state.sourceHighlights < 2) {
     throw new Error(`multi-selection did not preserve both source ranges: ${JSON.stringify(state)}`);
   }
 
@@ -178,11 +269,16 @@ try {
   }
 
   await page.keyboard.press("7");
-  await page.waitForFunction(() => /\.Voice\s+7' 7/.test(window.__app.getText()));
+  await page.waitForTimeout(80);
+  if (!/\.Voice\s+1' 2/.test(await page.evaluate(() => window.__app.getText()))) {
+    throw new Error("ordinary multi-selection accepted a direct 1–7 pitch shortcut");
+  }
+  await page.keyboard.press("ArrowUp");
+  await page.waitForFunction(() => /\.Voice\s+1'' 2'/.test(window.__app.getText()));
   await page.keyboard.press("Control+Z");
-  await page.waitForFunction(() => /\.Voice\s+5' 2/.test(window.__app.getText()));
-  await page.keyboard.press("7");
-  await page.waitForFunction(() => /\.Voice\s+7' 7/.test(window.__app.getText()));
+  await page.waitForFunction(() => /\.Voice\s+1' 2/.test(window.__app.getText()));
+  await noteText("1").first().click();
+  await noteText("2").first().click({ modifiers: ["Control"] });
 
   await page.keyboard.press("Delete");
   state = await page.evaluate(() => ({
@@ -197,8 +293,11 @@ try {
   await page.waitForFunction(() =>
     document.querySelectorAll("#score-pane g.soft-deleted").length === 0
     && window.__app._sourceNotes.every((source) => !source.note.softDeleted));
+  // Undo also queues the editor's 200 ms parse. Let it finish before the
+  // next deletion so the pending undo render cannot replace its hit target.
+  await page.waitForTimeout(300);
 
-  await noteText("7").first().click();
+  await noteText("1").first().click();
   await page.keyboard.press("Backspace");
   const deletedNote = page.locator("#score-pane g.soft-deleted").first();
   await deletedNote.dblclick();
@@ -217,7 +316,8 @@ try {
 
   const sourceToScore = await page.evaluate(() => {
     const app = window.__app;
-    const source = app._sourceNotes[2];
+    const source = app._sourceNotes.find((item) => !item.grace && item.note.number === "3");
+    if (!source) return null;
     app.view.focus();
     app.view.dispatch({ selection: { anchor: source.from, head: source.to } });
     return {
@@ -228,7 +328,7 @@ try {
       ),
     };
   });
-  if (sourceToScore.selectedNotes !== 1 || sourceToScore.selectedText !== "3'") {
+  if (!sourceToScore || sourceToScore.selectedNotes !== 1 || !sourceToScore.selectedText) {
     throw new Error(`source selection did not highlight its rendered note: ${JSON.stringify(sourceToScore)}`);
   }
 
@@ -263,7 +363,10 @@ try {
   const selectedPlayback = await page.evaluate(async () => {
     let start;
     const app = window.__app;
-    app._player = { stop() {}, async play(_score, _options, value) { start = value; } };
+    app._player = {
+      stop() {}, stopAudition() {}, async audition() {},
+      async play(_score, _options, value) { start = value; },
+    };
     await app.playScore();
     const primary = app._selectedNotes.at(-1);
     return Boolean(start && primary && start.chord === primary.source.chord && start.pass === primary.verse);
@@ -274,7 +377,10 @@ try {
   const clearedPlayback = await page.evaluate(async () => {
     let start = "not-called";
     const app = window.__app;
-    app._player = { stop() {}, async play(_score, _options, value) { start = value; } };
+    app._player = {
+      stop() {}, stopAudition() {}, async audition() {},
+      async play(_score, _options, value) { start = value; },
+    };
     await app.playScore();
     return {
       selected: app._selectedNotes.length,
@@ -286,6 +392,91 @@ try {
     throw new Error(`clearing the selection did not restore opening playback: ${JSON.stringify(clearedPlayback)}`);
   }
 
+  const duplicateSelectionFixture = `.Title
+KeyAndMeters = {1=C,4/4}
+.Voice
+3__ [35]_ 6- 7- |]
+`;
+  await page.evaluate((text) => {
+    const app = window.__app;
+    app.documentFormat = "jpw";
+    app.slashOptions = null;
+    app.setText(text);
+    app.setRhythmEditDivision(16);
+    app.setInputDurationDivision(16);
+    app.setInputMode(true);
+  }, duplicateSelectionFixture);
+  await noteText("3").first().click();
+  await page.keyboard.press("Alt+ArrowRight");
+  await page.waitForTimeout(180);
+  const transientDuplicateSelection = await page.evaluate(() => ({
+    text: window.__app.getText(),
+    selected: window.__app._selectedNotes.length,
+    duplicateChord: window.__app.painter.score.parts[0].measures[0].entries
+      .some((entry) => entry.notes?.filter((note) => note.number === "3").length === 2),
+  }));
+  if (transientDuplicateSelection.selected !== 1
+    || !transientDuplicateSelection.duplicateChord) {
+    throw new Error(
+      `same-pitch move was not kept while selected: ${JSON.stringify(transientDuplicateSelection)}`,
+    );
+  }
+  await page.locator("#score-pane svg").first().click({ position: { x: 4, y: 4 } });
+  await page.waitForFunction(() =>
+    window.__app.getText().includes("[35]")
+    && !window.__app.getText().includes("[335]"));
+  const committedDuplicateSelection = await page.evaluate(() => ({
+    selected: window.__app._selectedNotes.length,
+    duplicateChord: window.__app.painter.score.parts[0].measures[0].entries
+      .some((entry) => entry.notes?.filter((note) => note.number === "3").length > 1),
+  }));
+  if (committedDuplicateSelection.selected !== 0
+    || committedDuplicateSelection.duplicateChord) {
+    throw new Error(
+      `same-pitch move was not merged after deselection: ${JSON.stringify(committedDuplicateSelection)}`,
+    );
+  }
+
+  const duplicateNumberFixture = `数字谱
+4/4拍：
+点=16分音符
+3.(35).../1..../2..../3..../
+`;
+  await page.evaluate((text) => {
+    const app = window.__app;
+    app.setInputMode(false);
+    app.documentFormat = "number";
+    app.slashOptions = {
+      kind: "number", voiceCount: 1,
+      title: "", subtitle: "", composer: "", arranger: "", lyricist: "",
+      tempoBpm: 90, fifths: 0, beats: 4, beatType: 4,
+      symbolDurations: { ".": 16 }, spaceDivision: null, noteDivision: null,
+      braceMode: "grace", bracketMode: "triplet",
+    };
+    app.setText(text);
+    app.setRhythmEditDivision(16);
+    app.setInputDurationDivision(16);
+    app.setInputMode(true);
+  }, duplicateNumberFixture);
+  await noteText("3").first().click();
+  await page.keyboard.press("Alt+ArrowRight");
+  await page.waitForFunction(() => window.__app.getText().includes("(335)"));
+  const transientNumberDuplicate = await page.evaluate(() => ({
+    selected: window.__app._selectedNotes.length,
+    sources: window.__app._sourceNotes.filter((source) =>
+      source.note.absoluteTick.toString() === "1/4"
+      && source.note.number === "3").length,
+  }));
+  if (transientNumberDuplicate.selected !== 1 || transientNumberDuplicate.sources !== 2) {
+    throw new Error(
+      `TXT same-pitch move was not kept while selected: ${JSON.stringify(transientNumberDuplicate)}`,
+    );
+  }
+  await page.locator("#score-pane svg").first().click({ position: { x: 4, y: 4 } });
+  await page.waitForFunction(() =>
+    window.__app.getText().includes("(35)")
+    && !window.__app.getText().includes("(335)"));
+
   const jpwGrace = `.Title
 KeyAndMeters = {1=C,4/4}
 .Voice
@@ -296,6 +487,7 @@ KeyAndMeters = {1=C,4/4}
     app.documentFormat = "jpw";
     app.slashOptions = null;
     app.setText(text);
+    app.setInputMode(false);
   }, jpwGrace);
   await page.waitForFunction(() =>
     document.querySelectorAll("#score-pane .jianpu-grace-note").length === 1
@@ -309,9 +501,12 @@ KeyAndMeters = {1=C,4/4}
   if (state.source.join("|") !== "2'" || state.selectedGrace !== 1) {
     throw new Error(`clicking a JPW grace note did not select its exact source: ${JSON.stringify(state)}`);
   }
+  await page.evaluate(() => window.__app.setInputMode(true));
+  await page.locator("#score-pane .jianpu-grace-number").click();
   await page.keyboard.press("6");
   await page.waitForFunction(() => /\{6'\}3/.test(window.__app.getText()));
-  await page.keyboard.press("ArrowDown");
+  await page.locator("#score-pane .jianpu-grace-number").click();
+  await page.keyboard.press("Control+ArrowDown");
   await page.waitForFunction(() => /\{6\}3/.test(window.__app.getText()));
   const jpwGraceSourceSelection = await page.evaluate(() => {
     const app = window.__app;
@@ -369,6 +564,7 @@ KeyAndMeters = {1=C,4/4}
       symbolDurations: { ".": 8 }, spaceDivision: null, noteDivision: null, braceMode: "grace",
     };
     app.setText(text);
+    app.setInputMode(false);
   }, numberSlash);
   await page.waitForFunction(() => window.__app.documentFormat === "number" &&
     document.querySelectorAll("#score-pane g.entry").length >= 4);
@@ -381,10 +577,7 @@ KeyAndMeters = {1=C,4/4}
   if (state.source.join("|") !== "2" || state.mapped !== 5) {
     throw new Error(`number slash grace selection did not map to its TXT pitch: ${JSON.stringify(state)}`);
   }
-  await page.keyboard.press("7");
-  await page.waitForFunction(() => /\{7\}1\./.test(window.__app.getText()));
-  await page.keyboard.press("ArrowUp");
-  await page.waitForFunction(() => /\{\+7\}1\./.test(window.__app.getText()));
+  await page.evaluate(() => window.__app.setInputMode(true));
   await noteText("1").click();
   state = await page.evaluate(() => ({
     source: window.__app.view.state.selection.ranges.map((range) =>
@@ -394,14 +587,35 @@ KeyAndMeters = {1=C,4/4}
   if (state.source.join("|") !== "1" || state.mapped !== 5) {
     throw new Error(`number slash-score selection did not map to its TXT pitch: ${JSON.stringify(state)}`);
   }
+  const numberRhythmBeforePitch = await page.evaluate(() => window.__app.painter.score.parts[0].measures[0].entries
+    .filter((entry) => entry.notes?.length)
+    .map((entry) => [entry.position.toFloat(), entry.duration.toFloat(), entry.rest]));
   await page.keyboard.press("5");
-  await page.waitForFunction(() => /\{\+7\}5\.\/2\./.test(window.__app.getText()));
-  await page.keyboard.press("ArrowUp");
-  await page.waitForFunction(() => /\{\+7\}\+5\.\/2\./.test(window.__app.getText()));
+  await page.waitForTimeout(160);
+  const numberPitchEdit = await page.evaluate(() => {
+    const entries = window.__app.painter.score.parts[0].measures[0].entries.filter((entry) => entry.notes?.length);
+    return { number: entries[0].notes[0].number, grace: entries[0].graceNotes.map((note) => note.number),
+      rhythm: entries.map((entry) => [entry.position.toFloat(), entry.duration.toFloat(), entry.rest]) };
+  });
+  // One dot is an eighth followed by an eighth rest in this fixture. A
+  // pitch-only edit must preserve that rhythm rather than require `5..`,
+  // which would lengthen the attack to a quarter and erase its silence.
+  if (numberPitchEdit.number !== "5" || numberPitchEdit.grace.join("") !== "2"
+    || JSON.stringify(numberPitchEdit.rhythm) !== JSON.stringify(numberRhythmBeforePitch)) {
+    throw new Error(`number TXT input-mode digit changed pitch/rhythm incorrectly: ${JSON.stringify(numberPitchEdit)}`);
+  }
+  await page.keyboard.press("Control+ArrowUp");
+  await page.waitForFunction(() => window.__app.painter.score.parts[0].measures[0].entries
+    .find((entry) => entry.notes?.length)?.notes[0].jpOctave === 1);
+  await page.evaluate(() => window.__app.setInputMode(false));
+  await noteText("5").click();
   const slashPlayback = await page.evaluate(async () => {
     let start;
     const app = window.__app;
-    app._player = { stop() {}, async play(_score, _options, value) { start = value; } };
+    app._player = {
+      stop() {}, stopAudition() {}, async audition() {},
+      async play(_score, _options, value) { start = value; },
+    };
     await app.playScore();
     const primary = app._selectedNotes.at(-1);
     return Boolean(start && primary && start.chord === primary.source.chord && start.pass === primary.verse);
@@ -422,6 +636,7 @@ KeyAndMeters = {1=C,4/4}
       symbolDurations: { ".": 8 }, spaceDivision: null, noteDivision: null, braceMode: "grace",
     };
     app.setText(text);
+    app.setInputMode(false);
   }, keyboardSlash);
   await page.waitForFunction(() => window.__app.documentFormat === "keyboard" &&
     document.querySelectorAll("#score-pane g.entry").length >= 4);
@@ -433,10 +648,7 @@ KeyAndMeters = {1=C,4/4}
   if (state.source.join("|") !== "Q") {
     throw new Error(`keyboard slash grace selection did not map to its TXT key: ${JSON.stringify(state)}`);
   }
-  await page.keyboard.press("3");
-  await page.waitForFunction(() => /\{E\}A\./.test(window.__app.getText()));
-  await page.keyboard.press("ArrowDown");
-  await page.waitForFunction(() => /\{D\}A\./.test(window.__app.getText()));
+  await page.evaluate(() => window.__app.setInputMode(true));
   await noteText("1").click();
   state = await page.evaluate(() => ({
     source: window.__app.view.state.selection.ranges.map((range) =>
@@ -445,10 +657,306 @@ KeyAndMeters = {1=C,4/4}
   if (state.source.join("|") !== "A") {
     throw new Error(`keyboard slash-score selection did not map to its TXT key: ${JSON.stringify(state)}`);
   }
+  const keyboardRhythmBeforePitch = await page.evaluate(() => window.__app.painter.score.parts[0].measures[0].entries
+    .filter((entry) => entry.notes?.length)
+    .map((entry) => [entry.position.toFloat(), entry.duration.toFloat(), entry.rest]));
   await page.keyboard.press("3");
-  await page.waitForFunction(() => /\{D\}D\.\/S\./.test(window.__app.getText()));
-  await page.keyboard.press("ArrowUp");
-  await page.waitForFunction(() => /\{D\}E\.\/S\./.test(window.__app.getText()));
+  await page.waitForFunction(() => window.__app.painter.score.parts[0].measures[0].entries
+    .find((entry) => entry.notes?.length)?.notes[0].number === "3");
+  const keyboardRhythmAfterPitch = await page.evaluate(() => window.__app.painter.score.parts[0].measures[0].entries
+    .filter((entry) => entry.notes?.length)
+    .map((entry) => [entry.position.toFloat(), entry.duration.toFloat(), entry.rest]));
+  if (JSON.stringify(keyboardRhythmAfterPitch) !== JSON.stringify(keyboardRhythmBeforePitch)) {
+    throw new Error("keyboard TXT pitch entry changed the attack/rest durations");
+  }
+  await page.keyboard.press("Control+ArrowUp");
+  await page.waitForFunction(() => window.__app.painter.score.parts[0].measures[0].entries
+    .find((entry) => entry.notes?.length)?.notes[0].jpOctave === 1);
+
+  const keyboardKeyLabelState = await page.evaluate(() => {
+    const app = window.__app;
+    const text = "键盘谱\n4/4拍：\nQ../'Q../A../,V../\n";
+    app.documentFormat = "keyboard";
+    app.slashOptions = {
+      kind: "keyboard", keyboardKeyLabels: true, voiceCount: 1,
+      title: "", subtitle: "", composer: "", arranger: "", lyricist: "",
+      tempoBpm: 90, fifths: 0, beats: 4, beatType: 4,
+      symbolDurations: { ".": 8 }, spaceDivision: null, noteDivision: null,
+      braceMode: "grace", bracketMode: "triplet",
+    };
+    app.setText(text);
+    const notes = app.painter.score.parts[0].measures[0].entries
+      .filter((entry) => !entry.rest)
+      .map((entry) => entry.notes.find((note) => !note.rest));
+    return {
+      labels: notes.map((note) => note?.displayText ?? "").join(""),
+      octaves: notes.map((note) => note?.displayOctave ?? null),
+      underlying: notes.map((note) => note?.number ?? "").join(""),
+      visible: [...document.querySelectorAll("#score-pane g.entry text")]
+        .map((item) => item.textContent ?? ""),
+    };
+  });
+  if (keyboardKeyLabelState.labels !== "QQAV"
+    || keyboardKeyLabelState.octaves.join(",") !== "0,1,0,-1"
+    || !/^[1-7]+$/.test(keyboardKeyLabelState.underlying)
+    || !keyboardKeyLabelState.visible.includes("Q")
+    || !keyboardKeyLabelState.visible.includes("A")
+    || !keyboardKeyLabelState.visible.includes("V")) {
+    throw new Error(`keyboard-key staff display failed: ${JSON.stringify(keyboardKeyLabelState)}`);
+  }
+
+  const keyboardChordCenters = await page.evaluate(() => {
+    const app = window.__app;
+    const text = "\u952e\u76d8\u8c31\n4/4\u62cd\uff1a\n(WJ)../A../S../D../\n";
+    app.documentFormat = "keyboard";
+    app.slashOptions = {
+      kind: "keyboard", keyboardKeyLabels: true, voiceCount: 1,
+      title: "", subtitle: "", composer: "", arranger: "", lyricist: "",
+      tempoBpm: 90, fifths: 0, beats: 4, beatType: 4,
+      symbolDurations: { ".": 8 }, spaceDivision: null, noteDivision: null,
+      braceMode: "grace", bracketMode: "triplet",
+    };
+    app.setText(text);
+    const glyphs = [...document.querySelectorAll("#score-pane g.entry text")];
+    const centerOf = (label) => {
+      const glyph = glyphs.find((item) => item.textContent === label);
+      if (!glyph) return null;
+      const rect = glyph.getBoundingClientRect();
+      return rect.left + rect.width / 2;
+    };
+    return { w: centerOf("W"), j: centerOf("J") };
+  });
+  if (keyboardChordCenters.w === null
+    || keyboardChordCenters.j === null
+    || Math.abs(keyboardChordCenters.w - keyboardChordCenters.j) > 0.75) {
+    throw new Error(`keyboard chord rows are not centered: ${JSON.stringify(keyboardChordCenters)}`);
+  }
+
+  const keyboardQBaseline = await page.evaluate(() => {
+    const app = window.__app;
+    app.documentFormat = "keyboard";
+    app.slashOptions = {
+      kind: "keyboard", keyboardKeyLabels: true, voiceCount: 1,
+      title: "", subtitle: "", composer: "", arranger: "", lyricist: "",
+      tempoBpm: 90, fifths: 0, beats: 4, beatType: 4,
+      symbolDurations: { ".": 8 }, spaceDivision: null, noteDivision: null,
+      braceMode: "grace", bracketMode: "triplet",
+    };
+    app.setText("\u952e\u76d8\u8c31\n4/4\u62cd\uff1a\nH../Q../W../T../\n");
+    const glyphs = [...document.querySelectorAll("#score-pane g.entry text")];
+    const baselineOf = (label) =>
+      glyphs.find((item) => item.textContent === label)?.getCTM()?.f ?? null;
+    return { h: baselineOf("H"), q: baselineOf("Q"), w: baselineOf("W") };
+  });
+  if (keyboardQBaseline.h === null
+    || keyboardQBaseline.q === null
+    || keyboardQBaseline.w === null
+    || Math.abs(keyboardQBaseline.h - keyboardQBaseline.w) > 0.5
+    || keyboardQBaseline.q <= (keyboardQBaseline.h + keyboardQBaseline.w) / 2 + 0.35) {
+    throw new Error(`keyboard Q baseline was not lowered visually: ${JSON.stringify(keyboardQBaseline)}`);
+  }
+
+  const hiddenTieLayout = await page.evaluate(() => {
+    const app = window.__app;
+    const text = "\u952e\u76d8\u8c31\n4/4\u62cd\uff1a\n\u70b9=\u516b\u5206\u97f3\u7b26\n"
+      + "-/-/-/(\u2063Q Z)../\n../../\u2063W../X../\n";
+    const render = (hideTieLabels) => {
+      app.documentFormat = "keyboard";
+      app.slashOptions = {
+        kind: "keyboard", keyboardKeyLabels: true, keyboardHideTieLabels: hideTieLabels,
+        keyboardTieAsZero: false, voiceCount: 2, instrumentName: "\u94a2\u7434",
+        title: "", subtitle: "", composer: "", arranger: "", lyricist: "",
+        tempoBpm: 90, fifths: 0, beats: 4, beatType: 4,
+        symbolDurations: { ".": 8 }, spaceDivision: null, noteDivision: null,
+        braceMode: "none", bracketMode: "none",
+      };
+      app.setText(text);
+      const part = app.painter.score.parts[0];
+      const continuation = part?.measures[1]?.entries.find((entry) =>
+        entry.transparentContinuation && Math.abs(entry.position.toFloat()) < 1e-8);
+      const following = part?.measures[1]?.entries.find((entry) =>
+        Array.isArray(entry.notes)
+        && !entry.transparentContinuation
+        && entry.position.toFloat() > 1e-8);
+      const note = continuation?.notes.find((item) => !item.rest);
+      const textNode = continuation && note
+        ? app.painter.noteGroupEl(continuation, note)?.querySelector("text")
+        : null;
+      const followingNode = following
+        ? app.painter.chordGroupEl(following)?.querySelector("text")
+        : null;
+      const box = textNode?.getBoundingClientRect();
+      const followingBox = followingNode?.getBoundingClientRect();
+      return {
+        label: textNode?.textContent ?? "",
+        visibility: textNode?.getAttribute("visibility") ?? "",
+        width: box?.width ?? 0,
+        followingX: followingBox?.left ?? null,
+      };
+    };
+    return { shown: render(false), hidden: render(true) };
+  });
+  if (!hiddenTieLayout.shown.label
+    || hiddenTieLayout.hidden.label !== hiddenTieLayout.shown.label
+    || hiddenTieLayout.shown.visibility === "hidden"
+    || hiddenTieLayout.hidden.visibility !== "hidden"
+    || hiddenTieLayout.shown.width <= 0
+    || Math.abs(hiddenTieLayout.hidden.width - hiddenTieLayout.shown.width) > 0.5
+    || hiddenTieLayout.shown.followingX === null
+    || hiddenTieLayout.hidden.followingX === null
+    || Math.abs(hiddenTieLayout.hidden.followingX - hiddenTieLayout.shown.followingX) > 0.75) {
+    throw new Error(`hidden tied keyboard label changed layout: ${JSON.stringify(hiddenTieLayout)}`);
+  }
+
+  const markerText = `键盘谱
+4/4拍：
+\u2063Q../A../S../D../
+`;
+  const markerPositions = await page.evaluate((text) => {
+    const app = window.__app;
+    app.documentFormat = "keyboard";
+    app.slashOptions = {
+      kind: "keyboard", voiceCount: 2,
+      title: "", subtitle: "", composer: "", arranger: "", lyricist: "",
+      tempoBpm: 90, fifths: 0, beats: 4, beatType: 4,
+      symbolDurations: { ".": 8 }, spaceDivision: null, noteDivision: null,
+      braceMode: "grace", bracketMode: "triplet",
+    };
+    app.setText(text);
+    const source = app._sourceNotes.find((item) => item.markerCount === 1);
+    app.view.dispatch({ selection: { anchor: source.markerFrom } });
+    app.view.focus();
+    return { markerFrom: source.markerFrom, from: source.from, to: source.to };
+  }, markerText);
+  await page.keyboard.press("ArrowRight");
+  const skippedMarker = await page.evaluate(() => window.__app.view.state.selection.main.head);
+  if (skippedMarker !== markerPositions.to) {
+    throw new Error(`ArrowRight did not cross U+2063 with its visible pitch: ${skippedMarker} !== ${markerPositions.to}`);
+  }
+  await page.keyboard.press("ArrowLeft");
+  const skippedBack = await page.evaluate(() => window.__app.view.state.selection.main.head);
+  if (skippedBack !== markerPositions.markerFrom) {
+    throw new Error(`ArrowLeft stopped inside U+2063 run: ${skippedBack} !== ${markerPositions.markerFrom}`);
+  }
+  await page.evaluate((to) => {
+    const app = window.__app;
+    app.view.dispatch({ selection: { anchor: to } });
+    app.view.focus();
+  }, markerPositions.to);
+  await page.keyboard.press("Backspace");
+  await page.waitForFunction(() => !window.__app.getText().includes("\u2063Q"));
+  const markerDeletedWithPitch = await page.evaluate(() => ({
+    hasMarker: window.__app.getText().includes("\u2063"),
+    scoreLine: window.__app.getText().split("\n").find((line) => line.includes("../")),
+  }));
+  if (markerDeletedWithPitch.hasMarker || markerDeletedWithPitch.scoreLine?.includes("Q")) {
+    throw new Error(`deleting a marked pitch left its invisible marker: ${JSON.stringify(markerDeletedWithPitch)}`);
+  }
+
+  const multiMarkerText = `键盘谱
+4/4拍：
+\u2063\u2063Q../A../S../D../
+`;
+  const multiMarkerPositions = await page.evaluate((text) => {
+    const app = window.__app;
+    app.documentFormat = "keyboard";
+    app.slashOptions = {
+      kind: "keyboard", voiceCount: 3,
+      title: "", subtitle: "", composer: "", arranger: "", lyricist: "",
+      tempoBpm: 90, fifths: 0, beats: 4, beatType: 4,
+      symbolDurations: { ".": 8 }, spaceDivision: null, noteDivision: null,
+      braceMode: "grace", bracketMode: "triplet",
+    };
+    app.setText(text);
+    const source = app._sourceNotes.find((item) => item.markerCount === 2);
+    app.view.dispatch({ selection: { anchor: source.markerFrom + 1 } });
+    app.view.focus();
+    return { markerFrom: source.markerFrom, from: source.from, to: source.to };
+  }, multiMarkerText);
+  await page.keyboard.press("ArrowRight");
+  if (await page.evaluate(() => window.__app.view.state.selection.main.head)
+    !== multiMarkerPositions.to) {
+    throw new Error("ArrowRight did not cross a multi-marker U+2063 run with its pitch");
+  }
+  await page.keyboard.press("ArrowLeft");
+  if (await page.evaluate(() => window.__app.view.state.selection.main.head)
+    !== multiMarkerPositions.markerFrom) {
+    throw new Error("ArrowLeft did not skip an entire multi-marker U+2063 run");
+  }
+  await page.evaluate(({ markerFrom, from }) => {
+    const app = window.__app;
+    app.view.dispatch({ selection: { anchor: markerFrom, head: from } });
+    app.view.focus();
+  }, multiMarkerPositions);
+  await page.keyboard.press("Delete");
+  if (await page.evaluate(() => window.__app.getText()) !== multiMarkerText) {
+    throw new Error("a U+2063 voice marker was deleted without its pitch");
+  }
+  await page.evaluate(({ from, to }) => {
+    const app = window.__app;
+    app.view.dispatch({ selection: { anchor: from, head: to } });
+    app.view.focus();
+  }, multiMarkerPositions);
+  await page.keyboard.press("Delete");
+  const multiMarkerDelete = await page.evaluate(() => window.__app.getText());
+  if (multiMarkerDelete.includes("\u2063") || multiMarkerDelete.includes("Q../")) {
+    throw new Error(`deleting a pitch did not remove its complete U+2063 prefix: ${multiMarkerDelete}`);
+  }
+
+  const adjacentMarkerText = `键盘谱
+4/4拍：
+.\u2063N.\u2063A.\u2063N./
+`;
+  const adjacentMarkerPositions = await page.evaluate((text) => {
+    const app = window.__app;
+    app.documentFormat = "keyboard";
+    app.slashOptions = {
+      kind: "keyboard", voiceCount: 2,
+      title: "", subtitle: "", composer: "", arranger: "", lyricist: "",
+      tempoBpm: 90, fifths: 0, beats: 4, beatType: 4,
+      symbolDurations: { ".": 16 }, spaceDivision: null, noteDivision: null,
+      braceMode: "grace", bracketMode: "triplet",
+    };
+    app.setText(text);
+    const sources = app._sourceNotes.filter((item) => item.markerCount === 1);
+    app.view.dispatch({ selection: { anchor: sources[0].markerFrom } });
+    app.view.focus();
+    return sources.map((source) => ({
+      markerFrom: source.markerFrom,
+      from: source.from,
+      to: source.to,
+    }));
+  }, adjacentMarkerText);
+  await page.keyboard.press("ArrowRight");
+  const adjacentMarkerForward = await page.evaluate(() => ({
+    head: window.__app.view.state.selection.main.head,
+    selectedModel: window.__app._selectedNotes.length,
+    selectedSvg: document.querySelectorAll("#score-pane g.selected").length,
+  }));
+  if (adjacentMarkerForward.head !== adjacentMarkerPositions[0].to
+    || adjacentMarkerForward.selectedModel !== 0
+    || adjacentMarkerForward.selectedSvg !== 0) {
+    throw new Error(
+      `crossing .U+2063N selected or stopped before the note: ${
+        JSON.stringify(adjacentMarkerForward)
+      }`,
+    );
+  }
+  await page.keyboard.press("ArrowLeft");
+  const adjacentMarkerBackward = await page.evaluate(() => ({
+    head: window.__app.view.state.selection.main.head,
+    selectedModel: window.__app._selectedNotes.length,
+    selectedSvg: document.querySelectorAll("#score-pane g.selected").length,
+  }));
+  if (adjacentMarkerBackward.head !== adjacentMarkerPositions[0].markerFrom
+    || adjacentMarkerBackward.selectedModel !== 0
+    || adjacentMarkerBackward.selectedSvg !== 0) {
+    throw new Error(
+      `crossing N backwards over U+2063 selected or stopped inside it: ${
+        JSON.stringify(adjacentMarkerBackward)
+      }`,
+    );
+  }
 
   const jpwFormatFixture = `.Title
 Title = {格式转换测试}
@@ -461,10 +969,17 @@ KeyAndMeters = {1=A,4/4}
     app.documentFormat = "jpw";
     app.slashOptions = null;
     app.setText(text);
+    app.setRhythmEditDivision(64);
+    app.setInputDurationDivision(64);
     await app.changeDocumentFormat("number");
     const numberText = app.getText();
     const numberSources = app._sourceNotes.map((source) =>
       app.view.state.doc.sliceString(source.from, source.to));
+    const numberGrid = app.engravingStyle.rhythmGuideDivision;
+    const numberDuration = app._inputDurationDivision;
+    const activeGrid = document.querySelector(
+      "#rhythm-grid-control button.active",
+    )?.dataset.rhythmDivision ?? null;
     app.documentFormat = "jpw";
     app.slashOptions = null;
     app.setText(text);
@@ -472,6 +987,9 @@ KeyAndMeters = {1=A,4/4}
     return {
       numberText,
       numberSources,
+      numberGrid,
+      numberDuration,
+      activeGrid,
       keyboardText: app.getText(),
       keyboardSources: app._sourceNotes.map((source) =>
         app.view.state.doc.sliceString(source.from, source.to)),
@@ -480,9 +998,68 @@ KeyAndMeters = {1=A,4/4}
   if (!jpwFormatConversion.numberText.includes("\n1..../2..../3..../4..../")
     || jpwFormatConversion.numberText.includes("\n-1..../")
     || jpwFormatConversion.numberSources.join("|") !== "1|2|3|4|5|6|7|+1"
+    // TXT without an explicit finer duration cannot retain JPW's 64th-note
+    // grid or writing value; both clamp to the mapped sixteenth boundary.
+    || jpwFormatConversion.numberGrid !== 16
+    || jpwFormatConversion.numberDuration !== 16
+    || jpwFormatConversion.activeGrid !== "16"
     || !jpwFormatConversion.keyboardText.includes("\nA..../S..../D..../F..../")
     || jpwFormatConversion.keyboardSources.join("|") !== "A|S|D|F|G|H|J|Q") {
     throw new Error(`JPW keyboard/number conversion is inaccurate: ${JSON.stringify(jpwFormatConversion)}`);
+  }
+
+  const voicedRestConversion = await page.evaluate(async (text) => {
+    const app = window.__app;
+    app.documentFormat = "jpw";
+    app.slashOptions = null;
+    app.setText(text);
+    await app.changeDocumentFormat("keyboard");
+    const score = app.painter.score;
+    const rightMeasure = score.parts[0]?.measures[0];
+    const leftMeasure = score.parts[1]?.measures[0];
+    return {
+      format: app.documentFormat,
+      text: app.getText(),
+      rightHasFourthBeatRest: rightMeasure?.entries.some((entry) =>
+        entry.rest && entry.position.equals(3)) ?? false,
+      leftSoundingDuration: leftMeasure?.entries
+        .filter((entry) => !entry.rest)
+        .reduce((sum, entry) => sum + entry.duration.toFloat(), 0) ?? 0,
+    };
+  }, `.Title
+Instrument = {钢琴}
+KeyAndMeters = {1=C,4/4}
+.Voice.RH
+1 2 3 0 |]
+.Voice.LH
+6,--- |]
+`);
+  if (voicedRestConversion.format !== "keyboard"
+    || !voicedRestConversion.text.includes("\u20630")
+    || !voicedRestConversion.rightHasFourthBeatRest
+    || voicedRestConversion.leftSoundingDuration !== 4) {
+    throw new Error(
+      `JPW voice-specific rest conversion failed: ${JSON.stringify(voicedRestConversion)}`,
+    );
+  }
+
+  const dottedLongValue = await page.evaluate((text) => {
+    const app = window.__app;
+    app.documentFormat = "jpw";
+    app.slashOptions = null;
+    app.setText(text);
+    return [...document.querySelectorAll("#score-pane text")]
+      .map((element) => element.textContent ?? "")
+      .filter((value) => value.includes("\u00b7"));
+  }, `.Title
+KeyAndMeters = {1=C,4/4}
+.Voice
+(1- 1) 2 |]
+`);
+  if (!dottedLongValue.some((value) => value.includes("1\u00b7"))) {
+    throw new Error(
+      `dotted half note did not render its augmentation dot: ${JSON.stringify(dottedLongValue)}`,
+    );
   }
 
   const mixedRecognitionText = `键盘谱
@@ -552,18 +1129,40 @@ A../S../D../F../
     );
   }
   await scoreSettingsButton.click();
-  const scoreSettingsBox = page.locator(".slash-import-box");
+  const scoreSettingsBox = page.locator('#inspector-pane[data-inspector-id="score"]');
   await scoreSettingsBox.waitFor();
-  const settingsTitle = await scoreSettingsBox.locator(".modal-title").textContent();
-  if (settingsTitle !== "乐谱设置") {
+  const settingsTitle = await scoreSettingsBox.locator(".inspector-title").textContent();
+  if (settingsTitle !== "乐谱") {
     throw new Error(`top score settings did not open the current-score editor: ${settingsTitle}`);
+  }
+  const keyboardLabelsToggle = scoreSettingsBox.locator("label.modal-row")
+    .filter({ hasText: "谱面显示键盘按键" }).locator('input[type="checkbox"]');
+  const tieAsZeroRow = scoreSettingsBox.locator("label.modal-row")
+    .filter({ hasText: "延音用 0 替代" });
+  const hideTieLabelsRow = scoreSettingsBox.locator("label.modal-row")
+    .filter({ hasText: "隐藏延音字母" });
+  await keyboardLabelsToggle.check();
+  if (!await tieAsZeroRow.isVisible() || !await hideTieLabelsRow.isVisible()) {
+    throw new Error("keyboard continuation display options did not appear with key labels enabled");
+  }
+  await keyboardLabelsToggle.uncheck();
+  if (await tieAsZeroRow.isVisible() || await hideTieLabelsRow.isVisible()) {
+    throw new Error("keyboard continuation display options remained visible with key labels disabled");
   }
   const tempoInput = scoreSettingsBox.locator("label.modal-row")
     .filter({ hasText: "速度（BPM）" }).locator("input");
   await tempoInput.fill("123");
+  await scoreSettingsBox.locator(".inspector-close").click();
+  if (!await scoreSettingsBox.locator(".inspector-dirty-prompt").isVisible()) {
+    throw new Error("dirty score settings did not offer inline apply/discard/continue");
+  }
+  await scoreSettingsBox.getByRole("button", { name: "继续编辑" }).click();
+  if (!await scoreSettingsBox.isVisible()) {
+    throw new Error("continue editing closed score settings");
+  }
   await scoreSettingsBox.getByRole("button", { name: "应用到当前乐谱" }).click();
   await page.waitForFunction(() =>
-    !document.querySelector(".slash-import-box")
+    !document.querySelector('#inspector-pane[data-inspector-id="score"]')
     && window.__app.slashOptions?.tempoBpm === 123
     && window.__app.painter.score.tempoBpm === 123);
   const appliedScoreSettings = await page.evaluate(() => ({
@@ -600,7 +1199,68 @@ A../S../D../F../
   }
 
   await page.locator("#btn-export").click();
-  const exportBox = page.locator(".modal-box").filter({ hasText: "键盘谱 TXT" });
+  let exportBox = page.locator(".modal-box").filter({ hasText: "键盘谱 TXT" });
+  if (await exportBox.getByRole("button", { name: "PNG（全部页面）" }).count() !== 1
+    || await exportBox.getByRole("button", { name: "PDF（全部页面）" }).count() !== 1
+    || await exportBox.getByRole("button", { name: "MusicXML" }).count() !== 1) {
+    throw new Error("score export menu is missing all-page PNG, PDF or MusicXML");
+  }
+  const pngDownloadPromise = page.waitForEvent("download");
+  await exportBox.getByRole("button", { name: "PNG（全部页面）" }).click();
+  const pngOptionsBox = page.locator(".modal-box").filter({ hasText: "透明背景" });
+  await pngOptionsBox.waitFor();
+  const pngChecks = pngOptionsBox.locator('input[type="checkbox"]');
+  if (await pngChecks.count() !== 2 || !await pngChecks.nth(0).isChecked()) {
+    throw new Error("PNG export does not default to a transparent background");
+  }
+  await pngChecks.nth(1).check();
+  await pngOptionsBox.getByRole("button", { name: "导出" }).click();
+  const pngDownload = await pngDownloadPromise;
+  const pngDownloadPath = await pngDownload.path();
+  const pngDownloadBytes = pngDownloadPath ? await readFile(pngDownloadPath) : null;
+  if (!pngDownload.suggestedFilename().endsWith(".zip")
+    || !pngDownloadBytes
+    || pngDownloadBytes[0] !== 0x50
+    || pngDownloadBytes[1] !== 0x4b) {
+    throw new Error("PNG ZIP export did not create a valid downloadable archive");
+  }
+
+  await page.locator("#btn-export").click();
+  exportBox = page.locator(".modal-box").filter({ hasText: "键盘谱 TXT" });
+  const pdfDownloadPromise = page.waitForEvent("download");
+  await exportBox.getByRole("button", { name: "PDF（全部页面）" }).click();
+  const pdfDownload = await pdfDownloadPromise;
+  const pdfDownloadPath = await pdfDownload.path();
+  const pdfDownloadBytes = pdfDownloadPath ? await readFile(pdfDownloadPath) : null;
+  if (!pdfDownload.suggestedFilename().endsWith(".pdf")
+    || !pdfDownloadBytes
+    || pdfDownloadBytes.subarray(0, 5).toString() !== "%PDF-") {
+    throw new Error("PDF export did not create a valid downloadable PDF");
+  }
+  if (process.argv[7]) {
+    await mkdir(dirname(process.argv[7]), { recursive: true });
+    await pdfDownload.saveAs(process.argv[7]);
+  }
+
+  await page.locator("#btn-export").click();
+  exportBox = page.locator(".modal-box").filter({ hasText: "键盘谱 TXT" });
+  const musicXmlDownloadPromise = page.waitForEvent("download");
+  await exportBox.getByRole("button", { name: "MusicXML" }).click();
+  const musicXmlDownload = await musicXmlDownloadPromise;
+  const musicXmlDownloadPath = await musicXmlDownload.path();
+  const musicXmlDownloadBytes = musicXmlDownloadPath
+    ? await readFile(musicXmlDownloadPath)
+    : null;
+  const musicXmlDownloadText = musicXmlDownloadBytes?.toString("utf-8") ?? "";
+  if (!musicXmlDownload.suggestedFilename().endsWith(".musicxml")
+    || !musicXmlDownloadText.includes('<score-partwise version="4.0">')
+    || !musicXmlDownloadText.includes("<part-list>")
+    || !musicXmlDownloadText.includes("<measure ")) {
+    throw new Error("MusicXML export did not create a valid downloadable partwise score");
+  }
+
+  await page.locator("#btn-export").click();
+  exportBox = page.locator(".modal-box").filter({ hasText: "键盘谱 TXT" });
   await exportBox.getByRole("button", { name: "键盘谱 TXT" }).click();
   const slashExportBox = page.locator(".modal-box")
     .filter({ hasText: "键盘谱 / 数字谱导出设置" });
@@ -637,6 +1297,7 @@ A../S../D../F../
     app.setText(text);
   }, twoVoiceColorText);
   await page.waitForFunction(() => document.querySelectorAll(".cm-slash-voice").length >= 2);
+  await page.locator("#btn-file-menu").click();
   await page.locator("#btn-options").click();
   let optionsBox = page.locator(".options-box");
   let textColorToggle = optionsBox.locator("label.modal-row")
@@ -645,6 +1306,10 @@ A../S../D../F../
     throw new Error("text voice coloring master switch was not enabled initially");
   }
   await textColorToggle.uncheck();
+  await page.locator(".modal-overlay").click({ position: { x: 2, y: 2 } });
+  const unsaved = page.getByRole("dialog", { name: "设置尚未保存", exact: true });
+  await unsaved.getByRole("button", { name: "继续编辑", exact: true }).click();
+  if (await optionsBox.count() !== 1) throw new Error("dirty settings must remain open after Continue editing");
   await optionsBox.getByRole("button", { name: "确定" }).click();
   await page.waitForFunction(() =>
     window.__app.textVoiceColoring === false
@@ -653,6 +1318,7 @@ A../S../D../F../
   if (preservedVoiceColor !== "#dc2626") {
     throw new Error(`disabling text voice colors deleted the saved color: ${preservedVoiceColor}`);
   }
+  await page.locator("#btn-file-menu").click();
   await page.locator("#btn-options").click();
   optionsBox = page.locator(".options-box");
   textColorToggle = optionsBox.locator("label.modal-row")
@@ -825,6 +1491,9 @@ Tempo = {90}
     return {
       incoming: document.querySelectorAll("#score-pane .tie-system-incoming").length,
       outgoing: document.querySelectorAll("#score-pane .tie-system-outgoing").length,
+      curveHeights: [...document.querySelectorAll(
+        "#score-pane .tie-system-incoming path, #score-pane .tie-system-outgoing path",
+      )].map((path) => path.getBBox().height),
       tied: continuations.length === 2 && continuations.every((chord) =>
         chord?.notes.every((note) =>
           note.tieEnd && note.tiePrev && note.tiePrev.tieNext === note)),
@@ -836,6 +1505,8 @@ Tempo = {90}
     || crossSystemContinuation.outgoing < 2
     || !crossSystemContinuation.tied
     || !crossSystemContinuation.transparent
+    || crossSystemContinuation.curveHeights.length < 4
+    || crossSystemContinuation.curveHeights.some((height) => height < 3)
     || crossSystemContinuation.fills.length < 2
     || crossSystemContinuation.fills.some((fill) => !fill || fill === "#000000")) {
     throw new Error(
@@ -870,32 +1541,221 @@ Tempo = {90}
   const ensembleBefore = await page.evaluate(() => ({
     html: document.querySelector("#score-pane")?.innerHTML ?? "",
     metaY: window.__app.engravingStyle.publicationMetaYOffset,
+    metaTransform: document.querySelector("#score-pane .publication-meta")?.getAttribute("transform"),
+    source: window.__app.getText(),
   }));
   await page.locator("#btn-layout-style").click();
   await page.locator('input[name="publicationMetaYOffset"]').evaluate((input) => {
     input.value = "2.4";
     input.dispatchEvent(new Event("input", { bubbles: true }));
   });
+  await page.waitForFunction(() =>
+    Math.abs(window.__app.painter.layout.options.engravingStyle.publicationMetaYOffset - 2.4) < 1e-8);
   const ensembleDraftIsolation = await page.evaluate((before) => ({
-    liveUnchanged: (document.querySelector("#score-pane")?.innerHTML ?? "") === before.html,
+    scoreChanged: (document.querySelector("#score-pane")?.innerHTML ?? "") !== before.html,
     styleUnchanged: window.__app.engravingStyle.publicationMetaYOffset === before.metaY,
-    previewHasEnsemble: document.querySelectorAll(".engraving-preview .piano-system").length > 0,
+    sourceUnchanged: window.__app.getText() === before.source,
+    previewHasEnsemble: document.querySelectorAll("#score-pane .ensemble-system").length > 0,
   }), ensembleBefore);
   if (process.argv[6]) {
-    await page.locator(".modal-box.engraving-box").screenshot({ path: process.argv[6] });
+    await page.locator("#inspector-pane").screenshot({ path: process.argv[6] });
   }
-  await page.getByRole("button", { name: "取消" }).click();
-  if (!ensembleDraftIsolation.liveUnchanged
+  await page.locator("#inspector-pane .inspector-close").click();
+  if (!await page.locator("#inspector-pane .inspector-dirty-prompt").isVisible()) {
+    throw new Error("closing a dirty engraving inspector did not show the inline choice");
+  }
+  await page.getByRole("button", { name: "继续编辑" }).click();
+  if (await page.locator("#inspector-pane").isHidden()) {
+    throw new Error("continue editing closed the dirty engraving inspector");
+  }
+  await page.locator("#inspector-pane .inspector-footer").getByRole("button", { name: "取消" }).click();
+  await page.waitForFunction((before) =>
+    document.getElementById("inspector-pane").hidden
+    && window.__app.painter.layout.options.engravingStyle.publicationMetaYOffset === before.metaY,
+  ensembleBefore);
+  const ensembleAfterCancel = await page.evaluate(() =>
+    document.querySelector("#score-pane .publication-meta")?.getAttribute("transform"));
+  if (!ensembleDraftIsolation.scoreChanged
     || !ensembleDraftIsolation.styleUnchanged
-    || !ensembleDraftIsolation.previewHasEnsemble) {
+    || !ensembleDraftIsolation.sourceUnchanged
+    || !ensembleDraftIsolation.previewHasEnsemble
+    || ensembleAfterCancel !== ensembleBefore.metaTransform) {
     throw new Error(
-      `engraving draft changed the live ensemble before confirmation: ${
-        JSON.stringify(ensembleDraftIsolation)
+      `engraving ensemble preview/cancel failed: ${
+        JSON.stringify({ ...ensembleDraftIsolation, restored: ensembleAfterCancel === ensembleBefore.metaTransform })
       }`,
     );
   }
 
-  if (errors.filter((error) => !/favicon/.test(error)).length > 0) {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.waitForTimeout(80);
+  const portraitLayout = await page.evaluate(() => {
+    const toolbar = document.querySelector("#toolbar");
+    const body = document.querySelector("#body");
+    const code = document.querySelector("#code-workspace");
+    const score = document.querySelector("#score-pane");
+    const toggle = document.querySelector("#code-pane-toggle");
+    const controls = [...document.querySelectorAll("#toolbar > button, #toolbar > select")];
+    return {
+      toolbarFitsHeight: toolbar.scrollHeight <= toolbar.clientHeight + 1,
+      controlsUnclipped: controls.every((control) =>
+        control.scrollWidth <= control.clientWidth + 1
+        && control.scrollHeight <= control.clientHeight + 1),
+      bodyDirection: getComputedStyle(body).flexDirection,
+      codePosition: getComputedStyle(code).position,
+      codeWidth: code.getBoundingClientRect().width,
+      scoreWidth: score.getBoundingClientRect().width,
+      toggleWidth: toggle.getBoundingClientRect().width,
+      viewportWidth: innerWidth,
+    };
+  });
+  if (!portraitLayout.toolbarFitsHeight
+    || !portraitLayout.controlsUnclipped
+    || portraitLayout.bodyDirection !== "row"
+    || portraitLayout.codePosition !== "absolute"
+    || portraitLayout.codeWidth > 340
+    || portraitLayout.scoreWidth < portraitLayout.viewportWidth - 20
+    || portraitLayout.toggleWidth > 20) {
+    throw new Error(`portrait responsive layout failed: ${JSON.stringify(portraitLayout)}`);
+  }
+  await page.locator("#btn-layout-style").click();
+  const portraitInspector = await page.evaluate(() => {
+    const pane = document.querySelector("#inspector-pane");
+    const score = document.querySelector("#score-pane");
+    const rect = pane.getBoundingClientRect();
+    return {
+      position: getComputedStyle(pane).position,
+      right: rect.right,
+      left: rect.left,
+      top: rect.top,
+      bottom: rect.bottom,
+      height: innerHeight,
+      headerVisible: pane.querySelector(".inspector-header")?.getBoundingClientRect().bottom <= innerHeight,
+      footerVisible: pane.querySelector(".inspector-footer")?.getBoundingClientRect().top < innerHeight,
+      scoreWidth: score.getBoundingClientRect().width,
+      viewportWidth: innerWidth,
+    };
+  });
+  if (portraitInspector.position !== "fixed"
+    || portraitInspector.left < 0
+    || portraitInspector.right > portraitInspector.viewportWidth + 1
+    || portraitInspector.top < 0
+    || portraitInspector.bottom > portraitInspector.height + 1
+    || !portraitInspector.headerVisible
+    || !portraitInspector.footerVisible
+    || portraitInspector.scoreWidth < portraitInspector.viewportWidth - 20) {
+    throw new Error(`portrait floating inspector escaped or resized score: ${JSON.stringify(portraitInspector)}`);
+  }
+  await page.locator("#inspector-pane .inspector-close").click();
+  await page.waitForFunction(() => document.getElementById("inspector-pane").hidden);
+  await page.locator("#btn-file-menu").click();
+  await page.locator("#btn-options").click();
+  await page.waitForSelector(".modal-overlay .modal-box");
+  const portraitModal = await page.evaluate(() => {
+    const box = document.querySelector(".modal-overlay .modal-box").getBoundingClientRect();
+    return {
+      left: box.left,
+      right: box.right,
+      top: box.top,
+      bottom: box.bottom,
+      width: innerWidth,
+      height: innerHeight,
+    };
+  });
+  if (portraitModal.left < -1
+    || portraitModal.right > portraitModal.width + 1
+    || portraitModal.top < -1
+    || portraitModal.bottom > portraitModal.height + 1) {
+    throw new Error(`portrait modal escaped the viewport: ${JSON.stringify(portraitModal)}`);
+  }
+  await page.locator(".modal-footer button").first().click();
+
+  await page.setViewportSize({ width: 844, height: 390 });
+  await page.waitForTimeout(80);
+  const landscapeLayout = await page.evaluate(() => {
+    const body = document.querySelector("#body");
+    const toolbar = document.querySelector("#toolbar");
+    const controls = [...document.querySelectorAll("#toolbar > button, #toolbar > select")];
+    return {
+      bodyDirection: getComputedStyle(body).flexDirection,
+      toolbarFitsHeight: toolbar.scrollHeight <= toolbar.clientHeight + 1,
+      controlsUnclipped: controls.every((control) =>
+        control.scrollWidth <= control.clientWidth + 1
+        && control.scrollHeight <= control.clientHeight + 1),
+      codeWidth: document.querySelector("#code-pane").getBoundingClientRect().width,
+      scoreWidth: document.querySelector("#score-pane").getBoundingClientRect().width,
+    };
+  });
+  if (landscapeLayout.bodyDirection !== "row"
+    || !landscapeLayout.toolbarFitsHeight
+    || !landscapeLayout.controlsUnclipped
+    || landscapeLayout.codeWidth < 200
+    || landscapeLayout.scoreWidth < 300) {
+    throw new Error(`landscape responsive layout failed: ${JSON.stringify(landscapeLayout)}`);
+  }
+  await page.setViewportSize({ width: 1280, height: 900 });
+
+  const musicXmlFixture = [...await readFile("examples/piano-demo.musicxml")];
+  await page.evaluate((input) => {
+    void window.__app.importBytes(Uint8Array.from(input), "dialog-test.musicxml");
+  }, musicXmlFixture);
+  const musicXmlImportBox = page.locator(".modal-box")
+    .filter({ hasText: "MusicXML 导入" });
+  await musicXmlImportBox.waitFor();
+  const musicXmlDialogState = await musicXmlImportBox.evaluate((box) => ({
+    hasOutputFormat: [...box.querySelectorAll("label")].some((label) =>
+      label.textContent?.includes("导入后格式")),
+    hasTextDivision: [...box.querySelectorAll("label")].some((label) =>
+      label.textContent?.includes("文本谱最短时值")),
+    hasMetadata: box.textContent?.includes("标题与署名"),
+    hasInstrumentMapping: box.textContent?.includes("乐器与声部"),
+    hasMeterTempo: box.textContent?.includes("调号、拍号与速度"),
+  }));
+  if (Object.values(musicXmlDialogState).some((value) => !value)) {
+    throw new Error(
+      `MusicXML import dialog omitted MIDI-style conversion controls: ${
+        JSON.stringify(musicXmlDialogState)
+      }`,
+    );
+  }
+  await musicXmlImportBox.locator("label")
+    .filter({ hasText: "导入后格式" })
+    .locator("select")
+    .selectOption("keyboard");
+  await musicXmlImportBox.getByRole("button", { name: "导入并转为简谱" }).click();
+  await page.waitForFunction(() =>
+    window.__app.documentFormat === "keyboard"
+    && !document.querySelector(".modal-box"));
+
+  const beforeFailedImport = await page.evaluate(() => window.__app.getText());
+  await page.evaluate(async () => {
+    await window.__app.importBytes(
+      new TextEncoder().encode("<score-partwise><part-list>"),
+      "broken.musicxml",
+    );
+  });
+  const failureBox = page.locator(".import-failure-overlay .modal-box");
+  await failureBox.waitFor();
+  const failureState = await failureBox.evaluate((box) => ({
+    title: box.querySelector(".modal-title")?.textContent,
+    text: box.textContent,
+    role: box.getAttribute("role"),
+  }));
+  const afterFailedImport = await page.evaluate(() => window.__app.getText());
+  if (failureState.title !== "导入失败"
+    || failureState.role !== "alertdialog"
+    || !failureState.text?.includes("当前正在编辑的乐谱没有被替换")
+    || afterFailedImport !== beforeFailedImport) {
+    throw new Error(
+      `failed MusicXML import did not show a non-destructive error prompt: ${
+        JSON.stringify(failureState)
+      }`,
+    );
+  }
+  await failureBox.getByRole("button", { name: "确定" }).click();
+
+  if (errors.filter((error) =>
+    !/favicon/.test(error) && !/MusicXML 导入失败/.test(error)).length > 0) {
     throw new Error(`browser errors: ${errors.join("\n")}`);
   }
   const result = {
@@ -909,12 +1769,25 @@ Tempo = {90}
     mixedRecognitionSwitch: true,
     scoreSettingsAvailability: true,
     scoreSettingsApplied: true,
+    engravingInspectorLivePreview: true,
+    engravingInlineDirtyGuard: true,
+    builtInMetadata: true,
+    pngZipExport: true,
+    pdfExport: true,
+    musicXmlExport: true,
+    musicXmlImportDialog: true,
+    importFailurePrompt: true,
     optionalMetadataExport: true,
     textVoiceColorToggle: true,
     arpeggioHighlighting: true,
+    keyboardQBaseline: true,
+    hiddenTieLabelLayout: true,
     crossMeasureChordHeight: true,
     crossSystemContinuation: true,
     ensembleDraftIsolation: true,
+    invisibleVoiceMarkerAtomicity: true,
+    portraitResponsiveLayout: true,
+    landscapeResponsiveLayout: true,
     selectedPlayback,
     slashPlayback,
     clearedPlayback,

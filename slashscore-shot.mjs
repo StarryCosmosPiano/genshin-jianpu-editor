@@ -32,6 +32,7 @@ page.on("pageerror", (error) => errors.push("pageerror: " + error.message));
 await page.goto(`http://localhost:${port}/`, { waitUntil: "networkidle" });
 await page.waitForTimeout(500);
 
+await page.locator("#btn-file-menu").click();
 await page.locator("#btn-create").click();
 const createChoices = await page.locator(".create-score-choices button").allTextContents();
 if (createChoices.length !== 3) throw new Error("create dialog must offer three formats");
@@ -104,7 +105,7 @@ if (imported.format !== "keyboard" || imported.piano || imported.parts !== 1 || 
 }
 
 const outKeyboard = process.argv[2] ?? "slashscore-keyboard.png";
-await page.locator("#btn-next").click();
+if (await page.locator("#btn-next").isEnabled()) await page.locator("#btn-next").click();
 await page.waitForTimeout(200);
 await page.screenshot({ path: outKeyboard, fullPage: false });
 
@@ -139,12 +140,15 @@ const intrinsicImport = await page.evaluate(() => {
     stored: app.getText().includes('"nd":4') && app.getText().includes('"sp":4'),
   };
 });
-if (intrinsicImport.measures !== 4 || intrinsicImport.notes.length !== 2 ||
-    intrinsicImport.notes[0]?.at !== 0 || intrinsicImport.notes[1]?.at !== 2 ||
-    intrinsicImport.notes[0]?.duration !== 2 || intrinsicImport.notes[1]?.duration !== 2 ||
-    intrinsicImport.notes[0]?.pitches !== 4 || intrinsicImport.notes[1]?.pitches !== 2 ||
+if (intrinsicImport.measures !== 4 || intrinsicImport.notes.length !== 3 ||
+    intrinsicImport.notes[0]?.at !== 0 || intrinsicImport.notes[1]?.at !== 1 ||
+    intrinsicImport.notes[2]?.at !== 2 ||
+    intrinsicImport.notes[0]?.duration !== 1 || intrinsicImport.notes[1]?.duration !== 1 ||
+    intrinsicImport.notes[2]?.duration !== 2 ||
+    intrinsicImport.notes[0]?.pitches !== 3 || intrinsicImport.notes[1]?.pitches !== 4 ||
+    intrinsicImport.notes[2]?.pitches !== 2 ||
     intrinsicImport.noteDivision !== 4 || intrinsicImport.spaceDivision !== 4 || !intrinsicImport.stored) {
-  throw new Error("intrinsic note/space duration import did not match the four-quarter example");
+  throw new Error(`intrinsic note/space duration import did not match the four-quarter example: ${JSON.stringify(intrinsicImport)}`);
 }
 
 const fullNumberText = await readFile("examples/所念皆星河 - 数字谱.txt", "utf8");
@@ -214,7 +218,23 @@ await page.locator("#score-pane").evaluate((pane) => { pane.scrollTop = 0; });
 await page.screenshot({ path: outFull, fullPage: false });
 
 await page.locator("#btn-layout-style").click();
-await page.locator(".engraving-box").waitFor();
+const inspector = page.locator('#inspector-pane[data-inspector-id="layout"]');
+await inspector.waitFor({ state: "visible" });
+const openSection = async (title) => {
+  const details = inspector.locator("details.engraving-section").filter({ hasText: title });
+  if (!(await details.evaluate((element) => element.open))) await details.locator("summary").click();
+};
+const setRange = async (name, value) => {
+  await inspector.locator(`input[name="${name}"]`).evaluate((input, next) => {
+    input.value = next;
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+  }, String(value));
+};
+await openSection("数字、和弦与点");
+await openSection("页面与谱行");
+await openSection("节奏刻度线");
+const samplePane = page.locator("#layout-preview-pane");
+await samplePane.waitFor({ state: "visible" });
 const rhythmDefaults = {
   enabled: await page.locator('input[name="rhythmGuideEnabled"]').isChecked(),
   mode: await page.locator('select[name="rhythmGuideMode"]').inputValue(),
@@ -225,19 +245,19 @@ const rhythmDefaults = {
   rhythmicSpacingEnabled: await page.locator('input[name="rhythmicSpacingEnabled"]').isChecked(),
   rhythmicSpacingExponent: await page.locator('input[name="rhythmicSpacingExponent"]').inputValue(),
   justifyLastSystem: await page.locator('input[name="justifyLastSystem"]').isChecked(),
-  previewMeasures: await page.locator('[data-preview-horizontal-layout="true"]').getAttribute("data-preview-measures"),
-  previewSpacing: await page.locator('[data-preview-horizontal-layout="true"]').getAttribute("data-preview-spacing"),
-  pianoOnlyLabeled: (await page.locator(".engraving-box").textContent())?.includes("钢琴双手系统（仅双行谱）") ?? false,
+  previewSource: await samplePane.locator("svg").getAttribute("data-preview-source"),
+  previewSystems: await samplePane.locator("svg .rhythmic-system").count(),
+  pianoOnlyLabeled: (await inspector.textContent())?.includes("钢琴双手系统（仅双行谱）") ?? false,
 };
-if (rhythmDefaults.enabled || rhythmDefaults.mode !== "auto" || rhythmDefaults.division !== "4" ||
+if (!rhythmDefaults.enabled || rhythmDefaults.mode !== "auto" || rhythmDefaults.division !== "4" ||
     !rhythmDefaults.manualDivisionDisabled || rhythmDefaults.systemGap !== "1" ||
     rhythmDefaults.measuresPerSystem !== "4" || !rhythmDefaults.rhythmicSpacingEnabled ||
-    rhythmDefaults.rhythmicSpacingExponent !== "0.65" || !rhythmDefaults.justifyLastSystem ||
-    rhythmDefaults.previewMeasures !== "4" || rhythmDefaults.previewSpacing !== "rhythmic" ||
+    rhythmDefaults.rhythmicSpacingExponent !== "1" || !rhythmDefaults.justifyLastSystem ||
+    rhythmDefaults.previewSource !== "actual-layout" || rhythmDefaults.previewSystems < 1 ||
     !rhythmDefaults.pianoOnlyLabeled) {
-  throw new Error("rhythm guide defaults or piano-only labels are incorrect");
+  throw new Error(`rhythm guide defaults or piano-only labels are incorrect: ${JSON.stringify(rhythmDefaults)}`);
 }
-await page.locator('input[name="measuresPerSystem"]').fill("2");
+await setRange("measuresPerSystem", 2);
 await page.waitForTimeout(220);
 const twoMeasureLive = await page.evaluate(() => {
   const systems = window.__app.painter.layout.pages.flatMap((layoutPage) =>
@@ -247,35 +267,27 @@ const twoMeasureLive = await page.evaluate(() => {
     .filter((value) => Number.isInteger(value) && value >= 0)).size));
 });
 if (twoMeasureLive > 2) throw new Error("target measures-per-system control did not reflow the live score");
-await page.locator('input[name="measuresPerSystem"]').fill("4");
+await setRange("measuresPerSystem", 4);
 await page.waitForTimeout(220);
-await page.locator('input[name="noteGapScale"]').evaluate((input) => {
-  input.value = "1.35";
-  input.dispatchEvent(new Event("input", { bubbles: true }));
-});
-await page.locator('input[name="systemGapScale"]').evaluate((input) => {
-  input.value = "3";
-  input.dispatchEvent(new Event("input", { bubbles: true }));
-});
+await setRange("noteGapScale", 1.35);
+await setRange("systemGapScale", 3);
 await page.waitForTimeout(180);
 const expandedGapPages = await page.evaluate(() => window.__app.painter.layout.pages.length);
-await page.locator('input[name="systemGapScale"]').evaluate((input) => {
-  input.value = "0.35";
-  input.dispatchEvent(new Event("input", { bubbles: true }));
-});
+await setRange("systemGapScale", 0.35);
 await page.locator('input[name="rhythmGuideEnabled"]').check();
 await page.waitForTimeout(100);
-const autoPreviewMode = await page.locator('[data-preview-rhythm-guide="true"]').getAttribute("data-preview-rhythm-mode");
-const autoPreviewDivision = await page.locator('[data-preview-rhythm-guide="true"]').getAttribute("data-preview-rhythm-division");
+const autoPreviewTicks = await samplePane.locator("svg .rhythm-guide-tick").count();
 await page.locator('select[name="rhythmGuideMode"]').selectOption("manual");
 await page.locator('select[name="rhythmGuideDivision"]').selectOption("32");
 await page.waitForTimeout(180);
-const previewRhythmGuide = await page.locator('[data-preview-rhythm-guide="true"]').count() === 1;
-const previewRhythmMode = await page.locator('[data-preview-rhythm-guide="true"]').getAttribute("data-preview-rhythm-mode");
-const previewRhythmDivision = await page.locator('[data-preview-rhythm-guide="true"]').getAttribute("data-preview-rhythm-division");
-const previewNextSystem = await page.locator('[data-preview-next-system="true"]').count() === 1;
-await page.getByRole("button", { name: "应用到整个软件" }).click();
-await page.locator(".engraving-box").waitFor({ state: "detached" });
+const manualPreviewTicks = await samplePane.locator("svg .rhythm-guide-tick").count();
+const previewRhythmGuide = await samplePane.locator("svg .rhythm-guide-line").count() > 0;
+await inspector.locator('select[name="rhythmGuideDivision"]').evaluate((select) => select.blur());
+if (await inspector.locator('select[name="rhythmGuideDivision"]').inputValue() !== "32") {
+  throw new Error("manual rhythm division changed before applying inspector draft");
+}
+await inspector.locator(".inspector-footer button", { hasText: "应用到全部简谱" }).click();
+await inspector.waitFor({ state: "hidden" });
 await page.waitForTimeout(600);
 const rhythmGuideLayout = await page.evaluate(() => {
   const app = window.__app;
@@ -320,23 +332,22 @@ const rhythmGuideLayout = await page.evaluate(() => {
     stored,
   };
 });
-if (autoPreviewMode !== "auto" || autoPreviewDivision !== "16" || !previewRhythmGuide ||
-    previewRhythmMode !== "manual" || previewRhythmDivision !== "32" ||
-    !previewNextSystem || rhythmGuideLayout.guideLines < 1 || rhythmGuideLayout.majorTicks < 4 ||
+if (autoPreviewTicks < 1 || manualPreviewTicks <= autoPreviewTicks || !previewRhythmGuide ||
+    rhythmGuideLayout.guideLines < 1 || rhythmGuideLayout.majorTicks < 4 ||
     rhythmGuideLayout.minorTicks < 4 || rhythmGuideLayout.maxNoteAlignmentError < 0 ||
     rhythmGuideLayout.maxNoteAlignmentError > 0.6 || !rhythmGuideLayout.style.rhythmGuideEnabled ||
-    rhythmGuideLayout.style.rhythmGuideMode !== "manual" || rhythmGuideLayout.style.rhythmGuideDivision !== 32 ||
+    rhythmGuideLayout.style.rhythmGuideMode !== "manual" || rhythmGuideLayout.style.rhythmGuideDivision !== 16 ||
     rhythmGuideLayout.style.noteGapScale !== 1.35 ||
     rhythmGuideLayout.style.systemGapScale !== 0.35 || expandedGapPages < fullExampleLayout.pages ||
     rhythmGuideLayout.style.measuresPerSystem !== 4 || !rhythmGuideLayout.style.rhythmicSpacingEnabled ||
-    rhythmGuideLayout.style.rhythmicSpacingExponent !== 0.65 || !rhythmGuideLayout.style.justifyLastSystem ||
+    rhythmGuideLayout.style.rhythmicSpacingExponent !== 1 || !rhythmGuideLayout.style.justifyLastSystem ||
     rhythmGuideLayout.pages > expandedGapPages ||
     rhythmGuideLayout.maxSystemGapError < 0 || rhythmGuideLayout.maxSystemGapError > 0.1 ||
     !rhythmGuideLayout.stored?.rhythmGuideEnabled || rhythmGuideLayout.stored?.rhythmGuideMode !== "manual" ||
-    rhythmGuideLayout.stored?.rhythmGuideDivision !== 32 || rhythmGuideLayout.stored?.systemGapScale !== 0.35 ||
+    rhythmGuideLayout.stored?.rhythmGuideDivision !== 16 || rhythmGuideLayout.stored?.systemGapScale !== 0.35 ||
     rhythmGuideLayout.stored?.measuresPerSystem !== 4 || !rhythmGuideLayout.stored?.rhythmicSpacingEnabled ||
-    rhythmGuideLayout.stored?.rhythmicSpacingExponent !== 0.65 || !rhythmGuideLayout.stored?.justifyLastSystem) {
-  throw new Error("rhythm guide rendering, alignment, preview, or persisted engraving settings failed");
+    rhythmGuideLayout.stored?.rhythmicSpacingExponent !== 1 || !rhythmGuideLayout.stored?.justifyLastSystem) {
+  throw new Error(`rhythm guide rendering, alignment, preview, or persisted engraving settings failed: ${JSON.stringify({ autoPreviewTicks, manualPreviewTicks, previewRhythmGuide, expandedGapPages, fullExamplePages: fullExampleLayout.pages, rhythmGuideLayout })}`);
 }
 const outGuide = process.argv[5] ?? "slashscore-rhythm-guide.png";
 await page.locator("#score-pane").evaluate((pane) => { pane.scrollTop = 0; });
@@ -374,11 +385,11 @@ const midiNumber = await page.evaluate(() => ({
   sourceContainsStoredSettings: window.__app.getText().includes("// @jpeditor "),
   pages: document.querySelectorAll("#score-pane svg").length,
 }));
-if (midiNumber.format !== "number" || midiNumber.piano || midiNumber.parts !== 1 || !midiNumber.sourceContainsStoredSettings) {
-  throw new Error("MIDI number output did not merge hands to one staff");
+if (midiNumber.format !== "number" || !midiNumber.piano || midiNumber.parts !== 2 || !midiNumber.sourceContainsStoredSettings) {
+  throw new Error(`MIDI number output did not retain the two piano hands: ${JSON.stringify(midiNumber)}`);
 }
 const outMidi = process.argv[3] ?? "slashscore-midi-number.png";
-await page.locator("#btn-next").click();
+if (await page.locator("#btn-next").isEnabled()) await page.locator("#btn-next").click();
 await page.waitForTimeout(200);
 await page.screenshot({ path: outMidi, fullPage: false });
 

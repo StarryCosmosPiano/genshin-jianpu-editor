@@ -6,6 +6,7 @@ import { buildPptx } from "./pptx";
 import { isTauriRuntime, saveBytes } from "./fileio";
 import { asset } from "../common/asset";
 import { zipSync } from "fflate";
+import { showMessageDialog } from "../ui/app-dialog";
 
 const SVG_NS = "http://www.w3.org/2000/svg";
 
@@ -504,7 +505,7 @@ export function showExportDialog(app: App): void {
         await fn();
       } catch (e) {
         console.error(e);
-        window.alert(`导出失败：${e instanceof Error ? e.message : String(e)}`);
+        await showMessageDialog("导出失败", e instanceof Error ? e.message : String(e));
       }
     };
     list.append(btn);

@@ -1,0 +1,2 @@
+#score-pane .publication-header { cursor: pointer; pointer-events: bounding-box; }
+#score-pane .publication-header:hover { filter: drop-shadow(0 0 2px #a98dd480); }

@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DOMParser as XmlDomParser } from "@xmldom/xmldom";
 import { Fraction } from "./src/common/fraction";
+import { Point } from "./src/common/geom";
 
 class FakeElement {
   constructor(public tagName = "div") {}
@@ -72,7 +73,7 @@ function check(value: unknown, message: string): asserts value {
   if (!value) throw new Error(message);
 }
 
-const [{ JpwFile }, { fromJpw }, { scoreToJpwabc }, { buildTimeline }, { scoreToMidi }, layoutMod, scoreMod, painterMod, musicXmlMod, smuflMod, slashMod, selectionMod] =
+const [{ JpwFile }, { fromJpw }, { scoreToJpwabc }, { buildTimeline }, { scoreToMidi }, layoutMod, scoreMod, painterMod, musicXmlMod, musicXmlExportMod, smuflMod, slashMod, selectionMod] =
   await Promise.all([
     import("./src/jpword/jpwfile"),
     import("./src/score/jpwimport"),
@@ -83,6 +84,7 @@ const [{ JpwFile }, { fromJpw }, { scoreToJpwabc }, { buildTimeline }, { scoreTo
     import("./src/score/score"),
     import("./src/layout/painter"),
     import("./src/score/musicxml"),
+    import("./src/score/musicxml-export"),
     import("./src/smufl/smufl"),
     import("./src/slashscore"),
     import("./src/editor/note-selection"),
@@ -110,14 +112,98 @@ check(tieFile, "same-pitch tie fixture did not parse");
 const tieScore = fromJpw(tieFile);
 check(tieScore, "same-pitch tie fixture did not import");
 const tieChords = tieScore.parts[0].measures[0].entries.filter((entry) => entry instanceof scoreMod.Chord);
-check(tieChords.length === 4, "tie fixture lost a chord");
-check(tieChords[0].notes[0].tieStart && tieChords[1].notes[0].tieEnd &&
-  tieChords[0].notes[0].tieNext === tieChords[1].notes[0] &&
-  tieChords[1].notes[0].tiePrev === tieChords[0].notes[0],
-"same-pitch parentheses were not restored as a semantic tie");
+check(tieChords.length === 3
+  && tieChords[0].duration?.equals(2)
+  && tieChords[0].beats === 2
+  && tieChords[0].notes.every((note) => !note.tieStart && !note.tieEnd),
+"two aligned tied quarters did not combine into one half note");
 const tieTimeline = buildTimeline(tieScore);
 check(tieTimeline.notes.length === 3 && tieTimeline.notes[0].t0 === 0 && tieTimeline.notes[0].t1 === 2,
   "tied continuation retriggered instead of extending the first sounding note");
+
+// JPW variable-member tuplets keep one shared Tuplet across every member,
+// while each chord retains its own written value and real 3:2 duration.
+for (const [label, body, expectedWritten, expectedActual] of [
+  ["six 32nds", "{(3}1___ 2___ 3___)", [3, 3, 3], [1 / 12, 1 / 12, 1 / 12]],
+  ["8+16+8", "{(3}1_ 2__ 3_)", [1, 2, 1], [1 / 3, 1 / 6, 1 / 3]],
+  ["dotted eighth members", "{(3}1_. 2_. 3_.)", [1, 1, 1], [0.5, 0.5, 0.5]],
+] as const) {
+  const variableTupletFile = JpwFile.fromString(`.Title
+KeyAndMeters = {1=C,4/4}
+.Voice
+${body} 0--- |]
+`);
+  check(variableTupletFile, `${label} JPW fixture did not parse`);
+  const variableScore = fromJpw(variableTupletFile);
+  check(variableScore, `${label} JPW fixture did not import`);
+  const variableChords = variableScore.parts[0].measures[0].entries
+    .filter((entry): entry is InstanceType<typeof scoreMod.Chord> =>
+      entry instanceof scoreMod.Chord && !entry.rest)
+    .slice(0, 3);
+  const variableTuplets = variableChords.map((chord) => chord.notes[0]?.tuplet ?? null);
+  check(variableChords.length === 3
+    && variableTuplets[0] !== null
+    && variableTuplets.every((tuplet) => tuplet === variableTuplets[0])
+    && variableChords.every((chord, index) => chord.beams === expectedWritten[index]
+      && Math.abs((chord.duration?.toFloat() ?? 0) - expectedActual[index]) < 1e-9),
+  `${label} did not preserve one Tuplet and member-specific written/real durations`);
+  const variableRoundTrip = JpwFile.fromString(scoreToJpwabc(variableScore));
+  const reparsedVariable = variableRoundTrip ? fromJpw(variableRoundTrip) : null;
+  const reparsedChords = reparsedVariable?.parts[0]?.measures[0]?.entries
+    .filter((entry): entry is InstanceType<typeof scoreMod.Chord> =>
+      entry instanceof scoreMod.Chord && !entry.rest)
+    .slice(0, 3) ?? [];
+  const reparsedTuplets = reparsedChords.map((chord) => chord.notes[0]?.tuplet ?? null);
+  check(reparsedChords.length === 3
+    && reparsedTuplets[0] !== null
+    && reparsedTuplets.every((tuplet) => tuplet === reparsedTuplets[0])
+    && reparsedChords.every((chord, index) => Math.abs(
+      (chord.duration?.toFloat() ?? 0) - expectedActual[index],
+    ) < 1e-9),
+  `${label} did not survive JPW round-trip`);
+}
+
+// A dotted-eighth member may end a variable tuplet before an ordinary
+// sixteenth continuation begins.  The following 16th must not inherit the
+// preceding Tuplet when the JPW text is serialized and imported again.
+const dottedBoundaryFile = JpwFile.fromString(`.Title
+KeyAndMeters = {1=C,4/4}
+.Voice
+{(3}1_. 2__ 3__) 4__ 0--- |]
+`);
+check(dottedBoundaryFile, "dotted-eighth tuplet boundary fixture did not parse");
+const dottedBoundaryScore = fromJpw(dottedBoundaryFile);
+check(dottedBoundaryScore, "dotted-eighth tuplet boundary fixture did not import");
+const dottedBoundaryChords = dottedBoundaryScore.parts[0].measures[0].entries
+  .filter((entry): entry is InstanceType<typeof scoreMod.Chord> =>
+    entry instanceof scoreMod.Chord && !entry.rest)
+  .slice(0, 4);
+const dottedBoundaryTuplet = dottedBoundaryChords[0]?.notes[0]?.tuplet ?? null;
+check(dottedBoundaryChords.length === 4
+  && dottedBoundaryTuplet !== null
+  && dottedBoundaryChords.slice(0, 3).every((chord) => chord.notes[0]?.tuplet === dottedBoundaryTuplet)
+  && dottedBoundaryChords[3].notes.every((note) => note.tuplet === null)
+  && Math.abs((dottedBoundaryChords[0].duration?.toFloat() ?? 0) - 0.5) < 1e-9
+  && Math.abs((dottedBoundaryChords[1].duration?.toFloat() ?? 0) - 1 / 6) < 1e-9
+  && Math.abs((dottedBoundaryChords[2].duration?.toFloat() ?? 0) - 1 / 6) < 1e-9
+  && Math.abs((dottedBoundaryChords[3].duration?.toFloat() ?? 0) - 0.25) < 1e-9,
+"ordinary sixteenth after a dotted-eighth tuplet boundary inherited Tuplet timing");
+const dottedBoundaryRoundTrip = JpwFile.fromString(scoreToJpwabc(dottedBoundaryScore));
+const reparsedDottedBoundary = dottedBoundaryRoundTrip ? fromJpw(dottedBoundaryRoundTrip) : null;
+const reparsedDottedChords = reparsedDottedBoundary?.parts[0]?.measures[0]?.entries
+  .filter((entry): entry is InstanceType<typeof scoreMod.Chord> =>
+    entry instanceof scoreMod.Chord && !entry.rest)
+  .slice(0, 4) ?? [];
+const reparsedDottedTuplet = reparsedDottedChords[0]?.notes[0]?.tuplet ?? null;
+check(reparsedDottedChords.length === 4
+  && reparsedDottedTuplet !== null
+  && reparsedDottedChords.slice(0, 3).every((chord) => chord.notes[0]?.tuplet === reparsedDottedTuplet)
+  && reparsedDottedChords[3].notes.every((note) => note.tuplet === null)
+  && Math.abs((reparsedDottedChords[0].duration?.toFloat() ?? 0) - 0.5) < 1e-9
+  && Math.abs((reparsedDottedChords[1].duration?.toFloat() ?? 0) - 1 / 6) < 1e-9
+  && Math.abs((reparsedDottedChords[2].duration?.toFloat() ?? 0) - 1 / 6) < 1e-9
+  && Math.abs((reparsedDottedChords[3].duration?.toFloat() ?? 0) - 0.25) < 1e-9,
+"dotted-eighth tuplet boundary was not stable after JPW round-trip");
 
 const tieChainFile = JpwFile.fromString(`.Title
 KeyAndMeters = {1=C,4/4}
@@ -129,13 +215,13 @@ const tieChainScore = fromJpw(tieChainFile);
 check(tieChainScore, "three-chord tie-chain fixture did not import");
 const tieChainChords = tieChainScore.parts[0].measures[0].entries
   .filter((entry): entry is InstanceType<typeof scoreMod.Chord> => entry instanceof scoreMod.Chord);
-check(tieChainChords.length === 4, "three-chord tie-chain fixture lost a chord");
-check(tieChainChords[0].notes.every((note) => note.tieStart && !note.tieEnd) &&
-  tieChainChords[1].notes.every((note) =>
-    note.tieStart && note.tieEnd && note.tiePrev?.chord === tieChainChords[0] &&
-    note.tieNext?.chord === tieChainChords[2]) &&
-  tieChainChords[2].notes.every((note) => note.tieEnd && !note.tieStart),
-"same-pitch slur across three chords was not converted to adjacent tie segments");
+check(tieChainChords.length === 2
+  && tieChainChords[0].duration?.equals(3)
+  && tieChainChords[0].beats === 2
+  && tieChainChords[0].dot === 1
+  && tieChainChords[0].notes.length === 2
+  && tieChainChords[0].notes.every((note) => !note.tieStart && !note.tieEnd),
+"three aligned tied chord attacks did not combine into one dotted-half chord");
 const tieChainTimeline = buildTimeline(tieChainScore);
 const sustainedChainNotes = tieChainTimeline.notes.filter((note) => note.t0 === 0);
 check(sustainedChainNotes.length === 2 && sustainedChainNotes.every((note) => note.t1 === 3),
@@ -145,9 +231,10 @@ const reparsedTieChainFile = JpwFile.fromString(serializedTieChain);
 check(reparsedTieChainFile, "serialized tie chain did not parse");
 const reparsedTieChain = fromJpw(reparsedTieChainFile);
 check(reparsedTieChain?.parts[0].measures[0].entries
-  .filter((entry): entry is InstanceType<typeof scoreMod.Chord> => entry instanceof scoreMod.Chord)[1]
-  ?.notes.every((note) => note.tieStart && note.tieEnd),
-"tie-chain middle continuation was lost after jpwabc round-trip");
+  .filter((entry): entry is InstanceType<typeof scoreMod.Chord> => entry instanceof scoreMod.Chord)[0]
+  ?.duration?.equals(3),
+`dotted-half chord duration was lost after jpwabc round-trip:
+${serializedTieChain}`);
 
 const selectionText = `.Title
 KeyAndMeters = {1=C,4/4}
@@ -202,6 +289,28 @@ check(roundTrip.includes(".Voice.RH") && roundTrip.includes(".Voice.LH"), "round
 check(roundTrip.includes("Instrument = {钢琴}"), "round-trip lost the instrument name");
 check(roundTrip.includes("[5'3'1']") || roundTrip.includes("[1'3'5']"), "round-trip lost chord pitches");
 
+const exportedMusicXml = musicXmlExportMod.scoreToMusicXml(score);
+const exportedMusicXmlPath = join(tmpdir(), "piano-demo-export.musicxml");
+await writeFile(exportedMusicXmlPath, exportedMusicXml, "utf-8");
+check(exportedMusicXml.includes('<score-partwise version="4.0">')
+  && exportedMusicXml.includes('<part id="P1">')
+  && exportedMusicXml.includes('<part id="P2">')
+  && exportedMusicXml.includes("<part-name>钢琴V1</part-name>")
+  && exportedMusicXml.includes("<part-name>钢琴V2</part-name>")
+  && exportedMusicXml.includes('<part-group number="1" type="start">')
+  && exportedMusicXml.includes("<group-symbol>brace</group-symbol>")
+  && exportedMusicXml.includes("<chord/>")
+  && exportedMusicXml.includes("<divisions>1920</divisions>")
+  && exportedMusicXml.includes('<sound tempo="90"/>')
+  && !exportedMusicXml.includes("<print new-"),
+"MusicXML export omitted its portable piano grouping, V1/V2 names, notes or tempo");
+const exportedMusicXmlScore = musicXmlMod.loadMusicXml(exportedMusicXml);
+check(exportedMusicXmlScore.piano
+  && exportedMusicXmlScore.parts.length === 2
+  && exportedMusicXmlScore.parts[0].measures.length === score.parts[0].measures.length
+  && exportedMusicXmlScore.instrumentName === "钢琴",
+"exported MusicXML did not round-trip as the same paired piano score");
+
 const xmlText = await readFile("examples/piano-demo.musicxml", "utf-8");
 check(musicXmlMod.isPianoMusicXml(xmlText), "two-staff MusicXML was not detected as piano");
 const xmlScore = musicXmlMod.loadMusicXml(xmlText);
@@ -219,16 +328,191 @@ check(importedFile, "serialized piano MusicXML did not parse as jpwabc");
 const importedRoundTrip = fromJpw(importedFile);
 check(importedRoundTrip?.piano && importedRoundTrip.parts.length === 2, "MusicXML -> jpwabc round-trip lost piano mode");
 
+const xmlAttackSignature = (candidate: InstanceType<typeof scoreMod.Score>): string[][] =>
+  candidate.parts.map((part) => part.measures.flatMap((measure) =>
+    measure.entries
+      .filter((entry): entry is InstanceType<typeof scoreMod.Chord> =>
+        entry instanceof scoreMod.Chord
+        && !entry.rest
+        && !entry.transparentContinuation)
+      .map((entry) => `${measure.index}:${entry.position.toString()}:${
+        entry.notes.filter((note) => !note.rest && !note.tieEnd)
+          .map((note) => note.pitch)
+          .sort((left, right) => left - right)
+          .join(",")
+      }`)));
+const importedNumberText = slashMod.scoreToSlashScore(
+  xmlScore,
+  "number",
+  16,
+  ".",
+  undefined,
+  xmlScore.parts.length,
+);
+const importedNumberAnalysis = slashMod.analyzeSlashScore(importedNumberText);
+const importedNumberOptions = slashMod.defaultSlashScoreOptions(
+  "number",
+  importedNumberAnalysis,
+);
+importedNumberOptions.voiceCount = xmlScore.parts.length;
+const importedNumberScore = slashMod.parseSlashScore(
+  importedNumberText,
+  importedNumberOptions,
+).score;
+check(JSON.stringify(xmlAttackSignature(importedNumberScore))
+  === JSON.stringify(xmlAttackSignature(xmlScore)),
+"MusicXML backup cursor put lower-staff attacks before zero and lost them only in TXT conversion");
+
+const tempoKeyXml = `<?xml version="1.0" encoding="UTF-8"?>
+<score-partwise version="4.0">
+  <part-list><score-part id="P1"><part-name>Piano</part-name></score-part></part-list>
+  <part id="P1">
+    <measure number="1">
+      <attributes><divisions>2</divisions><key><fifths>0</fifths></key>
+        <time><beats>4</beats><beat-type>4</beat-type></time></attributes>
+      <direction><direction-type><metronome><beat-unit>quarter</beat-unit>
+        <per-minute>72</per-minute></metronome></direction-type><sound tempo="72"/></direction>
+      <note><pitch><step>C</step><octave>4</octave></pitch><duration>8</duration><type>whole</type></note>
+    </measure>
+    <measure number="2">
+      <attributes><divisions>4</divisions><key><fifths>-3</fifths></key></attributes>
+      <direction><direction-type><metronome><beat-unit>quarter</beat-unit>
+        <per-minute>88</per-minute></metronome></direction-type><sound tempo="88"/></direction>
+      <note><pitch><step>E</step><alter>-1</alter><octave>4</octave></pitch>
+        <duration>16</duration><type>whole</type></note>
+    </measure>
+  </part>
+</score-partwise>`;
+const tempoKeyScore = musicXmlMod.loadMusicXml(tempoKeyXml);
+check(tempoKeyScore.tempoBpm === 72
+  && tempoKeyScore.tempoMarks.length === 1
+  && tempoKeyScore.tempoMarks[0].measure === 1
+  && tempoKeyScore.tempoMarks[0].bpm === 88,
+"MusicXML sound/metronome tempo events were not imported");
+check(tempoKeyScore.parts[0].measures[1].duration.equals(4)
+  && tempoKeyScore.parts[0].measures[1].key.fifths === -3
+  && tempoKeyScore.parts[0].measures[1].keyChange,
+"MusicXML per-measure divisions or mid-score key signature was not imported");
+const tempoKeyJpw = scoreToJpwabc(tempoKeyScore);
+check(tempoKeyJpw.includes("KeyChanges = {2=Eb}"),
+  "JPW serialization omitted the conventional 1=Eb key change");
+const tempoKeyJpwScore = fromJpw(JpwFile.fromString(tempoKeyJpw)!);
+check(tempoKeyJpwScore?.parts[0].measures[1].key.fifths === -3
+  && tempoKeyJpwScore.parts[0].measures[1].keyChange
+  && tempoKeyJpwScore.parts[0].measures[1].entries
+    .filter((entry): entry is InstanceType<typeof scoreMod.Chord> => entry instanceof scoreMod.Chord)[0]
+    ?.notes[0].pitch === 63,
+"JPW round-trip lost the key change or changed its absolute pitch");
+const tempoKeyNumber = slashMod.scoreToSlashScore(tempoKeyScore, "number", 16);
+const tempoKeyNumberOptions = slashMod.defaultSlashScoreOptions(
+  "number",
+  slashMod.analyzeSlashScore(tempoKeyNumber),
+);
+tempoKeyNumberOptions.keyChanges = [{ measure: 1, fifths: -3 }];
+const storedTempoKeyNumber = slashMod.embedSlashScoreOptions(
+  tempoKeyNumber,
+  tempoKeyNumberOptions,
+);
+const restoredTempoKeyNumber = slashMod.parseSlashScore(
+  storedTempoKeyNumber,
+  slashMod.defaultSlashScoreOptions(
+    "number",
+    slashMod.analyzeSlashScore(storedTempoKeyNumber),
+  ),
+).score;
+check(restoredTempoKeyNumber.parts[0].measures[1].key.fifths === -3
+  && restoredTempoKeyNumber.parts[0].measures[1].keyChange,
+"keyboard/number TXT settings did not retain the imported key change");
+const tempoKeyExport = musicXmlExportMod.scoreToMusicXml(tempoKeyJpwScore!);
+check(tempoKeyExport.includes("<key><fifths>-3</fifths></key>")
+  && tempoKeyExport.includes('<sound tempo="72"/>')
+  && tempoKeyExport.includes('<sound tempo="88"/>'),
+"MusicXML export omitted the imported key or tempo changes");
+const tempoKeyLayout = new layoutMod.Layout(28);
+tempoKeyLayout.options.smuflMeta = smuflMeta;
+tempoKeyLayout.fromScore(tempoKeyJpwScore!, null, 960, 540);
+const tempoKeySvg = fakeDocument.createElementNS("http://www.w3.org/2000/svg", "svg");
+tempoKeySvg.appendChild(
+  painterMod.renderPageItem(tempoKeyLayout.pages[0]) as unknown as FakeElement,
+);
+check(tempoKeySvg.outerHTML.includes("1=Eb"),
+  "mid-score key change was not printed in the jianpu layout");
+
+const exactKeyXml = `<?xml version="1.0" encoding="UTF-8"?>
+<score-partwise version="4.0">
+  <part-list><score-part id="P1"><part-name>Piano</part-name></score-part></part-list>
+  <part id="P1"><measure number="1">
+    <attributes><divisions>4</divisions><key><fifths>0</fifths></key>
+      <time><beats>4</beats><beat-type>4</beat-type></time></attributes>
+    <note><pitch><step>C</step><octave>4</octave></pitch><duration>4</duration><type>quarter</type></note>
+    <attributes><key><fifths>2</fifths></key></attributes>
+    <note><pitch><step>D</step><octave>4</octave></pitch><duration>12</duration><type>half</type><dot/></note>
+  </measure></part>
+</score-partwise>`;
+const exactKeyScore = musicXmlMod.loadMusicXml(exactKeyXml);
+check(exactKeyScore.keyMarks.length === 1
+  && exactKeyScore.keyMarks[0].measure === 0
+  && exactKeyScore.keyMarks[0].offset.equals(1)
+  && exactKeyScore.keyMarks[0].fifths === 2,
+"MusicXML intra-measure key signature lost its exact offset");
+const exactKeyChords = exactKeyScore.parts[0].measures[0].entries.filter(
+  (entry): entry is InstanceType<typeof scoreMod.Chord> => entry instanceof scoreMod.Chord,
+);
+check(exactKeyChords[0]?.notes[0].number === "1"
+  && exactKeyChords[1]?.notes[0].number === "1",
+"MusicXML notes after an intra-measure key change were not re-spelled in the new key");
+const exactKeyJpw = scoreToJpwabc(exactKeyScore);
+check(exactKeyJpw.includes("KeyChanges = {1@1=D}"),
+"JPW did not serialize a first-measure intra-measure key change exactly");
+const exactKeyExport = musicXmlExportMod.scoreToMusicXml(exactKeyScore);
+const exactKeyRoundTrip = musicXmlMod.loadMusicXml(exactKeyExport);
+check(exactKeyRoundTrip.keyMarks.some((mark) =>
+  mark.measure === 0 && mark.offset.equals(1) && mark.fifths === 2),
+"MusicXML export/re-import lost the intra-measure key signature");
+
+const playbackOrnamentScore = fromJpw(JpwFile.fromString(`.Title
+KeyAndMeters = {1=C,4/4}
+.Voice
+3--- |]
+`)!);
+check(playbackOrnamentScore, "ornament playback fixture did not parse");
+const playbackOrnamentChord = playbackOrnamentScore.parts[0].measures[0].entries.find(
+  (entry): entry is InstanceType<typeof scoreMod.Chord> => entry instanceof scoreMod.Chord,
+)!;
+playbackOrnamentChord.ornaments = [{ kind: "upper-mordent" }];
+const mordentPerformance = buildTimeline(playbackOrnamentScore).notes;
+check(mordentPerformance.length === 3
+  && mordentPerformance[0].pitch === 64
+  && mordentPerformance[1].pitch === 65
+  && mordentPerformance[2].pitch === 64,
+"upper mordent playback did not use the diatonic E-F-E neighbor pattern");
+playbackOrnamentChord.ornaments = [{ kind: "trill", subdivision: 32 }];
+const trillPerformance = buildTimeline(playbackOrnamentScore).notes;
+check(trillPerformance.length >= 30
+  && trillPerformance.slice(0, 6).every((note, index) => note.pitch === (index % 2 === 0 ? 64 : 65)),
+"Tr playback was not divided evenly at the configured 32nd-note grid");
+const ornamentMidi = scoreToMidi(playbackOrnamentScore);
+check(ornamentMidi.length > 100, "MIDI export did not realize the shared ornament performance timeline");
+
 const timeline = buildTimeline(score);
 check(timeline.notes.some((n) => n.part === 0) && timeline.notes.some((n) => n.part === 1), "timeline lost a hand");
 check(timeline.anchors.some((a) => a.chords.length >= 2), "playback cursor is not grouping both hands");
 const midi = scoreToMidi(score);
 check(((midi[10] << 8) | midi[11]) === 3, "MIDI should contain tempo + RH + LH tracks");
+const midiText = new TextDecoder().decode(midi);
+check(midiText.includes("钢琴V1") && midiText.includes("钢琴V2"),
+  "MIDI piano track names were not exported as 钢琴V1 / 钢琴V2");
 
 const layout = new layoutMod.Layout(28);
 layout.options.smuflMeta = smuflMeta;
 layout.fromScore(score, null, 960, 540);
 check(layout.pages.length > 0, "piano layout produced no pages");
+const [shortTieLeft, shortTieRight] = layoutMod.SlurTieBase.calcSlurPoints(
+  new Point(0, 0),
+  new Point(8, 0),
+);
+check(shortTieLeft.y <= -3.9 && shortTieRight.y <= -3.9,
+  "a short tie collapsed into a visually straight segment");
 
 const ornamentFile = JpwFile.fromString(await readFile("examples/ornaments-tempo-demo.jpwabc", "utf-8"));
 check(ornamentFile, "ornament and tempo example did not parse");
@@ -332,10 +616,119 @@ check(
   ) < 1e-6,
   "grace-note curve no longer aims at the vertical middle of the main digit",
 );
+const lowerGraceFile = JpwFile.fromString(`.Title
+KeyAndMeters = {1=C,4/4}
+.Voice
+{2,}3 4 5 6 |]
+`);
+check(lowerGraceFile, "lower-octave grace layout fixture did not parse");
+const lowerGraceScore = fromJpw(lowerGraceFile);
+check(lowerGraceScore, "lower-octave grace layout fixture did not import");
+const lowerGraceLayout = new layoutMod.Layout(28);
+lowerGraceLayout.options.smuflMeta = smuflMeta;
+lowerGraceLayout.fromScore(lowerGraceScore, null, 960, 540);
+let lowerGraceEntry: InstanceType<typeof layoutMod.NoteEntry> | null = null;
+const findLowerGrace = (item: InstanceType<typeof layoutMod.PageItem>): void => {
+  if (item.data instanceof layoutMod.NoteEntry && item.data.chord.graceNotes.length > 0) {
+    lowerGraceEntry = item.data;
+  }
+  for (const child of item.children) findLowerGrace(child as InstanceType<typeof layoutMod.PageItem>);
+};
+for (const page of lowerGraceLayout.pages) findLowerGrace(page);
+const lowerGraceVisual = lowerGraceEntry?.group.children.find((item) =>
+  item.classes.has("jianpu-grace-group"));
+check(lowerGraceEntry?.number && lowerGraceVisual,
+  "lower-octave grace note lost its visual group");
+const lowerGraceMainPosition = lowerGraceEntry.number.pos(lowerGraceEntry.group);
+const lowerGracePosition = lowerGraceVisual.pos(lowerGraceEntry.group);
+check(lowerGracePosition.y + lowerGraceVisual.childrenBound.bottom
+  <= lowerGraceMainPosition.y + lowerGraceEntry.number.bound.top + 0.5,
+"lower-octave grace dots/beams still consume space below the main-note top");
 check((ornamentClassCounts.get("tempo-accel") ?? 0) === 1 &&
   (ornamentClassCounts.get("tempo-rit") ?? 0) === 1 &&
   (ornamentClassCounts.get("tempo-tempo") ?? 0) === 2,
   "piano tempo ramp annotations were missing or duplicated");
+
+const floatingFile = JpwFile.fromString(`.Title
+KeyAndMeters = {1=C,4/4}
+.Voice.RH
+1 2 3 4 | 5 6 7 1' |]
+.Voice.LH
+1, 2, 3, 4, | 5, 6, 7, 1 |]
+`);
+check(floatingFile, "floating-annotation piano fixture did not parse");
+const floatingScore = fromJpw(floatingFile);
+check(floatingScore, "floating-annotation piano fixture did not import");
+const noteXs = (target: InstanceType<typeof layoutMod.Layout>): Map<string, number> => {
+  const positions = new Map<string, number>();
+  const walk = (
+    item: InstanceType<typeof layoutMod.PageItem>,
+    page: InstanceType<typeof layoutMod.Group>,
+  ): void => {
+    if (item.data instanceof layoutMod.NoteEntry && item.data.number) {
+      const entry = item.data;
+      const point = entry.number.pos(page);
+      positions.set(
+        `${entry.sourcePartIndex}:${entry.chord.measure.index}:${entry.chord.position}`,
+        point.x + entry.number.cx,
+      );
+    }
+    for (const child of item.children) walk(child as InstanceType<typeof layoutMod.PageItem>, page);
+  };
+  for (const page of target.pages) walk(page, page);
+  return positions;
+};
+const floatingBaseline = new layoutMod.Layout(28);
+floatingBaseline.options.smuflMeta = smuflMeta;
+floatingBaseline.fromScore(floatingScore, null, 960, 540);
+const baselineXs = noteXs(floatingBaseline);
+const floatingKey = new scoreMod.KeyMark();
+floatingKey.measure = 0;
+floatingKey.offset = new Fraction(1);
+floatingKey.fifths = -3;
+floatingScore.keyMarks.push(floatingKey);
+const floatingText = new scoreMod.ScoreTextMark();
+floatingText.partIndex = 0;
+floatingText.measure = 0;
+floatingText.offset = new Fraction(1);
+floatingText.text = "碰撞测试文字";
+floatingScore.textMarks.push(floatingText);
+const floatingTempo = new scoreMod.TempoMark();
+floatingTempo.measure = 0;
+floatingTempo.offset = new Fraction(1);
+floatingTempo.kind = "tempo";
+floatingTempo.bpm = 111;
+floatingScore.tempoMarks.push(floatingTempo);
+const floatingLayout = new layoutMod.Layout(28);
+floatingLayout.options.smuflMeta = smuflMeta;
+floatingLayout.fromScore(floatingScore, null, 960, 540);
+const markedXs = noteXs(floatingLayout);
+check([...baselineXs].every(([key, x]) => Math.abs((markedXs.get(key) ?? NaN) - x) < 0.01),
+  "key/text annotations still inserted horizontal space into a piano system");
+const floatingBoxes: Array<{ left: number; right: number; top: number; bottom: number }> = [];
+const collectFloating = (
+  item: InstanceType<typeof layoutMod.PageItem>,
+  page: InstanceType<typeof layoutMod.Group>,
+): void => {
+  if (item.classes.has("key-signature-entry")
+    || item.classes.has("score-text-annotation")
+    || item.data === floatingTempo) {
+    const point = item.pos(page);
+    floatingBoxes.push({
+      left: point.x + item.childrenBound.left,
+      right: point.x + item.childrenBound.right,
+      top: point.y + item.childrenBound.top,
+      bottom: point.y + item.childrenBound.bottom,
+    });
+  }
+  for (const child of item.children) collectFloating(child as InstanceType<typeof layoutMod.PageItem>, page);
+};
+for (const page of floatingLayout.pages) collectFloating(page, page);
+check(floatingBoxes.length === 3 && floatingBoxes.every((box, index) =>
+  floatingBoxes.slice(index + 1).every((other) =>
+    box.right <= other.left || other.right <= box.left
+      || box.bottom <= other.top || other.bottom <= box.top)),
+"overlapping key, text and tempo annotations were not raised onto separate tiers");
 
 const nearbySourceTempo = ornamentScore.tempoMarks.find((mark) => mark.kind === "tempo");
 check(nearbySourceTempo, "tempo collision fixture has no concrete tempo mark");
@@ -375,6 +768,36 @@ for (const page of collisionLayout.pages) {
 }
 
 const dottedMeasure = new scoreMod.Measure(0);
+// Long triplet members retain their written half-note values but each has
+// one visible symbol, including a silent member. Ordinary long values still
+// use their usual extension dashes/repeated rest symbols.
+const longTupletFile = JpwFile.fromString(".Title\nKeyAndMeters = {1=C,4/4}\n.Voice\n{(3}5- 0- 0-) |]\n");
+check(longTupletFile, "long triplet glyph fixture did not parse");
+const longTupletScore = fromJpw(longTupletFile);
+check(longTupletScore, "long triplet glyph fixture did not import");
+const longTupletChords = longTupletScore.parts[0].measures[0].entries
+  .filter((entry): entry is InstanceType<typeof scoreMod.Chord> => entry instanceof scoreMod.Chord);
+check(longTupletChords.length === 3 && longTupletChords.every((chord) =>
+  chord.beats === 2 && chord.duration?.equals(new Fraction(4, 3))), "long triplet model timing changed");
+const longTupletEntries: InstanceType<typeof layoutMod.Entry>[] = [];
+for (const chord of longTupletChords) layoutMod.NoteEntry.fromChord(longTupletEntries, chord, 0, layout.options);
+check(longTupletEntries.length === 3 && longTupletEntries.map((entry) =>
+  entry instanceof layoutMod.NoteEntry ? entry.number?.text : "").join(" ") === "5 0 0",
+"long triplet rendered extra extension symbols instead of 5 0 0");
+for (const rest of [false, true]) {
+  const ordinary = new scoreMod.Chord(dottedMeasure);
+  ordinary.beats = 4;
+  ordinary.rest = rest;
+  const note = new scoreMod.Note(ordinary);
+  note.number = rest ? "0" : "5";
+  note.rest = rest;
+  ordinary.add(note);
+  const entries: InstanceType<typeof layoutMod.Entry>[] = [];
+  layoutMod.NoteEntry.fromChord(entries, ordinary, 0, layout.options);
+  check(entries.length === 4 && entries.map((entry) =>
+    entry instanceof layoutMod.NoteEntry ? entry.number?.text : "").join(" ") === (rest ? "0 0 0 0" : "5 - - -"),
+  "ordinary whole-note/rest extension symbols changed");
+}
 const dottedChord = new scoreMod.Chord(dottedMeasure);
 dottedChord.beats = 1;
 dottedChord.dot = 1;
@@ -391,11 +814,28 @@ check(dottedEntry instanceof layoutMod.NoteEntry && dottedEntry.numbers.length =
 check(dottedEntry.numbers.every((number) => number.text.endsWith("·")),
   "augmentation dot was not rendered after every chord tone");
 
+const tieColorMeasure = new scoreMod.Measure(0);
+const tieColorChords = ["5", "5", "5"].map((number) => {
+  const chord = new scoreMod.Chord(tieColorMeasure);
+  chord.beats = 1;
+  const note = new scoreMod.Note(chord);
+  note.number = number;
+  chord.add(note);
+  return chord;
+});
+for (let index = 0; index < tieColorChords.length - 1; index++) {
+  const current = tieColorChords[index].notes[0];
+  const next = tieColorChords[index + 1].notes[0];
+  current.tieStart = true;
+  current.tieNext = next;
+  next.tieEnd = true;
+  next.tiePrev = current;
+}
 const tieColorOptions = new layoutMod.LayoutOptions(28);
 tieColorOptions.smuflMeta = smuflMeta;
 tieColorOptions.applyEngravingStyle({ tieContinuationGray: true });
 const grayTieEntries: InstanceType<typeof layoutMod.Entry>[] = [];
-layoutMod.NoteEntry.fromChord(grayTieEntries, tieChords[1], 0, tieColorOptions);
+layoutMod.NoteEntry.fromChord(grayTieEntries, tieColorChords[1], 0, tieColorOptions);
 const grayTieEntry = grayTieEntries[0];
 check(grayTieEntry instanceof layoutMod.NoteEntry && grayTieEntry.number,
   "tie destination did not create a numbered entry");
@@ -404,12 +844,12 @@ check(((grayTieEntry.number.color >>> 24) & 0xff) === 0xff && grayChannel > 0 &&
   "enabled tie continuation style did not render the destination as opaque gray");
 tieColorOptions.applyEngravingStyle({ tieContinuationGray: false });
 const blackTieEntries: InstanceType<typeof layoutMod.Entry>[] = [];
-layoutMod.NoteEntry.fromChord(blackTieEntries, tieChords[1], 0, tieColorOptions);
+layoutMod.NoteEntry.fromChord(blackTieEntries, tieColorChords[1], 0, tieColorOptions);
 const blackTieEntry = blackTieEntries[0];
 check(blackTieEntry instanceof layoutMod.NoteEntry && blackTieEntry.number?.color === tieColorOptions.color,
   "disabling tie continuation gray did not restore the normal score color");
 tieColorOptions.applyEngravingStyle({ tieContinuationGray: true });
-for (const chord of tieChainChords.slice(1, 3)) {
+for (const chord of tieColorChords.slice(1)) {
   const continuationEntries: InstanceType<typeof layoutMod.Entry>[] = [];
   layoutMod.NoteEntry.fromChord(continuationEntries, chord, 0, tieColorOptions);
   const continuationEntry = continuationEntries[0];
@@ -444,7 +884,7 @@ const wideAccidentalGap = accidentalGap(3);
 check(wideAccidentalGap > narrowAccidentalGap + 1,
   "accidental-to-number spacing control did not affect production layout geometry");
 
-let pianoSystems = 0, stackedEntries = 0, braceGlyphs = 0, instrumentLabels = 0, obsoleteHandLabels = 0;
+let pianoSystems = 0, stackedEntries = 0, bracePaths = 0, instrumentLabels = 0, obsoleteHandLabels = 0;
 const renderedNotes: InstanceType<typeof layoutMod.NoteEntry>[] = [];
 const renderedSystems: InstanceType<typeof layoutMod.Group>[] = [];
 const renderedText: InstanceType<typeof layoutMod.TextFrame>[] = [];
@@ -453,7 +893,7 @@ const walk = (item: InstanceType<typeof layoutMod.PageItem>): void => {
     pianoSystems++;
     renderedSystems.push(item as InstanceType<typeof layoutMod.Group>);
   }
-  if (item instanceof layoutMod.TextFrame && item.text === String.fromCharCode(0xe000)) braceGlyphs++;
+  if (item instanceof layoutMod.GraphicPath && item.classes.has("piano-brace-path")) bracePaths++;
   if (item instanceof layoutMod.TextFrame) renderedText.push(item);
   if (item instanceof layoutMod.TextFrame && item.text === "钢琴") instrumentLabels++;
   if (item instanceof layoutMod.TextFrame && (item.text === "右手" || item.text === "左手")) obsoleteHandLabels++;
@@ -466,7 +906,7 @@ const walk = (item: InstanceType<typeof layoutMod.PageItem>): void => {
 for (const page of layout.pages) walk(page);
 check(pianoSystems > 0, "paired piano systems were not created");
 check(stackedEntries > 0, "stacked chord was not rendered as numbered rows");
-check(braceGlyphs === pianoSystems, "piano systems are not using one standard SMuFL brace each");
+check(bracePaths === pianoSystems, "piano systems are not using one filled staff brace each");
 check(instrumentLabels === 1, "instrument name must appear on the first piano system only");
 check(obsoleteHandLabels === 0, "obsolete right/left hand labels are still rendered");
 const instrumentFrame = renderedText.find((item) => item.text === "钢琴");
@@ -532,20 +972,20 @@ check(Math.abs(controlledFirstSystem.y - controlledMeta.y
   - headerControlLayout.options.numberSize * 2.3) < 0.01,
 "first-system distance from key/meter/tempo metadata does not match the selected control");
 
-const braceGlyphOf = (system: InstanceType<typeof layoutMod.Group>): InstanceType<typeof layoutMod.TextFrame> | null => {
-  let found: InstanceType<typeof layoutMod.TextFrame> | null = null;
+const bracePathOf = (system: InstanceType<typeof layoutMod.Group>): InstanceType<typeof layoutMod.GraphicPath> | null => {
+  let found: InstanceType<typeof layoutMod.GraphicPath> | null = null;
   const find = (item: InstanceType<typeof layoutMod.PageItem>): void => {
-    if (item instanceof layoutMod.TextFrame && item.text === String.fromCharCode(0xe000)) found = item;
+    if (item instanceof layoutMod.GraphicPath && item.classes.has("piano-brace-path")) found = item;
     for (const child of item.children) find(child as InstanceType<typeof layoutMod.PageItem>);
   };
   find(system);
   return found;
 };
 if (renderedSystems.length > 1) {
-  const continuationBrace = braceGlyphOf(renderedSystems[1]);
+  const continuationBrace = bracePathOf(renderedSystems[1]);
   check(continuationBrace?.parent, "continuation piano system lost its brace");
   const labelLeft = instrumentFrame.pos(renderedSystems[0]).x;
-  const braceLeft = continuationBrace.parent.pos(renderedSystems[1]).x - continuationBrace.strokeWidth / 2;
+  const braceLeft = continuationBrace.pos(renderedSystems[1]).x;
   check(Math.abs(labelLeft - braceLeft) < 0.1, `continuation brace does not align with the first instrument-name character (${labelLeft} vs ${braceLeft})`);
 }
 let braceAlignedMeasureNumbers = 0;
@@ -553,9 +993,9 @@ for (const system of renderedSystems) {
   const label = system.children.find((item): item is InstanceType<typeof layoutMod.TextFrame> =>
     item instanceof layoutMod.TextFrame && item.classes.has("measure-number"));
   if (!label) continue;
-  const brace = braceGlyphOf(system);
+  const brace = bracePathOf(system);
   check(brace?.parent, "numbered piano system lost its brace");
-  const braceLeft = brace.parent.pos(system).x - brace.strokeWidth / 2;
+  const braceLeft = brace.pos(system).x;
   check(Math.abs(label.pos(system).x - braceLeft) < 0.1,
     "piano measure number is not aligned with the brace's left edge");
   braceAlignedMeasureNumbers++;
@@ -609,40 +1049,21 @@ check(distantOwnerDot.ownerGap > closeOwnerDot.ownerGap + 0.5,
   "octave-dot owner-distance control did not affect the real note geometry");
 check(wideNeighbourGap.neighbourGap > narrowNeighbourGap.neighbourGap + 1,
   "octave-dot adjacent-tone clearance control did not affect chord-row geometry");
-let matchedFullHeightBarlines = 0;
 for (const system of renderedSystems) {
   const directLines = system.children.filter((item): item is InstanceType<typeof layoutMod.GraphicLine> => item instanceof layoutMod.GraphicLine);
   const connectors = directLines.filter((line) => line.classes.has("piano-barline-connector"));
-  const nestedLines: InstanceType<typeof layoutMod.GraphicLine>[] = [];
+  check(connectors.length === 0 && directLines.every((line) => !line.classes.has("piano-barline-extension")),
+    "barline connections must be off by default");
   const numbers: InstanceType<typeof layoutMod.JpNumber>[] = [];
   const collect = (item: InstanceType<typeof layoutMod.PageItem>): void => {
-    if (item !== system && item instanceof layoutMod.GraphicLine && item.parent !== system) nestedLines.push(item);
     if (item instanceof layoutMod.JpNumber) numbers.push(item);
     for (const child of item.children) collect(child as InstanceType<typeof layoutMod.PageItem>);
   };
   collect(system);
-  for (const connector of connectors) {
-    const x = connector.pos(system).x;
-    const nearest = Math.min(...nestedLines.map((line) => Math.abs(line.pos(system).x - x)));
-    check(nearest < 0.01, "between-hand connector is not centered on the local barline");
-  }
   const systemLeft = directLines.find((line) => line.classes.has("piano-system-left"));
   check(systemLeft && numbers.length > 0, "piano system left edge or numbers are missing");
   const firstNumberX = Math.min(...numbers.map((number) => number.pos(system).x));
   check(firstNumberX - systemLeft.pos(system).x > layout.options.numberSize * 0.4, "left system line is too close to the first number");
-  const allLines = [...directLines, ...nestedLines];
-  const systemTop = systemLeft.pos(system).y;
-  const systemBottom = systemTop + systemLeft.height;
-  for (const connector of connectors) {
-    const x = connector.pos(system).x;
-    const segments = allLines.filter((line) =>
-      line.height > line.width && Math.abs(line.pos(system).x - x) < 0.01);
-    const top = Math.min(...segments.map((line) => line.pos(system).y));
-    const bottom = Math.max(...segments.map((line) => line.pos(system).y + line.height));
-    check(Math.abs(top - systemTop) < 0.01 && Math.abs(bottom - systemBottom) < 0.01,
-      "measure barline does not share the brace-side system line height");
-    matchedFullHeightBarlines++;
-  }
 }
 
 const uniformFile = JpwFile.fromString(`.Title
@@ -693,9 +1114,41 @@ customLayout.options.applyEngravingStyle({
   chordRowGap: 1.05,
   braceStrokeWidth: 2.4,
   pianoConnectorScale: 1.2,
+  connectBarlines: true,
   finalBarlineWidth: 5,
 });
 customLayout.fromScore(score, null, 960, 540);
+let matchedFullHeightBarlines = 0;
+const verifyConnectedSystem = (system: InstanceType<typeof layoutMod.Group>): void => {
+  const directLines = system.children.filter((item): item is InstanceType<typeof layoutMod.GraphicLine> =>
+    item instanceof layoutMod.GraphicLine);
+  const localLines: InstanceType<typeof layoutMod.GraphicLine>[] = [];
+  const collect = (item: InstanceType<typeof layoutMod.PageItem>): void => {
+    if (item instanceof layoutMod.GraphicLine && item.parent?.data instanceof layoutMod.Barline) localLines.push(item);
+    for (const child of item.children) collect(child as InstanceType<typeof layoutMod.PageItem>);
+  };
+  collect(system);
+  const systemLeft = directLines.find((line) => line.classes.has("piano-system-left"));
+  check(systemLeft, "enabled piano system lost its left line");
+  for (const connector of directLines.filter((line) => line.classes.has("piano-barline-connector"))) {
+    const x = connector.pos(system).x;
+    const segments = [...directLines, ...localLines].filter((line) =>
+      line.height > line.width && Math.abs(line.pos(system).x - x) < 0.01);
+    check(localLines.some((line) => Math.abs(line.pos(system).x - x) < 0.01),
+      "between-hand connector is not centered on a local barline");
+    const top = Math.min(...segments.map((line) => line.pos(system).y));
+    const bottom = Math.max(...segments.map((line) => line.pos(system).y + line.height));
+    check(Math.abs(top - systemLeft.pos(system).y) < 0.01
+      && Math.abs(bottom - systemLeft.pos(system).y - systemLeft.height) < 0.01,
+    "connected measure barline does not reach both brace-side system limits");
+    matchedFullHeightBarlines++;
+  }
+};
+const walkConnectedSystems = (item: InstanceType<typeof layoutMod.PageItem>): void => {
+  if (item instanceof layoutMod.Group && item.classes.has("piano-system")) verifyConnectedSystem(item);
+  for (const child of item.children) walkConnectedSystems(child as InstanceType<typeof layoutMod.PageItem>);
+};
+for (const page of customLayout.pages) walkConnectedSystems(page);
 let customFinalSegments = 0, customConnectorSegments = 0, boldNumbers = 0, customBraceWeight = 0;
 const walkCustom = (item: InstanceType<typeof layoutMod.PageItem>): void => {
   if (item instanceof layoutMod.GraphicLine) {
@@ -703,9 +1156,8 @@ const walkCustom = (item: InstanceType<typeof layoutMod.PageItem>): void => {
     if (Math.abs(item.strokeWidth - 6) < 0.001) customConnectorSegments++;
   }
   if (item instanceof layoutMod.JpNumber && item.font.bold) boldNumbers++;
-  if (item instanceof layoutMod.SmuflText && item.text === String.fromCharCode(0xe000)) {
-    customBraceWeight = item.strokeWidth;
-    check(item.nonScalingStroke, "brace weight is being scaled with brace geometry");
+  if (item instanceof layoutMod.GraphicPath && item.classes.has("piano-brace-path")) {
+    customBraceWeight = item.segs[3].pts[2];
   }
   for (const child of item.children) walkCustom(child as InstanceType<typeof layoutMod.PageItem>);
 };
@@ -713,28 +1165,28 @@ for (const page of customLayout.pages) walkCustom(page);
 check(customFinalSegments >= 4, "custom final double-bar thickness was not applied");
 check(customConnectorSegments >= 2, "custom between-hand connector thickness was not applied");
 check(boldNumbers > 0, "custom bold number style was not applied");
-check(Math.abs(customBraceWeight - 2.4) < 0.001, "custom brace weight was not applied to the actual SMuFL glyph");
+check(customBraceWeight > 1, "custom brace weight was not applied to the filled path");
 
-const braceMetrics = (widthScale: number, strokeWidth: number): { outerWidth: number; strokeWidth: number } => {
+const braceMetrics = (widthScale: number, strokeWidth: number): { outerWidth: number; quarterThickness: number } => {
   const target = new layoutMod.Layout(28);
   target.options.smuflMeta = smuflMeta;
   target.options.applyEngravingStyle({ braceWidthScale: widthScale, braceStrokeWidth: strokeWidth });
   target.fromScore(score, null, 960, 540);
   const groups: InstanceType<typeof layoutMod.Group>[] = [];
-  const glyphs: InstanceType<typeof layoutMod.SmuflText>[] = [];
+  const paths: InstanceType<typeof layoutMod.GraphicPath>[] = [];
   const find = (item: InstanceType<typeof layoutMod.PageItem>): void => {
     if (item instanceof layoutMod.Group && item.classes.has("piano-brace")) groups.push(item);
-    if (item instanceof layoutMod.SmuflText && item.classes.has("piano-brace-glyph")) glyphs.push(item);
+    if (item instanceof layoutMod.GraphicPath && item.classes.has("piano-brace-path")) paths.push(item);
     for (const child of item.children) find(child as InstanceType<typeof layoutMod.PageItem>);
   };
   for (const page of target.pages) find(page);
-  check(groups[0] && glyphs[0], "brace geometry fixture did not render a brace");
-  const box = smuflMeta.getBBox(String.fromCharCode(0xe000));
-  check(box, "brace metadata bounding box is missing");
-  const baseWidth = Math.max(0.1, (box.bBoxNE[0] - box.bBoxSW[0]) * target.options.smuflFont.size / 4);
+  check(groups[0] && paths[0], "brace geometry fixture did not render a brace");
+  const path = paths[0];
+  check(path.fill && !path.stroke && path.segs.filter((seg) => seg.op === "Z").length === 2,
+    "staff brace must be a tapered, filled two-lobe path");
   return {
-    outerWidth: groups[0].matrix.mat[0] * baseWidth + glyphs[0].strokeWidth,
-    strokeWidth: glyphs[0].strokeWidth,
+    outerWidth: path.width,
+    quarterThickness: path.segs[3].pts[2] - path.segs[1].pts[4],
   };
 };
 const narrowBrace = braceMetrics(0.5, 1.6);
@@ -743,19 +1195,81 @@ const thinBrace = braceMetrics(1, 0.5);
 const thickBrace = braceMetrics(1, 5);
 check(wideBrace.outerWidth > narrowBrace.outerWidth * 4,
   "brace width slider is still being swallowed by a fixed minimum width");
-check(Math.abs(thinBrace.outerWidth - thickBrace.outerWidth) < 0.05 && thickBrace.strokeWidth > thinBrace.strokeWidth * 9,
+check(Math.abs(thinBrace.outerWidth - thickBrace.outerWidth) < 0.05
+  && thickBrace.quarterThickness > thinBrace.quarterThickness * 2.5,
   "brace width and weight controls are not independent");
 const pianoGuideLayout = new layoutMod.Layout(28);
 pianoGuideLayout.options.smuflMeta = smuflMeta;
 pianoGuideLayout.options.applyEngravingStyle({ rhythmGuideEnabled: true, rhythmGuideDivision: 4 });
 pianoGuideLayout.fromScore(score, null, 960, 540);
 let pianoGuideLines = 0;
-const walkPianoGuide = (item: InstanceType<typeof layoutMod.PageItem>): void => {
+const pianoGuideTicks = new Map<string, number[]>();
+const walkPianoGuide = (
+  item: InstanceType<typeof layoutMod.PageItem>,
+  page: InstanceType<typeof layoutMod.Group>,
+  pageIndex: number,
+): void => {
   if (item.classes.has("rhythm-guide-line")) pianoGuideLines++;
-  for (const child of item.children) walkPianoGuide(child as InstanceType<typeof layoutMod.PageItem>);
+  if (item.classes.has("rhythm-guide-tick")) {
+    const measureClass = [...item.classes].find((name) => name.startsWith("rhythm-guide-measure-"));
+    const measure = measureClass?.slice("rhythm-guide-measure-".length);
+    if (measure !== undefined) {
+      const key = `${pageIndex}:${measure}`;
+      const ticks = pianoGuideTicks.get(key) ?? [];
+      // renderPageItem applies the page root transform as well as the item's
+      // local position; input spans are expressed in those SVG/viewBox
+      // coordinates so compare like with like.
+      ticks.push(page.x + item.pos(page).x);
+      pianoGuideTicks.set(key, ticks);
+    }
+  }
+  for (const child of item.children) {
+    walkPianoGuide(child as InstanceType<typeof layoutMod.PageItem>, page, pageIndex);
+  }
 };
-for (const page of pianoGuideLayout.pages) walkPianoGuide(page);
+for (let pageIndex = 0; pageIndex < pianoGuideLayout.pages.length; pageIndex++) {
+  const page = pianoGuideLayout.pages[pageIndex];
+  walkPianoGuide(page, page, pageIndex);
+}
 check(pianoGuideLines >= 1, "paired piano score did not receive its shared lower rhythm guide");
+const pianoGuideSpans = pianoGuideLayout.rhythmInputSpans
+  .filter((span) => span.partIndexes.join(",") === "0,1");
+check(pianoGuideSpans.length > 0 && pianoGuideSpans.every((span) => (span.gridAnchors?.length ?? 0) > 0),
+  "paired piano input spans did not retain the ruler's complete tick coordinates");
+for (const span of pianoGuideSpans) {
+  const visible = pianoGuideTicks.get(`${span.pageIndex}:${span.measureIndex}`) ?? [];
+  check(span.gridAnchors!.every((anchor) =>
+    visible.some((x) => Math.abs(x - anchor.x) < 0.01)),
+  "paired piano input grid is not centered on the visible shared rhythm ruler");
+}
+const lowerTextMark = new scoreMod.ScoreTextMark();
+lowerTextMark.partIndex = 1;
+lowerTextMark.measure = 0;
+lowerTextMark.offset = new Fraction(0);
+lowerTextMark.text = "左手文本";
+score.textMarks.push(lowerTextMark);
+const lowerTextLayout = new layoutMod.Layout(28);
+lowerTextLayout.options.smuflMeta = smuflMeta;
+lowerTextLayout.fromScore(score, null, 960, 540);
+let lowerTextRendered = false;
+const findLowerText = (item: InstanceType<typeof layoutMod.PageItem>): void => {
+  if (item.classes.has("score-text-annotation") && item.data === lowerTextMark) {
+    lowerTextRendered = true;
+  }
+  for (const child of item.children) findLowerText(child as InstanceType<typeof layoutMod.PageItem>);
+};
+for (const page of lowerTextLayout.pages) findLowerText(page);
+score.textMarks = score.textMarks.filter((mark) => mark !== lowerTextMark);
+check(lowerTextRendered, "right-click text annotation on the lower piano staff was not rendered");
+const pianoHitLayout = new layoutMod.Layout(28);
+pianoHitLayout.options.smuflMeta = smuflMeta;
+pianoHitLayout.options.applyEngravingStyle({ rhythmGuideEnabled: false });
+pianoHitLayout.fromScore(score, null, 960, 540);
+const pianoInputSpans = pianoHitLayout.rhythmInputSpans;
+check(pianoInputSpans.length > 0
+  && pianoInputSpans.some((span) => span.partIndexes.join(",") === "0,1")
+  && pianoInputSpans.every((span) => span.xEnd >= span.xStart && span.yBottom >= span.yTop && span.division >= 4),
+"paired piano input spans were not generated when the rhythm guide was disabled");
 const legacyLayout = new layoutMod.Layout(28);
 legacyLayout.options.smuflMeta = smuflMeta;
 legacyLayout.fromScore(legacyScore, null, 960, 540);
@@ -1006,8 +1520,17 @@ ${ensembleVoice("5'")}
 check(ensembleFile, "ensemble layout fixture did not parse");
 const ensembleScore = fromJpw(ensembleFile);
 check(ensembleScore?.ensemble && ensembleScore.parts.length === 3, "ensemble layout fixture lost its voices");
+const ensembleMusicXml = musicXmlExportMod.scoreToMusicXml(ensembleScore);
+const importedEnsembleMusicXml = musicXmlMod.loadMusicXml(ensembleMusicXml);
+check(importedEnsembleMusicXml.ensemble
+  && importedEnsembleMusicXml.parts.length === 3
+  && importedEnsembleMusicXml.parts.map((part) =>
+    `${part.instrumentName}:V${part.voiceIndex}`).join("|")
+    === "钢琴:V1|钢琴:V2|小提琴:V1",
+"multi-part MusicXML import did not preserve every instrument and voice");
 const ensembleLayout = new layoutMod.Layout(28);
 ensembleLayout.options.smuflMeta = smuflMeta;
+ensembleLayout.options.applyEngravingStyle({ connectBarlines: true });
 ensembleLayout.fromScore(ensembleScore, null, 595, 842);
 const ensembleSystems = ensembleLayout.pages.flatMap((page) =>
   page.children.filter((item) => item.classes.has("ensemble-system")));
@@ -1044,7 +1567,28 @@ for (const system of ensembleSystems) {
     Math.abs(hook.x - (bracketLines[0].x - bracketLines[0].strokeWidth / 2)) < 1e-8),
   "ensemble bracket hook left edges do not align with the vertical stroke");
   ensembleHooks += bracketHooks.length;
-  ensembleConnectors += system.children.filter((item) => item.classes.has("ensemble-barline-connector")).length;
+  const connectors = system.children.filter((item): item is InstanceType<typeof layoutMod.GraphicLine> =>
+    item instanceof layoutMod.GraphicLine && item.classes.has("ensemble-barline-connector"));
+  const rowBarlines = rows.slice(0, 2).map((row) => {
+    const bars: InstanceType<typeof layoutMod.GraphicLine>[] = [];
+    const collect = (item: InstanceType<typeof layoutMod.PageItem>): void => {
+      if (item instanceof layoutMod.GraphicLine && item.parent?.data instanceof layoutMod.Barline) bars.push(item);
+      for (const child of item.children) collect(child as InstanceType<typeof layoutMod.PageItem>);
+    };
+    collect(row);
+    return bars;
+  });
+  for (const connector of connectors) {
+    const x = connector.pos(system).x;
+    const top = connector.pos(system).y;
+    const bottom = top + connector.height;
+    check(rowBarlines[0].some((line) => Math.abs(line.pos(system).x - x) < 0.01
+      && Math.abs(line.pos(system).y + line.height - top) < 0.01)
+      && rowBarlines[1].some((line) => Math.abs(line.pos(system).x - x) < 0.01
+        && Math.abs(line.pos(system).y - bottom) < 0.01),
+    "ensemble connector must join matching local barline ends");
+  }
+  ensembleConnectors += connectors.length;
 }
 check(ensembleBrackets === ensembleSystems.length && ensembleHooks === ensembleSystems.length * 2,
   "ensemble bracket or its right-angle hooks are missing");
@@ -1074,6 +1618,8 @@ for (const system of oneInstrumentSystems) {
   check(system.children.every((item) =>
     !item.classes.has("ensemble-bracket") && !item.classes.has("ensemble-bracket-hook")),
   "single-instrument ensemble must not draw the outer square bracket");
+  check(system.children.every((item) => !item.classes.has("ensemble-barline-connector")),
+    "ensemble barline connections must be off by default");
 }
 
 const svg = new FakeElement("svg");
@@ -1130,6 +1676,8 @@ console.log(JSON.stringify({
   },
   midiTracks: (midi[10] << 8) | midi[11],
   musicXmlParts: xmlScore.parts.length,
+  exportedMusicXmlBytes: new TextEncoder().encode(exportedMusicXml).byteLength,
+  exportedMusicXml: exportedMusicXmlPath,
   svg: svgPath,
   slashSvg: slashSvgPath,
   partialArpeggioSvg: partialArpeggioSvgPath,

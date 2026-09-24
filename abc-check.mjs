@@ -5,13 +5,14 @@
 import { createServer } from "node:http";
 import { readFile, writeFile, mkdtemp } from "node:fs/promises";
 import { extname, join, normalize } from "node:path";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
 import { chromium } from "playwright";
 
-const ORIG = join(process.env.HOME, "proj/zanmeigepu/abc2xml.py");
-const ZANMEI = join(process.env.HOME, "proj/zanmeigepu/zanmeigepu_score.abc");
-const ZANMEI_GOLD = join(process.env.HOME, "proj/zanmeigepu/zanmeigepu_score.xml");
+const HOME = process.env.HOME || process.env.USERPROFILE || homedir();
+const ORIG = join(HOME, "proj/zanmeigepu/abc2xml.py");
+const ZANMEI = join(HOME, "proj/zanmeigepu/zanmeigepu_score.abc");
+const ZANMEI_GOLD = join(HOME, "proj/zanmeigepu/zanmeigepu_score.xml");
 
 // fixtures: [name, abcTextOrPath]. `gold` = compare full output (with page credits) to that xml
 // (the published zanmeigepu file = abc2xml + download_score.py post-processing).
@@ -79,17 +80,35 @@ await page.waitForTimeout(500);
 let fail = 0;
 const tmp = await mkdtemp(join(tmpdir(), "abc-check-"));
 for (const [name, src] of FIXTURES) {
-  const abc = src.path ? await readFile(src.path, "utf-8") : src.text;
+  let abc;
+  if (src.path) {
+    try {
+      abc = await readFile(src.path, "utf-8");
+    } catch {
+      console.log(`SKIP  ${name}: optional external fixture is unavailable`);
+      continue;
+    }
+  } else {
+    abc = src.text;
+  }
   const mine = await page.evaluate(async (a) => (await window.__abc2musicxml).abcToMusicXml(a), abc);
   if (!mine || !mine.includes("<score-partwise>")) { console.log(`FAIL  ${name}: no score-partwise output`); fail++; continue; }
   const nMeasure = (mine.match(/<measure /g) || []).length;
   // ref = the published golden xml (abc2xml + post-process) when given, else raw python abc2xml.py
   let ref, refWhat;
-  if (src.gold) { ref = await readFile(src.gold, "utf-8"); refWhat = "golden xml (abc2xml + credits)"; }
-  else if (havePy) {
+  if (src.gold) {
+    try {
+      ref = await readFile(src.gold, "utf-8");
+      refWhat = "golden xml (abc2xml + credits)";
+    } catch {
+      ref = undefined;
+    }
+  }
+  if (!ref && havePy) {
     const abcFile = join(tmp, "in.abc"); await writeFile(abcFile, abc);
     ref = spawnSync("python3", [ORIG, abcFile], { encoding: "utf-8" }).stdout; refWhat = "abc2xml.py";
-  } else { console.log(`ok?   ${name}: ${nMeasure} measures (no ref to diff)`); continue; }
+  }
+  if (!ref) { console.log(`ok?   ${name}: ${nMeasure} measures (no ref to diff)`); continue; }
   const d = diffClusters(mine, ref);
   if (d.clusters === 0 && d.tail === 0) console.log(`PASS  ${name}: byte-identical to ${refWhat} (${d.na} tokens, ${nMeasure} measures)`);
   else { console.log(`FAIL  ${name}: ${d.clusters} diff clusters, tail ${d.tail} (mine ${d.na} / ref ${d.nb})`); d.samples.forEach((s) => console.log("      " + s)); fail++; }

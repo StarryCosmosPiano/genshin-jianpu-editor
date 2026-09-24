@@ -13,11 +13,12 @@
   **不需要原生字体测量**，不需要 CanvasKit，不需要 DPI 位图缩放。
   - `Path.computeTightBounds()` → `pathTightBounds(d)`（临时 `<path>`.getBBox）
   - `font.measureText()` → `measureGlyphText()`（`<text>`.getComputedTextLength）
-- **MusicXML 已放弃 JAXB**，导入改为 Rust 后端解析 → 输出 `.jpwabc`（Phase 5，未做）。
-  因此 `src/score/score.ts` 里 **故意省略** 所有 MusicXML 导入方法（Score.load /
-  Part.load / Measure.load / Note.load / parse*）。**IDML 导出已彻底放弃。**
-- **逻辑分层**：排版/渲染/模型/编辑全在前端 TS；Rust 只做文件 I/O、对话框，以及（计划中的）
-  MusicXML 解析、PPTX/MIDI 打包导出。
+- **MusicXML 已放弃 JAXB**。普通简谱导入/导出由前端 `src/score/musicxml.ts` 和
+  `src/score/musicxml-export.ts` 完成；`src/mixed/` 保留独立的五线谱混排模型。
+  `src/score/score.ts` 故意不包含旧 JAXB 风格的 `Score.load/Part.load/...` 方法。
+  **IDML 导出已彻底放弃。**
+- **逻辑分层**：排版/渲染/模型/编辑/格式转换主要在前端 TS；Rust 承接 Tauri 文件能力、
+  SVG/PDF、原生 ONNX OCR、Gemini 命令和 macOS MIDI 播放。
 
 ## 命令
 
@@ -25,6 +26,8 @@
 npm run dev            # Vite 开发服务器
 npm run build          # tsc 严格检查 + vite 打包
 npx tsc --noEmit       # 仅类型检查（CI 用）
+npm run check:core     # 格式/排版/钢琴/MIDI/文本谱核心回归
+npm run check:all      # 核心回归 + Edge 浏览器端回归
 npm run tauri dev      # 跑 Tauri 桌面应用（需 Rust）
 cd src-tauri && cargo check   # 仅检查 Rust 侧
 
@@ -56,7 +59,9 @@ npm run build && node abc-shot.mjs <abc> /tmp/abc.png  # 拖入 .abc 端到端�
   （Write 工具会损坏这些字节）。
 - `src/jpword/tokens.ts` — `TokenData` 分词器，仅用于编辑器语法高亮（非语义解析）。
 - `src/editor/` — `app.ts`（编辑器↔实时重排↔翻页↔文件 I/O 控制器）、`highlight.ts`
-  （CodeMirror 装饰）、`fileio.ts`（UTF-16LE 编解码 + Tauri 运行时探测）。
+  （CodeMirror 装饰）、`file-format.ts`（共享扩展名注册）、`document-parser.ts`（实时解析边界）、
+  `fileio.ts`（UTF-16LE 编解码 + Tauri 运行时探测）。
+- `src/bootstrap/` — 默认示例、拖拽和缩放等平台/UI 启动适配层；`main.ts` 只编排启动顺序。
 - `src/jpword/parser/` — **ANTLR 生成代码，勿手改**，每个文件首行 `// @ts-nocheck`。
 
 ## 与原 Kotlin 的对应
@@ -78,11 +83,12 @@ Skija 值类型不可变（offset/inset/union 返回新对象）——TS 端保�
 
 ## 简谱图像识别（OMR，`src/omr/`）
 
-把简谱图片（PNG/JPG）识别成 MusicXML，再走编辑器现有 `importBytes`→`loadMusicXml` 导入排版。
-工具栏「识图」按钮 → `showRecognizeDialog`（[src/editor/dialogs.ts](src/editor/dialogs.ts)）选方式 →
-`App.recognizeFromImage`（[src/editor/app.ts](src/editor/app.ts)）。**两种方式**：
+把简谱图片（PNG/JPG/PDF）识别成 MusicXML，再走编辑器现有 `importBytes`→`loadMusicXml` 导入排版。
+拖拽入口由 `bootstrap/drag-drop.ts` 分流到 `App.recognizeBytes`；工具栏「识图」用于在识别叠加视图与
+普通简谱之间切换。识别核心保留**两种方式**：
 
-**PDF 输入**（拖入 `.pdf`，见 `main.ts` 的 `RECOG_EXT_RE`）经 `decode.ts` 的 `pdfToImageData` 转位图再走
+**PDF 输入**（拖入 `.pdf`，格式注册见 `editor/file-format.ts`，适配层见 `bootstrap/drag-drop.ts`）
+经 `decode.ts` 的 `pdfToImageData` 转位图再走
 同一 OMR 管线。用 **pdf.js（`pdfjs-dist`）**：worker 经 Vite `?url` 引入，位图解码器 wasm 目录（jbig2.wasm
 兼管 **CCITTFax G4**、openjpeg 管 JPEG2000）在 `public/redist/pdfjs/`，**必须**用 `getDocument({wasmUrl})`
 指明——否则内嵌位图（扫描版乐谱多是 1-bit `ImageMask`）会被 pdf.js 静默丢弃、页面只剩矢量文字。**优先直接抽取
@@ -193,14 +199,21 @@ java -jar /tmp/antlr-4.13.2-complete.jar -Dlanguage=TypeScript -o /tmp/gen -visi
   `src-tauri/src/lib.rs`、capabilities、`package.json`。
 - 提交信息用简要中文，不要 `Co-Authored-By` 尾注。
 
-## 进度
+## 当前状态
 
-Phase 0（脚手架）、Phase 1（解析→模型→导入→排版→SVG 渲染）、Phase 2（编辑器 + 实时重排 +
-文件读写 + 翻页）已完成。Phase 3（点选/选中高亮/对话框）、4（导出 MIDI/PNG/PPTX）、
-5（Rust MusicXML 导入）、6（选项面板/打包）待做。
-简谱 OMR（图片→MusicXML，两路：Gemini/agy + musicpp 本地移植）已落地进编辑器（见上节）。
-musicpp 本地路数字 OCR 已从 tesseract.js 换成 PaddleOCR（onnxruntime-web，数字实测 100%），
-并新增歌词识别 + 逐音节↔音符对齐（见 OMR 节）。rec 模型 PP-OCRv4 → v5_mobile → **PP-OCRv6_small**
-（字典 6623→18708 字、「祂」4/4 全对），配合 jianpu.ts 矮块补高 + 空心环校验，6 曲音符 100%、歌词/词曲 ~100%（见 OMR 节）。
-ABC 记谱导入（`.abc`→MusicXML→排版）已落地：全量忠实移植 abc2xml.py 到 `src/abc/`，与原脚本输出
-逐字节一致（见 ABC 节）。
+编辑、点选、直接时值修改、JPW/TXT、MIDI、MusicXML、ABC、OMR、单谱/钢琴/总谱、播放、
+PNG/PDF/MIDI/MusicXML/PPTX 导出和 Tauri 打包均已落地。详细能力状态见 `docs/进度.md`。
+
+当前维护重点不是继续沿用旧 Phase 编号，而是守住跨模块回归并渐进拆分高复杂度文件：
+
+- `editor/app.ts`：保留生命周期协调，逐步下沉文件会话、导入、选择和播放服务。
+- `slashscore/index.ts`：后续按 tokenizer、voice、duration、serializer 拆分。
+- `layout/layout.ts`：后续按 page、system、measure、ornament 拆分。
+- `score/note-timing.ts`：改动必须覆盖 JPW/TXT、延音链、同音和弦与跨小节回归。
+
+## 简谱逻辑总表
+
+`docs/简谱逻辑总表.md` 是简谱行为的单一维护索引。凡是改变简谱语义、编辑结果、排版、播放或格式往返行为，都必须在同一改动中更新对应稳定 ID 的现行规则、实现入口、最低回归、版本和核对日期；新增逻辑追加新 ID，废弃逻辑保留原行并指向替代 ID。用 `git diff --word-diff=plain -- docs/简谱逻辑总表.md` 查看本次改了哪些逻辑。
+
+简谱 OMR 已包含 Gemini/agy 与 musicpp/PaddleOCR 两路；rec 模型当前为 **PP-OCRv6_small**。
+ABC 导入由 `src/abc/` 的 TypeScript 移植实现。运行与回归命令以 `docs/开发.md` 为准。

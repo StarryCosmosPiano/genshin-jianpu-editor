@@ -277,6 +277,65 @@ export function tempoBpmAtQuarter(tempo: TempoTimeline, quarter: number): number
   return tempo.finalBpm;
 }
 
+const MAJOR_DEGREE_PITCH = [0, 2, 4, 5, 7, 9, 11] as const;
+
+function diatonicNeighborPitch(note: Note, direction: -1 | 1): number {
+  const degree = parseInt(note.number, 10);
+  if (!Number.isFinite(degree) || degree < 1 || degree > 7) {
+    return note.pitch + direction * 2;
+  }
+  const current = MAJOR_DEGREE_PITCH[degree - 1];
+  if (direction > 0) {
+    const next = degree === 7 ? 12 : MAJOR_DEGREE_PITCH[degree];
+    return note.pitch + next - current;
+  }
+  const previous = degree === 1 ? MAJOR_DEGREE_PITCH[6] - 12 : MAJOR_DEGREE_PITCH[degree - 2];
+  return note.pitch + previous - current;
+}
+
+function ornamentPerformance(
+  chord: Chord,
+  note: Note,
+  start: number,
+  end: number,
+  part: number,
+): TimedNote[] | null {
+  if (chord.notes.filter((candidate) => !candidate.rest && !candidate.softDeleted).length !== 1) return null;
+  if (note.tieEnd || chord.ornaments.length === 0 || end <= start + 1 / 256) return null;
+  const ornament = chord.ornaments[0];
+  const neighbor = diatonicNeighborPitch(
+    note,
+    ornament.kind === "lower-mordent" ? -1 : 1,
+  );
+  if (ornament.kind === "trill") {
+    const unit = Math.max(1 / 256, Math.min(4 / ornament.subdivision, end - start));
+    const result: TimedNote[] = [];
+    let cursor = start;
+    let index = 0;
+    while (cursor < end - 1 / 512) {
+      const stop = Math.min(end, cursor + unit);
+      result.push({
+        t0: cursor,
+        t1: Math.max(cursor + 1 / 512, stop),
+        pitch: index % 2 === 0 ? note.pitch : neighbor,
+        part,
+        chord,
+      });
+      cursor = stop;
+      index++;
+    }
+    return result;
+  }
+  const unit = Math.max(1 / 256, Math.min(1 / 8, (end - start) / 3));
+  const second = Math.min(end, start + unit);
+  const third = Math.min(end, second + unit);
+  return [
+    { t0: start, t1: second, pitch: note.pitch, part, chord },
+    { t0: second, t1: third, pitch: neighbor, part, chord },
+    { t0: third, t1: end, pitch: note.pitch, part, chord },
+  ].filter((item) => item.t1 > item.t0 + 1 / 1024);
+}
+
 export function buildTimeline(score: Score): Timeline {
   const notes: TimedNote[] = [];
   const anchorMap = new Map<string, Anchor & { primaryPart: number }>();
@@ -362,6 +421,32 @@ export function buildTimeline(score: Score): Timeline {
               arpeggioDelay.set(note, (index + leadingStep) * rollUnit);
             });
           }
+          // A CrossPartArpeggio is stored on the score rather than on a
+          // single Chord because its notes belong to several synchronized
+          // parts.  Apply the same short, deterministic roll used by a local
+          // arpeggio, but only to the explicitly selected part/pitch pairs.
+          // The marker is deliberately looked up in the source measure and
+          // local position, so repeats still get a fresh roll on every pass.
+          const cross = score.crossPartArpeggios.find((mark) =>
+            mark.measure === mid && mark.offset.equals(ent.position));
+          if (cross) {
+            // Rank the complete cross-part pitch list, not just the notes in
+            // this Chord. A common case is one note per voice; ranking each
+            // Chord independently would produce one-element rolls and hence
+            // no audible staggering at all.
+            const ordered = [...cross.pitches]
+              .map((item, index) => ({ ...item, index }))
+              .sort((left, right) => left.pitch - right.pitch || left.part - right.part || left.index - right.index);
+            if (cross.direction === "down") ordered.reverse();
+            if (ordered.length > 1) {
+              const rollSpan = Math.max(0, Math.min(1 / 8, (t1 - mainAttack) * 0.2));
+              const rollUnit = rollSpan / (ordered.length - 1);
+              soundingNotes.forEach((note) => {
+                const rank = ordered.findIndex((item) => item.part === pi && item.pitch === note.pitch);
+                if (rank >= 0) arpeggioDelay.set(note, rank * rollUnit);
+              });
+            }
+          }
           for (const nt of soundingNotes) {
             const tied = nt.tieEnd && nt.tiePrev ? tiedNotes.get(nt.tiePrev) : undefined;
             if (tied) {
@@ -370,6 +455,12 @@ export function buildTimeline(score: Score): Timeline {
               continue;
             }
             const attack = mainAttack + (arpeggioDelay.get(nt) ?? 0);
+            const ornament = ornamentPerformance(ent, nt, attack, t1, pi);
+            if (ornament && ornament.length > 0) {
+              notes.push(...ornament);
+              tiedNotes.set(nt, ornament[ornament.length - 1]);
+              continue;
+            }
             const timed = {
               t0: attack,
               t1: Math.max(attack + 1 / 128, t1),

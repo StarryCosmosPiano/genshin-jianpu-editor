@@ -50,6 +50,9 @@ jobs:
       - name: Type check
         run: npx tsc --noEmit
 
+      - name: Core regression checks
+        run: npm run check:core
+
       - name: Verify release contains no bundled SF2
         run: >-
           node -e "const fs=require('fs');const dir='src/assets/soundfonts';const files=fs.existsSync(dir)?fs.readdirSync(dir).filter((name)=>name.toLowerCase().endsWith('.sf2')):[];if(files.length)throw new Error('SF2 files must not be included in release packages - '+files.join(', '))"
@@ -83,6 +86,8 @@ jobs:
         run: npm ci
       - name: Type check
         run: npx tsc --noEmit
+      - name: Core regression checks
+        run: npm run check:core
       - name: Build (subpath base for project Pages)
         run: npm run build
         env:

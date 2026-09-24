@@ -1,6 +1,6 @@
 import { TokenData, TokType, tokenClass } from "../jpword/tokens";
-import { Chord, type Note, type Score } from "../score/score";
-import { slashPitchSources, type SlashScoreKind, type SlashScoreOptions } from "../slashscore";
+import { Chord, MusicCommon, type Note, type Score } from "../score/score";
+import { slashPitchSources, type SlashPitchSource, type SlashScoreKind, type SlashScoreOptions } from "../slashscore";
 
 export interface JpwSourceNote {
   chord: Chord;
@@ -39,8 +39,13 @@ function isVoiceSection(name: string): boolean {
 }
 
 /** Locate source note tokens in each `.Voice...` section while retaining absolute offsets. */
-function voiceNoteTokens(text: string): TextRange[][] {
-  const voices: TextRange[][] = [];
+interface SourceVoiceTokens {
+  section: string;
+  tokens: TextRange[];
+}
+
+function voiceNoteTokens(text: string): SourceVoiceTokens[] {
+  const voices: SourceVoiceTokens[] = [];
   let currentVoice = -1;
   let offset = 0;
   for (const token of TokenData.parse(text).tokens) {
@@ -50,14 +55,14 @@ function voiceNoteTokens(text: string): TextRange[][] {
     if (token.type === TokType.SectionName) {
       if (isVoiceSection(token.text)) {
         currentVoice = voices.length;
-        voices.push([]);
+        voices.push({ section: token.text.trim().toLowerCase(), tokens: [] });
       } else {
         currentVoice = -1;
       }
       continue;
     }
     if (currentVoice >= 0 && tokenClass[token.type] === "note") {
-      voices[currentVoice].push({ from, to, text: token.text });
+      voices[currentVoice].tokens.push({ from, to, text: token.text });
     }
   }
   return voices;
@@ -146,7 +151,25 @@ export function buildJpwSourceNotes(text: string, score: Score): JpwSourceNote[]
       .sort((left, right) =>
         (left.timingSourceIndex ?? Number.MAX_SAFE_INTEGER)
         - (right.timingSourceIndex ?? Number.MAX_SAFE_INTEGER));
-    const tokens = voiceTokens[partIndex] ?? [];
+    // Ensemble parts are sorted by instrument/voice index during import, but
+    // users commonly write `.Voice.<instrument>.V2` before `V1`. Resolve the
+    // source section by its semantic identity instead of the original array
+    // order, otherwise clicking V1 edits V2's source text.
+    let sourceVoice: SourceVoiceTokens | undefined;
+    if (score.ensemble) {
+      const instrument = part.instrumentName.trim().toLowerCase();
+      sourceVoice = voiceTokens.find((voice) => {
+        const match = /^\.voice\.(.+)\.v(\d+)$/.exec(voice.section);
+        return match !== null
+          && match[1].trim() === instrument
+          && parseInt(match[2], 10) === part.voiceIndex;
+      });
+    } else if (score.piano && part.hand !== null) {
+      sourceVoice = voiceTokens.find((voice) =>
+        voice.section === (part.hand === "right" ? ".voice.rh" : ".voice.lh")
+        || voice.section === (part.hand === "right" ? ".voice.right" : ".voice.left"));
+    }
+    const tokens = (sourceVoice ?? voiceTokens[partIndex])?.tokens ?? [];
     let chordCursor = 0;
     let tieOpen = false;
     let previous: { chord: Chord; chordIndex: number; pitches: string[] } | null = null;
@@ -254,10 +277,25 @@ export function buildJpwSourceNotes(text: string, score: Score): JpwSourceNote[]
   return result.sort((a, b) => a.from - b.from || a.to - b.to);
 }
 
+function containsPitchMultiplicity(actual: readonly number[], expected: readonly number[]): boolean {
+  const remaining = [...actual];
+  for (const pitch of expected) {
+    const index = remaining.indexOf(pitch);
+    if (index < 0) return false;
+    remaining.splice(index, 1);
+  }
+  return true;
+}
+
 /** Build Score-note -> editable TXT ranges for keyboard/number slash scores. */
-export function buildSlashSourceNotes(text: string, options: SlashScoreOptions, score: Score): JpwSourceNote[] {
-  const sources = slashPitchSources(text, options);
-  const events = new Map<string, typeof sources>();
+export function buildSlashSourceNotes(
+  text: string,
+  options: SlashScoreOptions,
+  score: Score,
+  scannedSources?: readonly SlashPitchSource[],
+): JpwSourceNote[] {
+  const sources = scannedSources ?? slashPitchSources(text, options);
+  const events = new Map<string, SlashPitchSource[]>();
   for (const source of sources) {
     const key = `${source.eventIndex}:${source.voiceIndex}`;
     const group = events.get(key) ?? [];
@@ -265,6 +303,29 @@ export function buildSlashSourceNotes(text: string, options: SlashScoreOptions, 
     events.set(key, group);
   }
 
+  // A local key mark applies at its exact measure/offset.  Candidate order is
+  // source order rather than time order, so resolve each chord independently.
+  const sortedKeyMarks = [...score.keyMarks].sort((left, right) =>
+    left.measure - right.measure || left.offset.compareTo(right.offset));
+  const tonicAt = (fifths: number): number => {
+    const index = Math.max(0, Math.min(MusicCommon.keys.length - 1, Math.round(fifths) + 7));
+    return MusicCommon.getBasePitch(MusicCommon.keys[index]);
+  };
+  const openingTonic = tonicAt(options.fifths);
+  const pitchDeltaAt = (chord: Chord): number => {
+    let low = 0;
+    let high = sortedKeyMarks.length;
+    while (low < high) {
+      const middle = (low + high) >>> 1;
+      const mark = sortedKeyMarks[middle];
+      const beforeChord = mark.measure < chord.measure.index
+        || (mark.measure === chord.measure.index
+          && mark.offset.compareTo(chord.position) <= 0);
+      if (beforeChord) low = middle + 1;
+      else high = middle;
+    }
+    return tonicAt(low === 0 ? options.fifths : sortedKeyMarks[low - 1].fifths) - openingTonic;
+  };
   const candidates = score.parts.flatMap((part, partIndex) => {
     let chordIndex = 0;
     return part.measures.flatMap((measure) =>
@@ -275,92 +336,199 @@ export function buildSlashSourceNotes(text: string, options: SlashScoreOptions, 
         && !entry.rest)
       .map((chord) => {
         const fallbackIndex = chordIndex++;
+        const pitchDelta = pitchDeltaAt(chord);
         return {
           chord,
           partIndex,
           chordIndex: chord.timingSourceIndex ?? fallbackIndex,
           time: measure.position.plus(chord.position).toFloat(),
-          pitches: [...new Set(chord.notes.filter((note) => !note.rest).map((note) => note.pitch))].sort((a, b) => a - b),
+          pitchDelta,
+          // Compare in the written key; the final note association still uses
+          // sounding pitch below.
+          pitches: chord.notes.filter((note) => !note.rest)
+            .map((note) => note.pitch - pitchDelta).sort((a, b) => a - b),
         };
       }),
     );
   }).sort((a, b) =>
     a.partIndex - b.partIndex || a.chordIndex - b.chordIndex || a.time - b.time);
 
+  type CandidateBucket = { indices: number[]; next?: number[] };
+  const exactByPart = new Map<number, Map<string, CandidateBucket>>();
+  const continuationByPart = new Map<number, Map<string, CandidateBucket>>();
+  const pitchByPart = new Map<number, Map<number, number[]>>();
+  const arpeggioPitchByPart = new Map<number, Map<number, number[]>>();
+  const allByPart = new Map<number, number[]>();
+  const arpeggioByPart = new Map<number, number[]>();
+  const pitchKey = (pitches: readonly number[]): string => pitches.join(",");
+  const appendBucket = (index: Map<number, Map<string, CandidateBucket>>,
+    part: number, key: string, candidateIndex: number): void => {
+    let byPitch = index.get(part);
+    if (!byPitch) { byPitch = new Map(); index.set(part, byPitch); }
+    let bucket = byPitch.get(key);
+    if (!bucket) { bucket = { indices: [] }; byPitch.set(key, bucket); }
+    bucket.indices.push(candidateIndex);
+  };
+  const appendPitch = (index: Map<number, Map<number, number[]>>,
+    part: number, pitch: number, candidateIndex: number): void => {
+    let byPitch = index.get(part);
+    if (!byPitch) { byPitch = new Map(); index.set(part, byPitch); }
+    let entries = byPitch.get(pitch);
+    if (!entries) { entries = []; byPitch.set(pitch, entries); }
+    entries.push(candidateIndex);
+  };
+  for (let index = 0; index < candidates.length; index++) {
+    const candidate = candidates[index];
+    const part = candidate.partIndex;
+    let all = allByPart.get(part);
+    if (!all) { all = []; allByPart.set(part, all); }
+    all.push(index);
+    const key = pitchKey(candidate.pitches);
+    appendBucket(exactByPart, part, key, index);
+    if (candidate.chord.transparentContinuation) {
+      appendBucket(continuationByPart, part, key, index);
+    }
+    if (candidate.chord.arpeggio) {
+      let arpeggios = arpeggioByPart.get(part);
+      if (!arpeggios) { arpeggios = []; arpeggioByPart.set(part, arpeggios); }
+      arpeggios.push(index);
+    }
+    for (let p = 0; p < candidate.pitches.length; p++) {
+      if (p > 0 && candidate.pitches[p] === candidate.pitches[p - 1]) continue;
+      appendPitch(pitchByPart, part, candidate.pitches[p], index);
+      if (candidate.chord.arpeggio) {
+        appendPitch(arpeggioPitchByPart, part, candidate.pitches[p], index);
+      }
+    }
+  }
+
   const result: JpwSourceNote[] = [];
   const usedCandidates = new Set<number>();
+  // A bucket keeps its original candidate order.  Its successor links skip
+  // consumed entries even when source events request an earlier chord index.
+  const firstAvailable = (bucket: CandidateBucket | undefined, minimumSourceIndex: number): number => {
+    if (!bucket || bucket.indices.length === 0) return -1;
+    const { indices } = bucket;
+    let low = 0;
+    let high = indices.length;
+    while (low < high) {
+      const middle = (low + high) >>> 1;
+      if (candidates[indices[middle]].chordIndex < minimumSourceIndex) low = middle + 1;
+      else high = middle;
+    }
+    const next = bucket.next ??= Array.from({ length: indices.length + 1 }, (_, index) => index);
+    const successor = (start: number): number => {
+      let end = start;
+      while (next[end] !== end) end = next[end];
+      while (start !== end) {
+        const following = next[start];
+        next[start] = end;
+        start = following;
+      }
+      return end;
+    };
+    let position = successor(low);
+    while (position < indices.length && usedCandidates.has(indices[position])) {
+      next[position] = successor(position + 1);
+      position = next[position];
+    }
+    return position < indices.length ? indices[position] : -1;
+  };
+  const subsetBuckets = new Map<string, CandidateBucket>();
+  const containsBucket = (part: number, pitches: readonly number[], arpeggio: boolean): CandidateBucket => {
+    const key = `${part}:${arpeggio ? 1 : 0}:${pitchKey(pitches)}`;
+    let bucket = subsetBuckets.get(key);
+    if (bucket) return bucket;
+    const byPitch = (arpeggio ? arpeggioPitchByPart : pitchByPart).get(part);
+    // Every containing chord has every required pitch.  Use the rarest
+    // posting, then check multiplicity once when building this source shape.
+    let posting = arpeggio ? arpeggioByPart.get(part) : allByPart.get(part);
+    for (let p = 0; p < pitches.length; p++) {
+      if (p > 0 && pitches[p] === pitches[p - 1]) continue;
+      const possible = byPitch?.get(pitches[p]) ?? [];
+      if (!posting || possible.length < posting.length) posting = possible;
+    }
+    bucket = { indices: (posting ?? []).filter((index) =>
+      containsPitchMultiplicity(candidates[index].pitches, pitches)) };
+    subsetBuckets.set(key, bucket);
+    return bucket;
+  };
   const lastSourceIndexByPart = new Map<number, number>();
   const lastMappedByPart = new Map<number, {
     groupKey: string;
     pitches: number[];
     candidateIndex: number;
   }>();
-  const sourceGroupKey = (offset: number): string => {
-    const lineStart = Math.max(
-      text.lastIndexOf("\n", Math.max(0, offset - 1)),
-      text.lastIndexOf("\r", Math.max(0, offset - 1)),
-    ) + 1;
-    const prefix = text.slice(lineStart, offset);
-    return `${lineStart}:${prefix.split("/").length - 1}`;
-  };
+  const sourceGroupKeys = new Map<number, string>();
+  const sourceOffsets = [...new Set(sources.map((source) => source.from))].sort((a, b) => a - b);
+  let scanned = 0;
+  let lineStart = 0;
+  let slashCount = 0;
+  for (const offset of sourceOffsets) {
+    while (scanned < offset) {
+      const char = text[scanned++];
+      if (char === "\n" || char === "\r") {
+        lineStart = scanned;
+        slashCount = 0;
+      } else if (char === "/") slashCount++;
+    }
+    // Preserve lastIndexOf's offset-zero behavior for an unusual source
+    // token beginning at the very first character.
+    if (offset === 0 && (text[0] === "\n" || text[0] === "\r")) {
+      sourceGroupKeys.set(offset, "1:0");
+    } else {
+      sourceGroupKeys.set(offset, `${lineStart}:${slashCount}`);
+    }
+  }
   for (const event of events.values()) {
     const mainEvent = event.filter((source) => !source.grace);
     const graceEvent = event.filter((source) => source.grace);
     if (mainEvent.length === 0) continue;
-    const expected = [...new Set(mainEvent.map((source) => source.pitch))].sort((a, b) => a - b);
+    const expected = mainEvent.map((source) => source.pitch).sort((a, b) => a - b);
     const preferredPart = Math.max(0, (mainEvent[0]?.voiceIndex ?? 1) - 1);
     const minimumSourceIndex = lastSourceIndexByPart.get(preferredPart) ?? -1;
-    const groupKey = sourceGroupKey(mainEvent[0].from);
+    const groupKey = sourceGroupKeys.get(mainEvent[0].from)!;
     const lastMapped = lastMappedByPart.get(preferredPart);
     const sameSustainedSource = lastMapped
       && lastMapped.groupKey === groupKey
       && lastMapped.pitches.length === expected.length
       && lastMapped.pitches.every((pitch, pitchIndex) => pitch === expected[pitchIndex]);
-    // A repeated source pitch inside one slash group is duration spelling, not
-    // a new attack. If a beat boundary requires a visible gray continuation,
-    // map to that chord; otherwise both source tokens select the merged note.
+    // Equal source pitches inside one slash group may be either a new attack
+    // or duration spelling absorbed by rhythmic normalization.  A visible
+    // gray continuation is the most specific match; other attacks are tried
+    // below before falling back to the already mapped merged note.
+    const expectedKey = pitchKey(expected);
     let candidateIndex = sameSustainedSource
-      ? candidates.findIndex((candidate, index) =>
-        !usedCandidates.has(index)
-        && candidate.partIndex === preferredPart
-        && candidate.chordIndex >= minimumSourceIndex
-        && candidate.chord.transparentContinuation
-        && candidate.pitches.length === expected.length
-        && candidate.pitches.every((pitch, pitchIndex) => pitch === expected[pitchIndex]))
+      ? firstAvailable(continuationByPart.get(preferredPart)?.get(expectedKey), minimumSourceIndex)
       : -1;
     let reusedCandidate = false;
+    if (candidateIndex < 0) {
+      candidateIndex = firstAvailable(exactByPart.get(preferredPart)?.get(expectedKey), minimumSourceIndex);
+    }
+    if (candidateIndex < 0) {
+      candidateIndex = firstAvailable(containsBucket(preferredPart, expected, false), minimumSourceIndex);
+    }
     if (candidateIndex < 0 && sameSustainedSource) {
+      // Equal pitches later in the same slash group can be either a genuine
+      // repeated MIDI attack or source spelling that was absorbed into the
+      // preceding legal duration.  Prefer every unused rendered attack first;
+      // only reuse the previous note when the timing normalizer produced no
+      // separate chord at all.  Reusing too early left the real repeated chord
+      // without a source range, so it appeared uncoloured and could not select
+      // its text (which looked like V1 had fallen into the default V2 row).
       candidateIndex = lastMapped.candidateIndex;
       reusedCandidate = true;
-    }
-    if (candidateIndex < 0) {
-      candidateIndex = candidates.findIndex((candidate, index) =>
-        !usedCandidates.has(index) &&
-        candidate.partIndex === preferredPart &&
-        candidate.chordIndex >= minimumSourceIndex &&
-        candidate.pitches.length === expected.length &&
-        candidate.pitches.every((pitch, pitchIndex) => pitch === expected[pitchIndex]));
-    }
-    if (candidateIndex < 0) {
-      candidateIndex = candidates.findIndex((candidate, index) =>
-        !usedCandidates.has(index) &&
-        candidate.partIndex === preferredPart &&
-        candidate.chordIndex >= minimumSourceIndex &&
-        expected.every((pitch) => candidate.pitches.includes(pitch)));
     }
     // A rolled subset and a simultaneous chord can be merged into one model
     // chord by the slash parser.  In that case the next source group must be
     // allowed to map back to the same arpeggio chord instead of being lost
     // behind the monotonic candidate cursor.
     if (candidateIndex < 0) {
-      candidateIndex = candidates.findIndex((candidate, index) =>
-        !usedCandidates.has(index) &&
-        candidate.partIndex === preferredPart &&
-        candidate.chord.arpeggio &&
-        expected.every((pitch) => candidate.pitches.includes(pitch)));
+      candidateIndex = firstAvailable(containsBucket(preferredPart, expected, true), -Infinity);
     }
     if (candidateIndex < 0) continue;
     const candidate = candidates[candidateIndex];
+    const candidatePitchDelta = candidate.pitchDelta;
     const tokenFrom = Math.min(...event.map((source) => source.from));
     const tokenTo = Math.max(...event.map((source) => source.to));
     const append = (
@@ -371,7 +539,7 @@ export function buildSlashSourceNotes(text: string, options: SlashScoreOptions, 
       const unused = new Set(notes.map((_note, index) => index));
       for (const source of sourcePitches) {
         let noteIndex = notes.findIndex((note, index) =>
-          unused.has(index) && !note.rest && note.pitch === source.pitch);
+          unused.has(index) && !note.rest && note.pitch === source.pitch + candidatePitchDelta);
         if (noteIndex < 0) noteIndex = [...unused][0] ?? -1;
         if (noteIndex < 0) continue;
         unused.delete(noteIndex);

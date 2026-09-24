@@ -1,0 +1,160 @@
+.notation-dialog-layer {
+  position: fixed;
+  inset: 0;
+  z-index: 12010;
+  background: rgba(18, 13, 24, .3);
+}
+
+.notation-dialog {
+  position: fixed;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  min-width: 0;
+  min-height: 0;
+  max-width: none;
+  max-height: none;
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  background: var(--surface);
+  color: var(--text);
+  box-shadow: var(--shadow);
+  font-size: 14px;
+}
+
+.notation-dialog .notation-dialog-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 52px;
+  padding: 9px 16px;
+  border-bottom: 1px solid var(--line);
+  background: linear-gradient(120deg, var(--purple-soft), var(--surface) 78%);
+}
+
+.notation-dialog .inspector-title { margin: 0; color: var(--purple-ink); font-size: 17px; }
+.notation-dialog .inspector-header-actions { display: flex; align-items: center; }
+.notation-dialog .inspector-close,
+.notation-dialog .inspector-reset {
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: 20px;
+  cursor: pointer;
+}
+.notation-dialog .inspector-close:hover,
+.notation-dialog .inspector-close:focus-visible,
+.notation-dialog .inspector-reset:hover,
+.notation-dialog .inspector-reset:focus-visible { background: var(--hover); color: var(--purple-ink); }
+.notation-dialog-content { flex: 1 1 auto; min-height: 0; overflow: auto; padding: 10px 18px; }
+.notation-dialog-hint { margin: 0 0 7px; color: var(--muted); font-size: 12px; line-height: 1.5; }
+.notation-dialog-footer {
+  display: flex;
+  justify-content: flex-end;
+  flex: 0 0 auto;
+  gap: 8px;
+  padding: 10px 36px 10px 14px;
+  border-top: 1px solid var(--line);
+}
+.notation-dialog-footer button,
+.notation-time-presets button {
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  cursor: pointer;
+}
+.notation-dialog-footer button { min-height: 34px; padding: 5px 13px; }
+.notation-dialog-footer button:hover { background: var(--hover); color: var(--purple-ink); }
+.notation-dialog-footer button.primary { border-color: var(--gold); background: var(--gold); color: var(--gold-ink); }
+.notation-dialog-footer button.primary:hover { background: var(--gold-hover); }
+.notation-dialog button:focus-visible,
+.notation-dialog input:focus-visible,
+.notation-dialog select:focus-visible { outline: 2px solid var(--purple); outline-offset: 2px; }
+
+.key-circle-wheel {
+  position: relative;
+  width: min(100%, 350px);
+  aspect-ratio: 1;
+  margin: 0 auto;
+  border: 1px solid var(--border);
+  border-radius: 50%;
+  background:
+    radial-gradient(circle, var(--surface) 0 27%, transparent 27.5%),
+    radial-gradient(circle, transparent 0 53%, var(--purple-soft) 53.5% 57%, transparent 57.5%),
+    radial-gradient(circle, var(--surface) 0 74%, var(--purple-soft) 74.5% 100%);
+  box-shadow: inset 0 0 0 7px var(--surface);
+}
+.key-circle-center {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  display: grid;
+  gap: 3px;
+  place-items: center;
+  transform: translate(-50%, -50%);
+  color: var(--muted);
+  white-space: nowrap;
+  line-height: 1.2;
+}
+.key-circle-center strong { color: var(--purple-ink); font-size: 21px; }
+.key-circle-option {
+  display: grid;
+  align-content: center;
+  gap: 1px;
+  min-width: 52px;
+  min-height: 42px;
+  padding: 2px 5px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface);
+  color: var(--text);
+  box-shadow: 0 1px 5px rgba(18,13,24,.13);
+  text-align: center;
+  line-height: 1.05;
+  cursor: pointer;
+}
+.key-circle-wheel > .key-circle-option { position: absolute; transform: translate(-50%, -50%); }
+.key-circle-option strong { font-size: 15px; font-weight: 700; }
+.key-circle-option small { color: var(--muted); font-size: 10px; white-space: nowrap; }
+.key-circle-option:hover,
+.key-circle-option:focus-visible { border-color: var(--purple); background: var(--purple-soft); color: var(--purple-ink); }
+.key-circle-option.active { border-color: var(--purple); background: var(--purple); color: #fff; box-shadow: 0 0 0 3px var(--gold); }
+.key-circle-option.active small { color: #fff; }
+.key-circle-enharmonic {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  margin: 9px 0 0;
+  color: var(--muted);
+  font-size: 11px;
+}
+.key-circle-alternates { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; }
+.key-circle-alternates .key-circle-option { min-width: 61px; min-height: 38px; }
+
+.notation-time-presets { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; margin: 4px 0 18px; }
+.notation-time-presets button { min-height: 39px; font-size: 16px; }
+.notation-time-presets button.active,
+.notation-time-presets button:hover,
+.notation-time-presets button:focus-visible { border-color: var(--purple); background: var(--purple-soft); color: var(--purple-ink); }
+.notation-time-custom { display: flex; align-items: center; justify-content: space-between; gap: 10px; color: var(--muted); }
+.notation-time-controls { display: flex; align-items: center; gap: 8px; color: var(--purple-ink); }
+.notation-time-controls input,
+.notation-time-controls select { width: 68px; height: 37px; padding: 4px 7px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); color: var(--text); font: inherit; }
+
+@media (max-width: 420px), (max-height: 580px) {
+  .notation-dialog-content { padding: 8px 12px; }
+  .key-circle-wheel { width: min(100%, 310px); }
+  .key-circle-option { min-width: 47px; min-height: 37px; padding: 2px 3px; border-radius: 10px; }
+  .key-circle-option strong { font-size: 13px; }
+  .key-circle-option small { font-size: 9px; }
+  .key-circle-alternates .key-circle-option { min-height: 34px; }
+}

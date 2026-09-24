@@ -1,6 +1,6 @@
 // Ported from mp/jpword/jpwfile.kt — .jpwabc section model + parsing.
-// The TokenData/highlight tokenizer (parseTokens) is deferred to Phase 2;
-// this module covers the semantic parse used by JpwImport.fromJpw.
+// TokenData in tokens.ts serves editor highlighting; this module owns the
+// section model and semantic parse used by JpwImport.fromJpw.
 
 import { parseVoiceText, type VoiceContext } from "./parse";
 
@@ -289,6 +289,10 @@ export class TitleSection extends Section {
   }
   get noteTimingEdits(): string | null {
     return this.getValue("NoteTimingEdits");
+  }
+  /** JSON payload for score-level input annotations. */
+  get annotations(): string | null {
+    return this.getValue("Annotations");
   }
   get key(): string | null {
     const km = this.keyAndMeters;

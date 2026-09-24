@@ -46,6 +46,8 @@ export interface EngravingStyle {
   /** Auto detects the shortest local value; manual uses rhythmGuideDivision. */
   rhythmGuideMode: RhythmGuideMode;
   rhythmGuideDivision: RhythmGuideDivision;
+  /** Accent dotted-value grid positions while retaining binary subdivisions. */
+  rhythmGuideDotted: boolean;
   /** Distance between right- and left-hand rows, in number-size units. */
   pianoHandGap: number;
   /** Curly-brace horizontal size and stroke width. */
@@ -54,6 +56,8 @@ export interface EngravingStyle {
   /** Piano system left edge and between-hand connector. */
   pianoLeftLineWidth: number;
   pianoConnectorScale: number;
+  /** Join matching measure barlines only in the gaps between paired voice rows. */
+  connectBarlines: boolean;
   /** Ordinary and final barline geometry, in SVG page units. */
   barlineWidth: number;
   finalBarlineWidth: number;
@@ -92,11 +96,13 @@ export const DEFAULT_ENGRAVING_STYLE: Readonly<EngravingStyle> = Object.freeze({
   rhythmGuideEnabled: true,
   rhythmGuideMode: "auto",
   rhythmGuideDivision: 4,
+  rhythmGuideDotted: false,
   pianoHandGap: 1.4,
-  braceWidthScale: 0.7,
-  braceStrokeWidth: 0.5,
+  braceWidthScale: 0.35,
+  braceStrokeWidth: 3.2,
   pianoLeftLineWidth: 1.8,
   pianoConnectorScale: 1,
+  connectBarlines: false,
   barlineWidth: 1.3,
   finalBarlineWidth: 3.5,
   finalBarlineGap: 2.8,
@@ -105,7 +111,8 @@ export const DEFAULT_ENGRAVING_STYLE: Readonly<EngravingStyle> = Object.freeze({
 export type NumericEngravingStyleKey = Exclude<
   keyof EngravingStyle,
   "numberBold" | "tieContinuationGray" | "rhythmicSpacingEnabled" | "justifyLastSystem" |
-  "rhythmGuideEnabled" | "rhythmGuideMode" | "rhythmGuideDivision"
+  "rhythmGuideEnabled" | "rhythmGuideMode" | "rhythmGuideDivision" | "rhythmGuideDotted" |
+  "connectBarlines"
 >;
 
 /** Shared slider/normalization ranges: [minimum, maximum, step]. */
@@ -135,8 +142,8 @@ export const ENGRAVING_STYLE_RANGES: Readonly<Record<NumericEngravingStyleKey, r
   publicationCreditYOffset: [-6, 8, 0.1],
   publicationFirstSystemGap: [0.2, 6, 0.05],
   pianoHandGap: [0.5, 4, 0.05],
-  braceWidthScale: [0.25, 3, 0.05],
-  braceStrokeWidth: [0.2, 8, 0.1],
+  braceWidthScale: [0.1, 2, 0.05],
+  braceStrokeWidth: [0.1, 5, 0.1],
   pianoLeftLineWidth: [0.2, 8, 0.1],
   pianoConnectorScale: [0.25, 3, 0.05],
   barlineWidth: [0.2, 6, 0.1],
@@ -155,7 +162,9 @@ export function normalizeEngravingStyle(value?: Partial<EngravingStyle> | null):
   for (const key of Object.keys(ENGRAVING_STYLE_RANGES) as NumericEngravingStyleKey[]) {
     const [min, max] = ENGRAVING_STYLE_RANGES[key];
     const n = finiteOr(source[key], DEFAULT_ENGRAVING_STYLE[key]);
-    result[key] = Math.min(max, Math.max(min, n));
+    // Existing documents may contain brace values from the original, wider sliders.
+    const legacyMax = key === "braceWidthScale" ? 3 : key === "braceStrokeWidth" ? 8 : max;
+    result[key] = Math.min(legacyMax, Math.max(min, n));
   }
   result.numberBold = typeof source.numberBold === "boolean"
     ? source.numberBold
@@ -180,5 +189,11 @@ export function normalizeEngravingStyle(value?: Partial<EngravingStyle> | null):
   result.rhythmGuideDivision = ([1, 2, 4, 8, 16, 32, 64] as const).includes(guideDivision as RhythmGuideDivision)
     ? guideDivision as RhythmGuideDivision
     : DEFAULT_ENGRAVING_STYLE.rhythmGuideDivision;
+  result.rhythmGuideDotted = typeof source.rhythmGuideDotted === "boolean"
+    ? source.rhythmGuideDotted
+    : DEFAULT_ENGRAVING_STYLE.rhythmGuideDotted;
+  result.connectBarlines = typeof source.connectBarlines === "boolean"
+    ? source.connectBarlines
+    : DEFAULT_ENGRAVING_STYLE.connectBarlines;
   return result;
 }

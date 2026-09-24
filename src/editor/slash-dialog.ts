@@ -17,6 +17,9 @@ import {
   type SlashScoreKind,
   type SlashScoreOptions,
 } from "../slashscore";
+import { fileStem } from "./file-format";
+import { openInspector } from "../ui/inspector";
+import { retainDetailsScroll } from "../ui/details-scroll-retention";
 
 const DIVISIONS: SlashDurationDivision[] = [4, 8, 16, 32, 64];
 
@@ -51,20 +54,22 @@ function selectedDivision(select: HTMLSelectElement): SlashDurationDivision | nu
 
 function groupModeSelect(value: SlashGroupMode): HTMLSelectElement {
   const select = document.createElement("select");
+  if (value === "subdivide") {
+    // Keep old documents round-trippable without exposing subdivision as a
+    // new choice. New documents use implicit compact notation instead.
+    const legacy = option("subdivide", "旧版细分（兼容读取）", true);
+    legacy.hidden = true;
+    select.append(legacy);
+  }
   select.append(
     option("none", "留空（不指定特殊功能）", value === "none"),
-    option("grace", "倚音：装饰音借用后方间隔，不增加小节拍长", value === "grace"),
+    option("chord", "和弦：括号内音符同时发声", value === "chord"),
+    option("grace", "倚音：括号内音符作为装饰音，不增加小节拍长", value === "grace"),
     option("arpeggio", "琶音：括号内三个及以上音作为滚奏和弦", value === "arpeggio"),
     option("triplet", "三连音：括号内三个时值按 3:2 压缩", value === "triplet"),
-    option("subdivide", "细分：最低时值÷2，并计入小节拍长", value === "subdivide"),
+    option("trill", "颤音：括号内音符仅作装饰，不增加小节拍长", value === "trill"),
   );
   return select;
-}
-
-function fileStem(path: string): string {
-  const leaf = path.replace(/\\/g, "/").split("/").pop() ?? path;
-  const stem = leaf.replace(/\.(?:txt|keyscore|numscore|kps|nps)$/i, "");
-  try { return decodeURIComponent(stem); } catch { return stem; }
 }
 
 interface SymbolRow {
@@ -153,10 +158,11 @@ export function showSlashScoreImportDialog(
     keyboardKeyLabels.checked = initial.keyboardKeyLabels ?? false;
     const keyboardKeyLabelsHint = document.createElement("small");
     keyboardKeyLabelsHint.textContent = "只替换右侧谱面的 1–7 为 A–Z 键位；音高、延音、播放和导出保持不变。超出 Z–U 三排范围时用上下加点表示额外八度。";
-    const keyboardKeyLabelsWrap = document.createElement("span");
-    keyboardKeyLabelsWrap.className = "slash-space-control";
-    keyboardKeyLabelsWrap.append(keyboardKeyLabels, keyboardKeyLabelsHint);
-    const keyboardKeyLabelsRow = row("谱面显示键盘按键", keyboardKeyLabelsWrap);
+    const keyboardKeyLabelsRow = row("谱面显示键盘按键", keyboardKeyLabels);
+    keyboardKeyLabelsRow.append(keyboardKeyLabelsHint);
+    keyboardKeyLabelsRow.style.cssText = "display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;column-gap:12px;row-gap:3px";
+    keyboardKeyLabels.style.cssText = "width:18px;min-width:18px;height:18px;justify-self:end;margin:0";
+    keyboardKeyLabelsHint.style.cssText = "grid-column:1/-1;display:block;min-width:0;max-width:none;text-align:left;color:var(--muted);line-height:1.5";
     const keyboardTieAsZero = document.createElement("input");
     keyboardTieAsZero.type = "checkbox";
     keyboardTieAsZero.checked = initial.keyboardTieAsZero ?? false;
@@ -189,7 +195,11 @@ export function showSlashScoreImportDialog(
 
     const key = document.createElement("select");
     for (let fifths = -7; fifths <= 7; fifths++) {
-      key.append(option(String(fifths), `1=${MusicCommon.keys[fifths + 7]}`, fifths === initial.fifths));
+      const rawName = MusicCommon.keys[fifths + 7];
+      const displayName = rawName.startsWith("#") || rawName.startsWith("b")
+        ? `${rawName.slice(1)}${rawName[0]}`
+        : rawName;
+      key.append(option(String(fifths), `1=${displayName}`, fifths === initial.fifths));
     }
     const beats = document.createElement("input");
     beats.type = "number";
@@ -296,6 +306,14 @@ export function showSlashScoreImportDialog(
     const emptyGroupWrap = document.createElement("span");
     emptyGroupWrap.className = "slash-space-control";
     emptyGroupWrap.append(emptyGroupsAsRests, emptyGroupHint);
+    const showExplicitRests = document.createElement("input");
+    showExplicitRests.type = "checkbox";
+    showExplicitRests.checked = initial.showExplicitRests ?? true;
+    const explicitRestsHint = document.createElement("small");
+    explicitRestsHint.textContent = "关闭后内部空拍由前一个音延长填充，开头静默仍保留休止符。";
+    const explicitRestsWrap = document.createElement("span");
+    explicitRestsWrap.className = "slash-space-control";
+    explicitRestsWrap.append(showExplicitRests, explicitRestsHint);
     mappingDetails.append(
       mappingSummary,
       mappingHint,
@@ -304,10 +322,17 @@ export function showSlashScoreImportDialog(
       row("音符自身时值", noteWrap),
       row("空格时值", spaceWrap),
       row("空拍使用 / - /", emptyGroupWrap),
+      row("保留 0 休止符", explicitRestsWrap),
     );
 
-    const braceMode = groupModeSelect(initial.braceMode);
+    const braceMode = groupModeSelect(initial.braceMode ?? "arpeggio");
     const bracketMode = groupModeSelect(initial.bracketMode ?? "triplet");
+    const barMode = groupModeSelect(initial.barMode ?? "none");
+    // Angle brackets now use the compact (stuck-together) notation implicitly;
+    // the legacy `subdivide` value is still accepted by the parser but is not
+    // offered as a new setting.
+    const angleMode = groupModeSelect(initial.angleMode ?? "grace");
+    const parenMode = groupModeSelect(initial.parenMode ?? "chord");
     const ordering = document.createElement("select");
     ordering.append(
       option("pitch-asc", "音高正序（低音到高音）", (initial.ordering ?? "pitch-asc") === "pitch-asc"),
@@ -350,6 +375,11 @@ export function showSlashScoreImportDialog(
         selectedDivision(noteDivision),
         bracketMode.value as SlashGroupMode,
         kind.value as SlashScoreKind,
+        {
+          barMode: barMode.value as SlashGroupMode,
+          angleMode: angleMode.value as SlashGroupMode,
+          parenMode: parenMode.value as SlashGroupMode,
+        },
       );
       meterHint.textContent = `按当前符号推荐：${suggestion.beats}/${suggestion.beatType}；` +
         `典型每小节 ${suggestion.groupsPerMeasure} 个斜杠拍组，每组约 ${suggestion.groupQuarterNotes.toFixed(3)} 个四分音符。` +
@@ -383,10 +413,13 @@ export function showSlashScoreImportDialog(
     noteDivision.onchange = updateRecommendation;
     braceMode.onchange = updateRecommendation;
     bracketMode.onchange = updateRecommendation;
+    barMode.onchange = updateRecommendation;
+    angleMode.onchange = updateRecommendation;
+    parenMode.onchange = updateRecommendation;
     const updateKindControls = () => {
       const visible = kind.value === "keyboard";
       keyboardKeyLabelsRow.hidden = !visible;
-      keyboardKeyLabelsRow.style.display = visible ? "" : "none";
+      keyboardKeyLabelsRow.style.display = visible ? "grid" : "none";
       const tieOptionsVisible = visible && keyboardKeyLabels.checked;
       keyboardTieAsZeroRow.hidden = !tieOptionsVisible;
       keyboardTieAsZeroRow.style.display = tieOptionsVisible ? "" : "none";
@@ -475,14 +508,20 @@ export function showSlashScoreImportDialog(
       mappingDetails,
       row("花括号 {}", braceMode),
       row("方括号 []", bracketMode),
+      row("竖线括号 | |", barMode),
+      row("尖括号 <>", angleMode),
+      row("圆括号 ()", parenMode),
       warning,
       metadata,
       singleStaffHint,
       error,
       footer,
     );
-    overlay.append(box);
-    document.body.append(overlay);
+    if (purpose === "import") {
+      overlay.append(box);
+      document.body.append(overlay);
+    }
+    const releaseImportScroll = purpose === "import" ? retainDetailsScroll(box, box) : null;
 
     const readOptions = (): SlashScoreOptions => ({
       kind: kind.value as SlashScoreKind,
@@ -514,9 +553,16 @@ export function showSlashScoreImportDialog(
       multiDurationSymbols: useMultipleSymbols.checked,
       spaceDivision: currentSpaceDivision(),
       noteDivision: selectedDivision(noteDivision),
+      wholeMeasureGroups: initial.wholeMeasureGroups || analysis.wholeMeasureGroups
+        ? true
+        : undefined,
       emptyGroupsAsRests: emptyGroupsAsRests.checked,
+      showExplicitRests: showExplicitRests.checked,
       braceMode: braceMode.value as SlashBraceMode,
       bracketMode: bracketMode.value as SlashGroupMode,
+      barMode: barMode.value as SlashGroupMode,
+      angleMode: angleMode.value as SlashGroupMode,
+      parenMode: parenMode.value as SlashGroupMode,
       ordering: ordering.value as NonNullable<SlashScoreOptions["ordering"]>,
       tempoMarks: initial.tempoMarks?.map((mark) => ({ ...mark })) ?? [],
       keyChanges: initial.keyChanges?.map((change) => ({ ...change })) ?? [],
@@ -526,37 +572,158 @@ export function showSlashScoreImportDialog(
     const markDirty = () => {
       dirty = true;
     };
-    box.addEventListener("input", markDirty);
-    box.addEventListener("change", markDirty);
+    const settingsBody = document.createElement("div");
+    settingsBody.className = "slash-settings-body";
+    if (purpose === "settings") {
+      const section = (name: string, initiallyOpen = false): HTMLDetailsElement => {
+        const details = document.createElement("details");
+        details.className = "inspector-section";
+        details.open = initiallyOpen;
+        const summary = document.createElement("summary");
+        summary.textContent = name;
+        details.append(summary);
+        settingsBody.append(details);
+        return details;
+      };
+      settingsBody.append(info);
+      const notation = section("谱型与声部", true);
+      notation.append(
+        row("谱子类型", kind), kindHint,
+        keyboardKeyLabelsRow, keyboardTieAsZeroRow, keyboardHideTieLabelsRow,
+        orderingRow, row("声部数量（1–9）", voiceCount),
+        row("多声部乐器名称", instrumentName), singleStaffHint,
+      );
+      const rhythm = section("调号、拍号与速度", true);
+      rhythm.append(
+        row("调号", key),
+        row(analysis.continuous ? "拍号（必填，用于分小节）" : "拍号（可修改）", meter),
+        row("速度（BPM）", tempo), tempoUnitRow, meterHint,
+      );
+      const notationRules = section("时值与括号规则");
+      notationRules.append(
+        mappingDetails,
+        row("花括号 {}", braceMode), row("方括号 []", bracketMode),
+        row("竖线括号 | |", barMode), row("尖括号 <>", angleMode),
+        row("圆括号 ()", parenMode), warning,
+      );
+      metadata.open = false;
+      metadata.classList.add("inspector-section");
+      settingsBody.append(metadata, error);
+      settingsBody.addEventListener("input", markDirty);
+      settingsBody.addEventListener("change", markDirty);
+    } else {
+      box.addEventListener("input", markDirty);
+      box.addEventListener("change", markDirty);
+    }
 
-    const close = (value: SlashScoreOptions | null) => { overlay.remove(); resolve(value); };
-    const applyAndClose = () => {
+    const close = (value: SlashScoreOptions | null) => {
+      releaseImportScroll?.();
+      overlay.remove();
+      resolve(value);
+    };
+    const validatedOptions = (): SlashScoreOptions | null => {
       const value = readOptions();
       try {
         parseSlashScore(text, value);
-        close(value);
+        error.hidden = true;
+        return value;
       } catch (reason) {
         error.hidden = false;
         error.textContent = reason instanceof Error ? reason.message : String(reason);
+        error.scrollIntoView({ block: "nearest" });
+        return null;
       }
     };
-    cancel.onclick = () => close(null);
-    overlay.onclick = (event) => {
-      if (event.target !== overlay) return;
-      if (purpose === "settings" && dirty) {
-        if (window.confirm("乐谱设置尚未保存，是否立即应用到当前乐谱？")) {
-          applyAndClose();
-        }
-        return;
-      }
-      close(null);
+    const applyAndClose = () => {
+      const value = validatedOptions();
+      if (value) close(value);
     };
-    confirm.onclick = applyAndClose;
     updateTempoUnit();
     updateKindControls();
     updateSymbolRows();
     updateRecommendation();
     updateVoiceHint();
+    if (purpose === "settings") {
+      let appliedOptions: SlashScoreOptions | null = null;
+      let releaseSettingsScroll: (() => void) | null = null;
+      const onHeaderChanged = (event: Event): void => {
+        if (!settingsBody.isConnected) return;
+        const changes = (event as CustomEvent<Partial<SlashScoreOptions>>).detail;
+        if (!changes || typeof changes !== "object") return;
+        for (const [field, input] of [
+          ["title", title], ["subtitle", subtitle], ["composer", composer],
+          ["arranger", arranger], ["lyricist", lyricist],
+        ] as const) {
+          if (changes[field] === undefined) continue;
+          initial[field] = changes[field];
+          input.value = changes[field];
+        }
+        if (changes.fifths !== undefined) {
+          initial.fifths = changes.fifths;
+          key.value = String(changes.fifths);
+        }
+        if (changes.beats !== undefined) {
+          initial.beats = changes.beats;
+          beats.value = String(changes.beats);
+        }
+        if (changes.beatType !== undefined) {
+          initial.beatType = changes.beatType;
+          beatType.value = String(changes.beatType);
+        }
+        if (changes.tempoBpm !== undefined) {
+          initial.tempoBpm = changes.tempoBpm;
+          quarterTempo = changes.tempoBpm;
+        }
+        if (changes.tempoBeatUnit !== undefined) {
+          initial.tempoBeatUnit = changes.tempoBeatUnit;
+          displayedTempoUnit = changes.tempoBeatUnit;
+        }
+        if (changes.tempoBpm !== undefined || changes.tempoBeatUnit !== undefined) {
+          tempo.value = formatTempoBpm(tempoBpmForUnit(quarterTempo, displayedTempoUnit));
+          if (displayedTempoUnit !== "quarter") tempoUnit.value = displayedTempoUnit;
+        }
+        if (changes.tempoMarks !== undefined) {
+          initial.tempoMarks = changes.tempoMarks.map((mark) => ({ ...mark }));
+        }
+        if (changes.keyChanges !== undefined) {
+          initial.keyChanges = changes.keyChanges.map((change) => ({ ...change }));
+        }
+        updateTempoUnit();
+      };
+      document.addEventListener("editor:header-changed", onHeaderChanged);
+      void openInspector({
+        id: "score",
+        title: "乐谱",
+        body: settingsBody,
+        isDirty: () => dirty,
+        onApply: () => {
+          appliedOptions = validatedOptions();
+          return appliedOptions !== null;
+        },
+        onClosed: (applied) => {
+          releaseSettingsScroll?.();
+          document.removeEventListener("editor:header-changed", onHeaderChanged);
+          resolve(applied ? appliedOptions : null);
+        },
+        applyText: "应用到当前乐谱",
+        initialFocus: kind,
+      }).then((opened) => {
+        if (!opened) {
+          document.removeEventListener("editor:header-changed", onHeaderChanged);
+          resolve(null);
+          return;
+        }
+        const content = settingsBody.closest<HTMLElement>(".inspector-content");
+        if (content) releaseSettingsScroll = retainDetailsScroll(settingsBody, content);
+      });
+      return;
+    }
+    cancel.onclick = () => close(null);
+    overlay.onclick = (event) => {
+      if (event.target !== overlay) return;
+      close(null);
+    };
+    confirm.onclick = applyAndClose;
     kind.focus();
   });
 }

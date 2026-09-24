@@ -9,17 +9,17 @@
          → 页面已隔离 → 脚本自动跳过。首次访问会自动多刷新一次。 -->
     <script src="coi-serviceworker.js"></script>
 
-    <title>原琴简谱编辑器 — 原神琴谱制作 · MIDI 转简谱 | Genshin Jianpu Editor</title>
+    <title>原琴助手编辑器 — 简谱、键盘谱与 MIDI 转谱</title>
     <meta
       name="description"
-      content="原琴简谱编辑器：面向原神琴谱制作的开源 MIDI 转简谱、键盘谱与数字谱编辑排版工具。支持智能量化、MusicXML、ABC、简谱图片识别、实时 SVG 预览、播放及 PDF/PNG/MIDI/PPTX 导出。An open-source jianpu editor and MIDI converter for Genshin musicians."
+      content="原琴助手编辑器：简谱、键盘谱与数字谱编辑排版工具。支持 MIDI 转谱、MusicXML、ABC、图片识别、实时预览、播放及多格式导出。"
     />
     <meta
       name="keywords"
-      content="原琴,原琴简谱编辑器,原神琴谱,原神风物琴,原神键盘谱,Genshin music,Genshin lyre,MIDI转简谱,MIDI导入,MIDI量化,键盘谱,数字谱,简谱编辑器,简谱排版,简谱识别,OMR,ABC记谱,JP-Word,jpwabc,MusicXML,jianpu,numbered notation,Tauri"
+      content="原琴,原琴助手编辑器,原神琴谱,原神风物琴,原神键盘谱,Genshin music,Genshin lyre,MIDI转简谱,MIDI导入,MIDI量化,键盘谱,数字谱,简谱编辑器,简谱排版,简谱识别,OMR,ABC记谱,JP-Word,jpwabc,MusicXML,jianpu,numbered notation,Tauri"
     />
     <meta name="author" content="StarryCosmosPiano" />
-    <meta name="theme-color" content="#f5f5f5" />
+    <meta name="theme-color" content="#FFFBFF" />
     <link rel="canonical" href="https://starrycosmospiano.github.io/genshin-jianpu-editor/" />
     <link rel="alternate" hreflang="zh-CN" href="https://starrycosmospiano.github.io/genshin-jianpu-editor/" />
     <link rel="alternate" hreflang="en" href="https://starrycosmospiano.github.io/genshin-jianpu-editor/" />
@@ -27,8 +27,8 @@
 
     <!-- Open Graph -->
     <meta property="og:type" content="website" />
-    <meta property="og:site_name" content="原琴简谱编辑器" />
-    <meta property="og:title" content="原琴简谱编辑器 — 原神琴谱制作 · MIDI 转简谱" />
+    <meta property="og:site_name" content="原琴助手编辑器" />
+    <meta property="og:title" content="原琴助手编辑器 — 简谱、键盘谱与 MIDI 转谱" />
     <meta
       property="og:description"
       content="面向原神琴谱制作的开源简谱编辑器：MIDI 智能转谱、键盘谱与数字谱、实时 SVG 排版、播放及多格式导出。"
@@ -42,14 +42,14 @@
 
     <!-- Twitter -->
     <meta name="twitter:card" content="summary_large_image" />
-    <meta name="twitter:title" content="原琴简谱编辑器 — Genshin Jianpu Editor" />
+    <meta name="twitter:title" content="原琴助手编辑器" />
     <meta
       name="twitter:description"
       content="面向原神琴谱制作的开源 MIDI 转简谱、键盘谱与 SVG 排版工具。"
     />
     <meta name="twitter:image" content="https://starrycosmospiano.github.io/genshin-jianpu-editor/og-image.png" />
 
-    <link rel="icon" type="image/svg+xml" href="%BASE_URL%favicon.svg" />
+    <link rel="icon" type="image/x-icon" href="%BASE_URL%favicon.ico" />
     <link rel="manifest" href="%BASE_URL%manifest.webmanifest" />
     <link rel="stylesheet" href="/src/styles.css" />
 
@@ -60,7 +60,7 @@
       "@graph": [
         {
           "@type": "SoftwareApplication",
-          "name": "原琴简谱编辑器",
+          "name": "原琴助手编辑器",
           "alternateName": "Genshin Jianpu Editor",
           "applicationCategory": "MultimediaApplication",
           "operatingSystem": "Windows, macOS, Web",
@@ -76,7 +76,7 @@
             "简谱与五线谱混排（加载 MusicXML 排版，含连音线/连谱号/力度/踏板/和弦记号）",
             "MusicXML 导入转简谱",
             "乐谱播放：光标跟随 + 两路音源",
-            "导出 PDF / PNG / MIDI / 矢量 PPTX",
+            "导出 PDF / PNG / MIDI / MusicXML / 矢量 PPTX",
             "点选高亮与自动分页（16:9 / 4:3 / A4 / A3）",
             "跨平台：浏览器在线版 + Windows/macOS 桌面版"
           ],
@@ -89,10 +89,10 @@
           "mainEntity": [
             {
               "@type": "Question",
-              "name": "什么是原琴简谱编辑器？",
+              "name": "什么是原琴助手编辑器？",
               "acceptedAnswer": {
                 "@type": "Answer",
-                "text": "原琴简谱编辑器是一款面向原神琴谱制作的开源简谱排版与 MIDI 转谱工具。左侧编辑代码、右侧实时渲染简谱，支持键盘谱、数字谱、MusicXML、ABC、OMR 以及 PDF、PNG、MIDI、矢量 PPTX 导出。"
+                "text": "原琴助手编辑器是一款面向原神琴谱制作的开源简谱排版与 MIDI 转谱工具。默认显示可直接编辑的乐谱，文本谱可按需展开，支持键盘谱、数字谱、MusicXML、ABC、OMR 以及 PDF、PNG、MIDI、矢量 PPTX 导出。"
               }
             },
             {
@@ -100,7 +100,7 @@
               "name": ".jpwabc 是什么格式？",
               "acceptedAnswer": {
                 "@type": "Answer",
-                "text": ".jpwabc 是 JP-Word 简谱软件使用的文本谱面格式，按 .Title/.Voice/.Words 等小节描述标题、调号拍号、音符与歌词。原琴简谱编辑器用 ANTLR 解析该格式并排版为 SVG 简谱。文件以 UTF-16LE（带 BOM）编解码以兼容 JP-Word。"
+                "text": ".jpwabc 是 JP-Word 简谱软件使用的文本谱面格式，按 .Title/.Voice/.Words 等小节描述标题、调号拍号、音符与歌词。原琴助手编辑器用 ANTLR 解析该格式并排版为 SVG 简谱。文件以 UTF-16LE（带 BOM）编解码以兼容 JP-Word。"
               }
             },
             {
@@ -108,20 +108,20 @@
               "name": "如何把 MusicXML 转成简谱？",
               "acceptedAnswer": {
                 "@type": "Answer",
-                "text": "在原琴简谱编辑器中打开或拖入 .musicxml/.xml 文件即可导入并转换为简谱；也可用「混排」模式直接按五线谱与简谱混合排版。"
+                "text": "在原琴助手编辑器中打开或拖入 .musicxml/.xml 文件即可导入并转换为简谱；也可用「混排」模式直接按五线谱与简谱混合排版。"
               }
             },
             {
               "@type": "Question",
-              "name": "原琴简谱编辑器能识别简谱图片吗？（OMR）",
+              "name": "原琴助手编辑器能识别简谱图片吗？（OMR）",
               "acceptedAnswer": {
                 "@type": "Answer",
-                "text": "可以。点工具栏「识图」，选择识别方式即可把简谱照片或截图识别成乐谱并排版：一是「musicpp」本地方式，完全在浏览器/桌面本地运行、可离线，数字用 PaddleOCR PP-OCRv4 识别，还能识别歌词并逐音节对齐（数字实测约 100%、完整 token 约 95%）；二是「Gemini」整页转写方式（仅桌面版，经 agy 调用，对真实照片更准）。识别结果会走 MusicXML 导入路径转成简谱，可继续编辑、排版、导出。"
+                "text": "可以。点工具栏「识图」，选择识别方式即可把简谱照片或截图识别成乐谱并排版：一是「musicpp」本地方式，完全在浏览器/桌面本地运行、可离线，数字和文字使用 PaddleOCR PP-OCRv6_small，还能识别歌词并逐音节对齐；二是「Gemini」整页转写方式（仅桌面版，经 agy 调用，对真实照片更准）。识别结果会走 MusicXML 导入路径转成简谱，可继续编辑、排版、导出。"
               }
             },
             {
               "@type": "Question",
-              "name": "原琴简谱编辑器支持 ABC 记谱导入吗？",
+              "name": "原琴助手编辑器支持 ABC 记谱导入吗？",
               "acceptedAnswer": {
                 "@type": "Answer",
                 "text": "支持。把 .abc 文件拖入或用「打开」选择，程序会自动将 ABC 记谱转成 MusicXML 再排版为简谱，支持多声部、连奏、重复、和弦、装饰音与调号变更等。"
@@ -132,7 +132,7 @@
               "name": "macOS 提示「已损坏」或「无法验证开发者」怎么办？",
               "acceptedAnswer": {
                 "@type": "Answer",
-                "text": "因应用未购买苹果开发者签名，首次打开可能被拦截。把 Genshin Jianpu Editor.app 拖入「应用程序」后，可在终端使用 xattr -cr 清除该应用的隔离标记；或者直接使用浏览器在线版。"
+                "text": "因应用未购买苹果开发者签名，首次打开可能被拦截。把「原琴助手编辑器.app」拖入「应用程序」后，可在终端使用 xattr -cr 清除该应用的隔离标记；或者直接使用浏览器在线版。"
               }
             }
           ]
@@ -145,56 +145,129 @@
   </head>
   <body>
     <div id="app">
-      <div id="toolbar">
-        <button id="btn-create" title="创建 JPW 简谱、键盘谱或数字谱">创建</button>
-        <button id="btn-open">打开</button>
-        <button id="btn-save">保存</button>
-        <button id="btn-saveas">另存为</button>
-        <button id="btn-export">导出</button>
-        <button id="btn-mixed" disabled>混排</button>
-        <button id="btn-recognize" title="识别模式：二值图 + 半透明识别结果叠加核对" disabled>识别</button>
-        <select id="sel-recog-view" title="识别视图" hidden>
-          <option value="floating">附近浮窗</option>
-          <option value="inplace">原位叠加</option>
-          <option value="original">仅原图</option>
-        </select>
-        <button id="btn-phrase" title="按乐句分析自动断行排版，可切回原始排版" disabled>乐句排版</button>
-        <span class="sep"></span>
-        <button id="btn-options">选项</button>
-        <button id="btn-score-settings" title="修改当前键盘谱或数字谱的识别、节奏、拍号、速度与标题设置">乐谱设置</button>
-        <button id="btn-layout-style" title="调整数字、和弦、花括号和小节线并应用到全部简谱">排版</button>
-        <span class="sep"></span>
-        <button id="btn-preview-lock" type="button" aria-pressed="false" title="暂停文本编辑引起的实时重排">锁定谱面</button>
-        <button id="btn-play">播放</button>
-        <button id="btn-stop">停止</button>
-        <div id="rhythm-grid-control" role="group" aria-label="音符移动与节奏刻度">
-          <span class="rhythm-grid-label">刻度</span>
-          <button type="button" data-rhythm-division="64" title="64 分音符刻度；再次点击恢复自动" aria-label="64 分音符刻度"><span class="rhythm-grid-glyph">&#x1D163;</span></button>
-          <button type="button" data-rhythm-division="32" title="32 分音符刻度；再次点击恢复自动" aria-label="32 分音符刻度"><span class="rhythm-grid-glyph">&#x1D162;</span></button>
-          <button type="button" data-rhythm-division="16" title="16 分音符刻度；再次点击恢复自动" aria-label="16 分音符刻度"><span class="rhythm-grid-glyph">&#x1D161;</span></button>
-          <button type="button" data-rhythm-division="8" title="8 分音符刻度；再次点击恢复自动" aria-label="8 分音符刻度"><span class="rhythm-grid-glyph">&#x1D160;</span></button>
-          <button type="button" data-rhythm-division="4" title="4 分音符刻度；再次点击恢复自动" aria-label="4 分音符刻度"><span class="rhythm-grid-glyph">&#x1D15F;</span></button>
-          <button type="button" data-rhythm-division="2" title="2 分音符刻度；再次点击恢复自动" aria-label="2 分音符刻度"><span class="rhythm-grid-glyph">&#x1D15E;</span></button>
-          <button type="button" data-rhythm-division="1" title="全音符刻度；再次点击恢复自动" aria-label="全音符刻度"><span class="rhythm-grid-glyph">&#x1D15D;</span></button>
+      <header id="app-header">
+        <div class="brand" aria-label="原琴助手编辑器">
+          <span class="brand-mark" aria-hidden="true"><img src="%BASE_URL%yuanqin-logo.png" width="32" height="32" alt="" /></span>
+          <span class="brand-name">原琴助手编辑器</span>
         </div>
-        <span class="sep"></span>
-        <button id="btn-zoom-out" title="缩小 (Ctrl/⌘ -)">−</button>
-        <button id="btn-zoom-reset" title="复位 (Ctrl/⌘ 0)">100%</button>
-        <button id="btn-zoom-in" title="放大 (Ctrl/⌘ +)">＋</button>
-        <span class="sep"></span>
-        <button id="btn-prev">上一页</button>
-        <button id="btn-next">下一页</button>
-        <span class="sep"></span>
-        <button id="btn-help" title="功能帮助与记谱法说明">帮助</button>
+        <div class="document-identity" aria-live="polite">
+          <span id="workspace-document-name">未命名乐谱</span>
+          <span id="workspace-document-format"></span>
+        </div>
+        <div class="header-actions">
+          <div class="header-menu-wrap">
+            <button id="btn-file-menu" type="button" aria-haspopup="menu" aria-controls="file-menu" aria-expanded="false"><span aria-hidden="true">☷</span><span>文件</span></button>
+            <div id="file-menu" class="header-menu" role="menu" aria-label="文件" hidden>
+              <button id="btn-create" class="header-menu-item" type="button" role="menuitem">新建乐谱</button>
+              <button id="btn-open" class="header-menu-item" type="button" role="menuitem">打开文件</button>
+              <button id="btn-import" class="header-menu-item" type="button" role="menuitem">导入乐谱</button>
+              <button id="btn-saveas" class="header-menu-item" type="button" role="menuitem">另存为</button>
+              <div class="header-menu-separator" role="separator"></div>
+              <button id="btn-mixed" class="header-menu-item" type="button" role="menuitem" disabled>混排</button>
+              <button id="btn-recognize" class="header-menu-item" type="button" role="menuitem" disabled>识图</button>
+              <label class="header-menu-label" for="sel-recog-view">识别视图</label>
+              <select id="sel-recog-view" title="识别视图" hidden>
+                <option value="floating">附近浮窗</option>
+                <option value="inplace">原位叠加</option>
+                <option value="original">仅原图</option>
+              </select>
+              <button id="btn-phrase" class="header-menu-item" type="button" role="menuitem" disabled>乐句排版</button>
+            </div>
+          </div>
+          <button id="btn-save" type="button" aria-label="保存"><span aria-hidden="true">▣</span><span>保存</span></button>
+          <button id="btn-export" type="button" aria-label="导出"><span aria-hidden="true">↗</span><span>导出</span></button>
+          <button id="btn-options" type="button" aria-label="设置" title="应用设置"><span aria-hidden="true">⚙</span><span>设置</span></button>
+          <button id="btn-help" type="button" aria-label="帮助" title="帮助与记谱法"><span aria-hidden="true">?</span><span>帮助</span></button>
+        </div>
+      </header>
+
+      <div id="toolbar" role="toolbar" aria-label="乐谱编辑工具">
+        <div class="toolbar-mode-group" role="group" aria-label="编辑模式">
+          <button id="btn-select-mode" type="button" aria-label="选择" aria-pressed="true"><span aria-hidden="true">⌖</span><span>选择</span></button>
+          <button id="btn-input-mode" type="button" aria-label="打谱" aria-pressed="false"><span aria-hidden="true">✎</span><span>打谱</span></button>
+        </div>
+        <span class="sep" aria-hidden="true"></span>
+        <button id="btn-undo" type="button" title="撤销"><span aria-hidden="true">↶</span><span>撤销</span></button>
+        <button id="btn-redo" type="button" title="重做"><span aria-hidden="true">↷</span><span>重做</span></button>
+        <span class="sep" aria-hidden="true"></span>
+        <button id="btn-play" type="button" aria-label="播放"><span aria-hidden="true">▶</span><span>播放</span></button>
+        <span class="sep" aria-hidden="true"></span>
+        <div id="rhythm-grid-control" data-toolbar-mode="grid" role="group" aria-label="节奏刻度与书写时值">
+          <div class="rhythm-group" data-rhythm-mode="grid" role="group" aria-label="光标与移动刻度">
+            <span class="rhythm-group-label">刻度</span>
+            <div class="rhythm-grid-options" data-rhythm-mode="grid">
+              <button id="rhythm-grid-auto" type="button" data-rhythm-auto title="自动刻度">自动</button>
+              <button type="button" data-rhythm-division="64" aria-label="64 分音符刻度" aria-pressed="false" title="64 分音符"><span aria-hidden="true">&#x1D163;</span></button>
+              <button type="button" data-rhythm-division="32" aria-label="32 分音符刻度" aria-pressed="false" title="32 分音符"><span aria-hidden="true">&#x1D162;</span></button>
+              <button type="button" data-rhythm-division="16" aria-label="16 分音符刻度" aria-pressed="false" title="16 分音符"><span aria-hidden="true">&#x1D161;</span></button>
+              <button type="button" data-rhythm-division="8" aria-label="8 分音符刻度" aria-pressed="false" title="8 分音符"><span aria-hidden="true">&#x1D160;</span></button>
+              <button type="button" data-rhythm-division="4" aria-label="4 分音符刻度" aria-pressed="false" title="4 分音符"><span aria-hidden="true">&#x1D15F;</span></button>
+              <button type="button" data-rhythm-division="2" aria-label="2 分音符刻度" aria-pressed="false" title="2 分音符"><span aria-hidden="true">&#x1D15E;</span></button>
+              <button type="button" data-rhythm-division="1" aria-label="全音符刻度" aria-pressed="false" title="全音符"><span aria-hidden="true">&#x1D15D;</span></button>
+            </div>
+            <button id="rhythm-grid-dot-toggle" type="button" data-dot-mode="grid" aria-label="刻度附点" aria-pressed="false" title="刻度附点">附点</button>
+          </div>
+          <div class="rhythm-group" data-rhythm-mode="duration" role="group" aria-label="书写音符时值">
+            <span class="rhythm-group-label">时值</span>
+            <div class="rhythm-grid-options" data-rhythm-mode="duration">
+              <button id="input-duration-auto" type="button" data-input-duration-auto title="自动跟随刻度">自动</button>
+              <button type="button" data-input-duration-division="64" aria-label="64 分音符时值" aria-pressed="false" title="64 分音符"><span aria-hidden="true">&#x1D163;</span></button>
+              <button type="button" data-input-duration-division="32" aria-label="32 分音符时值" aria-pressed="false" title="32 分音符"><span aria-hidden="true">&#x1D162;</span></button>
+              <button type="button" data-input-duration-division="16" aria-label="16 分音符时值" aria-pressed="false" title="16 分音符"><span aria-hidden="true">&#x1D161;</span></button>
+              <button type="button" data-input-duration-division="8" aria-label="8 分音符时值" aria-pressed="false" title="8 分音符"><span aria-hidden="true">&#x1D160;</span></button>
+              <button type="button" data-input-duration-division="4" aria-label="4 分音符时值" aria-pressed="false" title="4 分音符"><span aria-hidden="true">&#x1D15F;</span></button>
+              <button type="button" data-input-duration-division="2" aria-label="2 分音符时值" aria-pressed="false" title="2 分音符"><span aria-hidden="true">&#x1D15E;</span></button>
+              <button type="button" data-input-duration-division="1" aria-label="全音符时值" aria-pressed="false" title="全音符"><span aria-hidden="true">&#x1D15D;</span></button>
+            </div>
+            <button id="input-duration-dot-toggle" type="button" data-dot-mode="duration" aria-label="书写附点" aria-pressed="false" title="书写附点">附点</button>
+          </div>
+        </div>
+        <span class="sep" aria-hidden="true"></span>
+        <button id="btn-score-settings" type="button" aria-label="乐谱设置" data-inspector-trigger="score" aria-controls="inspector-pane" aria-expanded="false" title="当前乐谱设置"><span aria-hidden="true">♭</span><span>乐谱</span></button>
+        <button id="btn-layout-style" type="button" aria-label="排版设置" data-inspector-trigger="layout" aria-controls="inspector-pane" aria-expanded="false" title="简谱排版设置"><span aria-hidden="true">▤</span><span>排版</span></button>
       </div>
-      <div id="body">
-        <div id="code-pane"></div>
-        <button id="code-pane-toggle" type="button" aria-label="隐藏或展开文本编辑器" aria-expanded="true" title="隐藏文本编辑器">◀</button>
-        <div id="score-pane"></div>
+
+      <div id="body" data-code-pane-side="left">
+        <section id="code-workspace" aria-label="文本编辑器">
+          <div id="code-workspace-header">
+            <span>文本谱</span>
+            <span class="code-workspace-hint">修改文本后乐谱自动更新</span>
+            <button id="btn-preview-lock" type="button" aria-pressed="false" title="暂停文本修改引起的实时重排">锁定谱面</button>
+          </div>
+          <div id="code-pane"></div>
+        </section>
+        <button id="code-pane-toggle" type="button" aria-label="展开文本编辑器" aria-expanded="false" title="展开文本编辑器">▶</button>
+        <main id="score-pane" tabindex="0" aria-label="乐谱预览"></main>
+        <aside id="inspector-pane" hidden></aside>
       </div>
-      <div id="status"></div>
-    </div>
-    <!-- hidden off-screen svg used for getBBox/getComputedTextLength measurement -->
+
+      <div id="score-input-keypad" class="score-input-keypad" hidden role="group" aria-label="简谱输入键盘">
+        <button type="button" data-input-lane="above" title="在当前音上方添加和弦音">上方＋</button>
+        <button type="button" data-input-degree="0" title="输入休止符">0</button>
+        <button type="button" data-input-degree="1">1</button>
+        <button type="button" data-input-degree="2">2</button>
+        <button type="button" data-input-degree="3">3</button>
+        <button type="button" data-input-degree="4">4</button>
+        <button type="button" data-input-degree="5">5</button>
+        <button type="button" data-input-degree="6">6</button>
+        <button type="button" data-input-degree="7">7</button>
+        <button type="button" data-input-lane="below" title="在当前音下方添加和弦音">下方＋</button>
+      </div>
+
+      <footer id="statusbar">
+        <span id="status" role="status" aria-live="polite"></span>
+        <span id="workspace-position" aria-live="polite"></span>
+        <div id="page-controls" role="group" aria-label="页面与缩放">
+          <button id="btn-prev" type="button" title="上一页">‹</button>
+          <span id="workspace-page-count">1 / 1</span>
+          <button id="btn-next" type="button" title="下一页">›</button>
+          <span class="sep" aria-hidden="true"></span>
+          <button id="btn-zoom-out" type="button" title="缩小">−</button>
+          <button id="btn-zoom-reset" type="button" title="缩放复位">100%</button>
+          <button id="btn-zoom-in" type="button" title="放大">＋</button>
+        </div>
+      </footer>
+    </div>    <!-- hidden off-screen svg used for getBBox/getComputedTextLength measurement -->
     <svg id="measure-svg" width="0" height="0" aria-hidden="true"></svg>
   </body>
 </html>

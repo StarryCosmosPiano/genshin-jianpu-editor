@@ -304,7 +304,7 @@ export function analyzeMidi(parsed: ParsedMidi): MidiAnalysis {
   markTriplets(groups, 64);
   const tripletSources = new Set<ParsedMidiNote>();
   for (const group of groups) if (group.triplet) for (const note of group.notes) tripletSources.add(note.source);
-  const counts: MidiDurationCounts = { 4: 0, 8: 0, 16: 0, 32: 0, 64: 0 };
+  const counts: MidiDurationCounts = { 4: 0, 8: 0, 16: 0, 32: 0, 64: 0, 128: 0 };
   let tripletNoteCount = 0;
   for (const note of notes) {
     const classified = classifyDuration(note.end - note.start);
@@ -444,14 +444,26 @@ function quantizeHand(notes: WorkNote[], division: MidiQuantizeDivision, detectT
 }
 
 function buildMeasureBounds(parsed: ParsedMidi, options: MidiImportOptions, end: number, warnings: string[]): MeasureBound[] {
+  const preserveOpeningMeter = options.preserveSourceRhythmSpelling === true;
   const changes = parsed.timeSignatures
-    .filter((x) => x.tick > 0 && [2, 4, 8, 16].includes(x.beatType))
-    .map((x) => ({ at: x.tick / parsed.ppq, beats: x.beats, beatType: x.beatType }));
+    .filter((x) => (x.tick > 0 || preserveOpeningMeter && x.tick >= 0)
+      && x.beats > 0 && [2, 4, 8, 16].includes(x.beatType))
+    .map((x) => ({ at: x.tick / parsed.ppq, beats: x.beats, beatType: x.beatType }))
+    .sort((left, right) => left.at - right.at);
   const out: MeasureBound[] = [];
   let start = 0;
   let beats = options.beats;
   let beatType = options.beatType;
   let ci = 0;
+  // Compact TXT scores use the MIDI conversion path internally, so their
+  // tick-zero row meter is authoritative. Ordinary MIDI import still lets the
+  // dialog override the opening meter; later MIDI meter changes remain active
+  // in both modes.
+  while (ci < changes.length && changes[ci].at <= 1e-6) {
+    beats = changes[ci].beats;
+    beatType = changes[ci].beatType;
+    ci++;
+  }
   while (start < end - 1e-8 || out.length === 0) {
     let changed = out.length === 0;
     while (ci < changes.length && changes[ci].at <= start + 1e-6) {
@@ -495,7 +507,10 @@ function durationShape(duration: number, triplet: TripletMark | null): { beats: 
     while (beams > 0 && cells % 2 === 0) { cells /= 2; beams--; }
     return { beats: cells, beams, dot: 0, fraction: new Fraction(cells * 2, 3 * (1 << beams)) };
   }
-  let beams = 4;
+  // A user-facing MIDI import stops at 64th notes, but the TXT bridge may
+  // explicitly subdivide that grid once. Keep a fifth beam level internally
+  // so a 128th value is not rounded back to 64 after parsing `<...>`.
+  let beams = 5;
   let cells = Math.max(1, Math.round(duration * (1 << beams)));
   while (beams > 0 && cells % 2 === 0) { cells /= 2; beams--; }
   if (cells === 3 && beams === 0) {
@@ -510,10 +525,10 @@ function durationShape(duration: number, triplet: TripletMark | null): { beats: 
 /** Split binary-grid durations into canonical JPW values, including long dotted notes. */
 function splitNormalDuration(duration: number): number[] {
   const pieces: number[] = [];
-  let left = Math.round(duration * 16) / 16;
+  let left = Math.round(duration * 32) / 32;
   const candidates = [
     4, 3, 2, 1.5, 1,
-    0.75, 0.5, 0.375, 0.25, 0.1875, 0.125, 0.09375, 0.0625,
+    0.75, 0.5, 0.375, 0.25, 0.1875, 0.125, 0.09375, 0.0625, 0.046875, 0.03125,
   ];
   for (const candidate of candidates) {
     while (left >= candidate - 1e-8) {
@@ -521,7 +536,7 @@ function splitNormalDuration(duration: number): number[] {
       left -= candidate;
     }
   }
-  if (pieces.length === 0) pieces.push(1 / 16);
+  if (pieces.length === 0) pieces.push(1 / 32);
   return pieces;
 }
 
@@ -544,6 +559,8 @@ function splitMetricalDuration(
     { value: 0.125, alignment: 0.125 },
     { value: 0.09375, alignment: 0.125 },
     { value: 0.0625, alignment: 0.0625 },
+    { value: 0.046875, alignment: 0.0625 },
+    { value: 0.03125, alignment: 0.03125 },
   ] as const;
   const pieces: number[] = [];
   let position = Math.round(start * 64) / 64;
@@ -564,19 +581,20 @@ function splitMetricalDuration(
           || candidate.value <= availableInBeat + 1e-8
         );
     });
-    const value = written?.value ?? Math.min(remaining, 1 / 16);
+    const value = written?.value ?? Math.min(remaining, 1 / 32);
     pieces.push(value);
     position = Math.round((position + value) * 64) / 64;
     remaining = Math.round((remaining - value) * 64) / 64;
   }
-  if (pieces.length === 0) pieces.push(1 / 16);
+  if (pieces.length === 0) pieces.push(1 / 32);
   return pieces;
 }
 
 function addChord(measure: Measure, start: number, duration: number, pitches: number[], fifths: number, triplet: TripletMark | null): Chord {
   const chord = new Chord(measure);
   const shape = durationShape(duration, triplet);
-  chord.position = new Fraction(Math.round(start * 48), 48);
+  // 384 is the common denominator for binary 128ths and triplet 64ths.
+  chord.position = new Fraction(Math.round(start * 384), 384);
   chord.duration = shape.fraction;
   chord.beats = shape.beats;
   chord.beams = shape.beams;
@@ -886,7 +904,15 @@ function normalizedTrackAssignments(parsed: ParsedMidi, options: MidiImportOptio
 
 export function midiToScore(parsed: ParsedMidi, options: MidiImportOptions): MidiImportResult {
   const analysis = analyzeMidi(parsed);
-  const detectedGestures = detectMidiSlashGestures(parsed, options.quantize);
+  // Keyboard/number TXT already carries grace, arpeggio, and triplet
+  // semantics in its delimiters.  Running the heuristic MIDI gesture
+  // detector over that synthetic MIDI can reinterpret the return notes of an
+  // explicit mordent triplet as grace notes on the following attack.  In the
+  // source-rhythm-preserving path those decorations are restored directly by
+  // the TXT importer, so keep the heuristic detector out of the round trip.
+  const detectedGestures: MidiSlashGestureAnalysis = options.preserveSourceRhythmSpelling
+    ? { grace: [], arpeggio: [], triplet: [] }
+    : detectMidiSlashGestures(parsed, options.quantize);
   const gestures: MidiSlashGestureAnalysis = {
     ...detectedGestures,
     triplet: options.detectTriplets ? detectedGestures.triplet : [],
@@ -903,8 +929,18 @@ export function midiToScore(parsed: ParsedMidi, options: MidiImportOptions): Mid
     ? assignments.map((assignment) => sourceNotes.filter((note) => note.source.track === assignment.track))
     : splitHands(parsed, sourceNotes, resolvedMode, options.splitPitch);
   const quantized = streams.map((notes) => quantizeHand(notes, options.quantize, options.detectTriplets));
+  const openingSignature = options.preserveSourceRhythmSpelling
+    ? [...parsed.timeSignatures]
+      .filter((signature) => signature.tick === 0
+        && signature.beats > 0
+        && [2, 4, 8, 16].includes(signature.beatType))
+      .pop()
+    : undefined;
+  const openingMeasureLength = openingSignature
+    ? openingSignature.beats * 4 / openingSignature.beatType
+    : options.beats * 4 / options.beatType;
   const end = Math.max(
-    options.beats * 4 / options.beatType,
+    openingMeasureLength,
     ...quantized.flatMap((part) => part.events.map((event) => event.end)),
   );
   const warnings: string[] = [];

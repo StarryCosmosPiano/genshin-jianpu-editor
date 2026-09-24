@@ -1,7 +1,7 @@
 [package]
 name = "jpeditor"
-version = "0.3.1"
-description = "原琴简谱编辑器 / Genshin Jianpu Editor"
+version = "0.4.0"
+description = "原琴助手编辑器 / Genshin Jianpu Editor"
 authors = ["StarryCosmosPiano"]
 edition = "2021"
 

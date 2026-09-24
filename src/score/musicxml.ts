@@ -8,7 +8,9 @@ import {
   BarlineEntry,
   Chord,
   Credit,
+  AccidentalStat,
   JumpSpec,
+  KeyMark,
   Lyric,
   Measure,
   Note,
@@ -61,6 +63,12 @@ interface ImportedTempoEvent {
   offset: Fraction;
   bpm: number;
   beatUnit: TempoBeatUnit;
+}
+
+interface ImportedKeyEvent {
+  measure: number;
+  offset: Fraction;
+  fifths: number;
 }
 
 function noteDuration(noteEl: Element): Fraction {
@@ -131,6 +139,21 @@ function parseNotations(nt: Note, noteEl: Element): void {
       const ty = it.getAttribute("type");
       if (ty === "start") nt.chord.slurStart = true;
       else if (ty === "stop") nt.chord.slurEnd = true;
+    } else if (it.tagName === "arpeggiate") {
+      nt.chord.arpeggio = true;
+    } else if (it.tagName === "ornaments") {
+      for (const ornament of Array.from(it.children)) {
+        const value = ornament.tagName === "inverted-mordent"
+          ? { kind: "upper-mordent" as const }
+          : ornament.tagName === "mordent"
+            ? { kind: "lower-mordent" as const }
+            : ornament.tagName === "trill-mark"
+              ? { kind: "trill" as const, subdivision: 32 as const }
+              : null;
+        if (value && !nt.chord.ornaments.some((existing) => existing.kind === value.kind)) {
+          nt.chord.ornaments.push(value);
+        }
+      }
     }
   }
 }
@@ -201,10 +224,32 @@ function onNote(
   }
 }
 
-function parseAttribute(m: Measure, attrEl: Element): void {
+function rememberKey(
+  keys: ImportedKeyEvent[] | null,
+  event: ImportedKeyEvent,
+): void {
+  if (!keys) return;
+  const existing = keys.findIndex((item) =>
+    item.measure === event.measure && item.offset.equals(event.offset));
+  if (existing >= 0) keys[existing] = event;
+  else keys.push(event);
+}
+
+function parseAttribute(
+  m: Measure,
+  attrEl: Element,
+  offset: Fraction,
+  keys: ImportedKeyEvent[] | null,
+): void {
   for (const k of elems(attrEl, "key")) {
     const fifths = intOf(k, "fifths");
-    if (fifths !== null) { m.key.fifths = fifths; m.keyChange = true; }
+    if (fifths !== null) {
+      if (offset.equals(0)) {
+        m.key.fifths = fifths;
+        m.keyChange = true;
+      }
+      rememberKey(keys, { measure: m.index, offset, fifths });
+    }
   }
   for (const t of elems(attrEl, "time")) {
     const [beats, beatType] = parseTimeSig(t);
@@ -336,13 +381,15 @@ function loadMeasure(
   tmp: ParserTemp,
   staffFilter: number | null,
   tempos: ImportedTempoEvent[] | null,
+  keys: ImportedKeyEvent[] | null,
+  inheritedFifths: number,
 ): void {
   if (/^(?:yes|true|1)$/i.test(measureEl.getAttribute("implicit") ?? "")) {
     m.pickup = true;
     m.displayNumber = null;
   }
   if (prev) {
-    m.key.fifths = prev.key.fifths;
+    m.key.fifths = inheritedFifths;
     m.time.beats = prev.time.beats;
     m.time.beatType = prev.time.beatType;
   }
@@ -357,7 +404,7 @@ function loadMeasure(
       // while keyboard/number TXT correctly discarded those negative attacks.
       case "backup": st.pos = st.noteEnd.minus(new Fraction(intOf(item, "duration") ?? 0)); st.noteEnd = st.pos; break;
       case "forward": st.pos = st.noteEnd.plus(new Fraction(intOf(item, "duration") ?? 0)); st.noteEnd = st.pos; break;
-      case "attributes": parseAttribute(m, item); break;
+      case "attributes": parseAttribute(m, item, st.noteEnd.divInt(div), keys); break;
       case "print": parsePrint(m, item); break;
       case "barline": st.pos = st.noteEnd; parseBarline(m, item, st); break;
       case "sound": {
@@ -384,22 +431,30 @@ function loadPart(
   pd: PlayData,
   staffFilter: number | null = null,
   tempos: ImportedTempoEvent[] | null = null,
+  keys: ImportedKeyEvent[] | null = null,
 ): void {
   const measureEls = elems(partEl, "measure");
   let div = 1;
   let pos = new Fraction(0);
   const tmp = new ParserTemp(pd);
   let cur: Measure | null = null;
+  let inheritedFifths = 0;
   measureEls.forEach((mel, mid) => {
     const attr = elem(mel, "attributes");
     const nextDiv = attr ? intOf(attr, "divisions") : null;
     if (nextDiv !== null && nextDiv > 0) div = nextDiv;
     const mea = new Measure(mid);
     mea.position = pos;
-    loadMeasure(mea, mel, cur, div, tmp, staffFilter, tempos);
+    loadMeasure(mea, mel, cur, div, tmp, staffFilter, tempos, keys, inheritedFifths);
     part.measures.push(mea);
     tmp.pairTuplet();
     pos = pos.plus(mea.duration);
+    const measureKeys = keys
+      ?.filter((event) => event.measure === mid)
+      .sort((left, right) => left.offset.compareTo(right.offset));
+    inheritedFifths = measureKeys && measureKeys.length > 0
+      ? measureKeys[measureKeys.length - 1].fifths
+      : mea.key.fifths;
     cur = mea;
   });
   tmp.pairTie();
@@ -593,6 +648,7 @@ export function loadMusicXml(xmlText: string): Score {
   const root = doc.documentElement; // score-partwise
   const score = new Score();
   const importedTempos: ImportedTempoEvent[] = [];
+  const importedKeys: ImportedKeyEvent[] = [];
 
   score.title = extractScoreTitle(root);
   const movementTitle = normText(txt(root, "movement-title"));
@@ -638,7 +694,7 @@ export function loadMusicXml(xmlText: string): Score {
     const right = new Part();
     right.hand = "right";
     right.voiceIndex = 1;
-    loadPart(right, partEls[0], score.playData, 1, importedTempos);
+    loadPart(right, partEls[0], score.playData, 1, importedTempos, importedKeys);
     const left = new Part();
     left.hand = "left";
     left.voiceIndex = 2;
@@ -651,7 +707,7 @@ export function loadMusicXml(xmlText: string): Score {
     const right = new Part();
     right.hand = "right";
     right.voiceIndex = 1;
-    loadPart(right, partEls[0], score.playData, null, importedTempos);
+    loadPart(right, partEls[0], score.playData, null, importedTempos, importedKeys);
     const left = new Part();
     left.hand = "left";
     left.voiceIndex = 2;
@@ -678,6 +734,7 @@ export function loadMusicXml(xmlText: string): Score {
           score.parts.length === 0 ? score.playData : new PlayData(),
           staves > 1 ? staff : undefined,
           score.parts.length === 0 ? importedTempos : null,
+          score.parts.length === 0 ? importedKeys : null,
         );
         score.parts.push(part);
       }
@@ -697,6 +754,10 @@ export function loadMusicXml(xmlText: string): Score {
     }
   }
   applyImportedTempos(score, importedTempos);
+  score.keyMarks = importedKeys
+    .filter((event) => event.measure > 0 || !event.offset.equals(0))
+    .sort((left, right) => left.measure - right.measure || left.offset.compareTo(right.offset))
+    .map((event) => new KeyMark(event.measure, event.offset, event.fifths));
   for (const part of score.parts) {
     for (const m of part.measures) {
       m.init(score.piano || score.ensemble
@@ -710,6 +771,29 @@ export function loadMusicXml(xmlText: string): Score {
           if (lyrics.length > 0 && ent.notes.length > 0) {
             for (const n of ent.notes) n.lyrics = [];
             ent.notes[0].lyrics = lyrics;
+          }
+        }
+      }
+      const localKeys = score.keyMarks
+        .filter((mark) => mark.measure === m.index)
+        .sort((left, right) => left.offset.compareTo(right.offset));
+      if (localKeys.length > 0) {
+        let fifths = m.key.fifths;
+        let keyCursor = 0;
+        let accidental = new AccidentalStat(fifths);
+        const chords = m.entries
+          .filter((entry): entry is Chord => entry instanceof Chord)
+          .sort((left, right) => left.position.compareTo(right.position));
+        for (const chord of chords) {
+          while (keyCursor < localKeys.length
+            && localKeys[keyCursor].offset.compareTo(chord.position) <= 0) {
+            fifths = localKeys[keyCursor].fifths;
+            accidental = new AccidentalStat(fifths);
+            keyCursor++;
+          }
+          if (chord.rest) continue;
+          for (const note of [...chord.graceNotes, ...chord.notes]) {
+            if (!note.rest) note.init(fifths, accidental);
           }
         }
       }

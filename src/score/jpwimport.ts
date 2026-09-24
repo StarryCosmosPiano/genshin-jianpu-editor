@@ -15,7 +15,7 @@ import {
   BarlineEntry,
   Chord,
   Credit,
-  doPairTuplet,
+  Tuplet,
   Key,
   LineBreak,
   Measure,
@@ -27,6 +27,10 @@ import {
   PlayItem,
   RepeatSpec,
   Score,
+  KeyMark,
+  CrossPartArpeggio,
+  ScoreTextMark,
+  type ChordOrnament,
   TempoMark,
   Time,
 } from "./score";
@@ -226,6 +230,36 @@ function updateTimeInf(p: Part): void {
   }
 }
 
+/** Restore one shared Tuplet object for every chord in a JPW `{(3}... )`
+ * container.  The old importer paired only the opening and closing notes,
+ * leaving variable middle members without tuplets during serialization. */
+function pairAllTupletMembers(part: Part): void {
+  const chords = part.measures.flatMap((measure) => measure.entries)
+    .filter((entry): entry is Chord => entry instanceof Chord);
+  let begin = -1;
+  for (let index = 0; index < chords.length; index++) {
+    const chord = chords[index];
+    if (chord.notes.some((note) => note.tupletBegin)) {
+      if (begin >= 0) begin = -1;
+      begin = index;
+    }
+    if (begin < 0 || !chord.notes.some((note) => note.tupletEnd)) continue;
+    const first = chords[begin].notes[0];
+    const last = chord.notes[0];
+    if (!first || !last || (first !== last && (first.tupletEnd || last.tupletBegin))) {
+      begin = -1;
+      continue;
+    }
+    const tuplet = new Tuplet(first, last);
+    tuplet.voiceIndex = part.voiceIndex;
+    for (let member = begin; member <= index; member++) {
+      for (const note of chords[member].notes) note.tuplet = tuplet;
+    }
+    tuplet.refreshTiming();
+    begin = -1;
+  }
+}
+
 function makePart(
   sec: VoiceSection,
   key: Key,
@@ -243,7 +277,6 @@ function makePart(
   const stat = new JpState();
   stat.basePitch = MusicCommon.getBasePitchOfKey(key);
   stat.fifths = key.fifths;
-  const tupNotes: Note[] = [];
   let mid = 0;
   let currentTime = new Time(ts.beats, ts.beatType);
   let pendingTimeChange = false;
@@ -276,13 +309,11 @@ function makePart(
         newMeasure = false;
       }
       const chord = makeChord(noteCtx, mea, stat);
-      const nt = chord.notes[0];
       // A serialized tie-chain middle chord is written as `(A (A) A)`, so it
       // simultaneously closes one arc and opens the next.  Pairing the first
       // segment clears its visual slur flags; retain this fact before pairing
       // so the same chord can still seed the following segment.
       const startsFollowingSlur = chord.slurStart;
-      if (nt.tupletEnd || nt.tupletBegin) tupNotes.push(nt);
       if (slurChords !== null && !slurChords.includes(chord)) slurChords.push(chord);
       if (chord.slurEnd) {
         if (slurChords !== null && !convertSamePitchSlurToTie(slurChords)) {
@@ -330,22 +361,34 @@ function makePart(
     // TextContext / TimesigContext / prelude: ignored (as in original)
   }
 
-  doPairTuplet(tupNotes);
   updateTimeInf(res);
+  pairAllTupletMembers(res);
   return res;
+}
+
+function parseKeyMarks(text: string | null): KeyMark[] {
+  const result: KeyMark[] = [];
+  for (const token of text?.split(";") ?? []) {
+    const match = /^(\d+)(?:@([^=]+))?\s*=\s*([^;]+)$/.exec(token.trim());
+    if (!match) continue;
+    const measure = parseInt(match[1], 10) - 1;
+    const offset = match[2] ? Fraction.fromString(match[2].trim()) : new Fraction(0);
+    const raw = match[3].trim();
+    const numeric = /^-?\d+$/.test(raw) ? parseInt(raw, 10) : null;
+    const fifths = numeric ?? MusicCommon.keyNameToFifth(raw);
+    if (measure < 0 || !Number.isFinite(offset.toFloat()) || offset.compareTo(new Fraction(0)) < 0
+      || fifths < -7 || fifths > 7) continue;
+    result.push(new KeyMark(measure, offset, fifths));
+  }
+  return result;
 }
 
 function parseKeyChanges(text: string | null): Map<number, number> {
   const result = new Map<number, number>();
-  for (const token of text?.split(";") ?? []) {
-    const match = /^(\d+)\s*=\s*([^;]+)$/.exec(token.trim());
-    if (!match) continue;
-    const measure = parseInt(match[1], 10) - 1;
-    const raw = match[2].trim();
-    const numeric = /^-?\d+$/.test(raw) ? parseInt(raw, 10) : null;
-    const fifths = numeric ?? MusicCommon.keyNameToFifth(raw);
-    if (measure <= 0 || fifths < -7 || fifths > 7) continue;
-    result.set(measure, fifths);
+  // Legacy part construction only understands measure-boundary keys.  Never
+  // apply a mid-measure mark to the beginning of its measure.
+  for (const mark of parseKeyMarks(text)) {
+    if (mark.offset.equals(new Fraction(0))) result.set(mark.measure, mark.fifths);
   }
   return result;
 }
@@ -354,7 +397,10 @@ function applyTitleAnnotations(
   score: Score,
   tempoText: string | null,
   arpeggioText: string | null,
+  annotationsText: string | null = null,
+  keyChangesText: string | null = null,
 ): void {
+  score.keyMarks.push(...parseKeyMarks(keyChangesText));
   for (const token of tempoText?.split(";") ?? []) {
     const match = /^(\d+)@([^=]+)=(accel|rit|tempo)(?::(\d+(?:\.\d+)?))?$/.exec(token.trim());
     if (!match) continue;
@@ -380,6 +426,100 @@ function applyTitleAnnotations(
     const chord = measure.entries.find((entry): entry is Chord =>
       entry instanceof Chord && entry.position.equals(offset));
     if (chord) chord.arpeggio = true;
+  }
+
+  // New annotations are deliberately JSON so unknown future fields can be
+  // ignored without making an otherwise valid JPW file unloadable.
+  if (!annotationsText) return;
+  let payload: unknown;
+  try { payload = JSON.parse(annotationsText); } catch { return; }
+  if (!payload || typeof payload !== "object") return;
+  const value = payload as Record<string, unknown>;
+  const number = (v: unknown): number | null => {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : null;
+  };
+  const fraction = (v: unknown): Fraction | null => {
+    if (typeof v !== "string" && typeof v !== "number") return null;
+    try {
+      const f = Fraction.fromString(String(v));
+      return Number.isFinite(f.toFloat()) ? f : null;
+    } catch { return null; }
+  };
+  const keyMarks = Array.isArray(value.keyMarks) ? value.keyMarks : [];
+  for (const raw of keyMarks) {
+    if (!raw || typeof raw !== "object") continue;
+    const item = raw as Record<string, unknown>;
+    const measure = number(item.measure);
+    const offset = fraction(item.offset);
+    const fifths = number(item.fifths);
+    if (measure === null || offset === null || fifths === null
+      || measure < 0 || fifths < -7 || fifths > 7) continue;
+    score.keyMarks.push(new KeyMark(Math.round(measure), offset, Math.round(fifths)));
+  }
+  const marks = Array.isArray(value.textMarks) ? value.textMarks : [];
+  for (const raw of marks) {
+    if (!raw || typeof raw !== "object") continue;
+    const item = raw as Record<string, unknown>;
+    const measure = number(item.measure);
+    const offset = fraction(item.offset);
+    if (measure === null || offset === null || typeof item.text !== "string") continue;
+    const mark = new ScoreTextMark();
+    const partIndex = number(item.partIndex);
+    if (partIndex !== null && partIndex >= 0) mark.partIndex = Math.round(partIndex);
+    mark.measure = Math.max(0, Math.round(measure));
+    mark.offset = offset;
+    mark.text = item.text;
+    if (item.placement === "below" || item.placement === "left" || item.placement === "right") {
+      mark.placement = item.placement;
+    }
+    score.textMarks.push(mark);
+  }
+  const cross = Array.isArray(value.crossPartArpeggios) ? value.crossPartArpeggios : [];
+  for (const raw of cross) {
+    if (!raw || typeof raw !== "object") continue;
+    const item = raw as Record<string, unknown>;
+    const measure = number(item.measure);
+    const offset = fraction(item.offset);
+    if (measure === null || offset === null) continue;
+    const mark = new CrossPartArpeggio();
+    mark.measure = Math.max(0, Math.round(measure));
+    mark.offset = offset;
+    if (Array.isArray(item.parts)) {
+      mark.parts = item.parts.flatMap((v) => {
+        const n = number(v); return n === null || n < 0 ? [] : [Math.round(n)];
+      });
+    }
+    if (Array.isArray(item.pitches)) {
+      mark.pitches = item.pitches.flatMap((v) => {
+        if (!v || typeof v !== "object") return [];
+        const p = v as Record<string, unknown>;
+        const part = number(p.part); const pitch = number(p.pitch);
+        return part === null || pitch === null ? [] : [{ part: Math.round(part), pitch: Math.round(pitch) }];
+      });
+    }
+    if (item.direction === "down") mark.direction = "down";
+    score.crossPartArpeggios.push(mark);
+  }
+  const ornaments = Array.isArray(value.ornaments) ? value.ornaments : [];
+  for (const raw of ornaments) {
+    if (!raw || typeof raw !== "object") continue;
+    const item = raw as Record<string, unknown>;
+    const part = number(item.part); const measure = number(item.measure);
+    const offset = fraction(item.offset);
+    if (part === null || measure === null || offset === null) continue;
+    const target = score.parts[Math.round(part)]?.measures[Math.round(measure)]?.entries
+      .find((entry): entry is Chord => entry instanceof Chord && entry.position.equals(offset));
+    if (!target || !Array.isArray(item.items)) continue;
+    for (const ornament of item.items) {
+      if (!ornament || typeof ornament !== "object") continue;
+      const o = ornament as Record<string, unknown>;
+      if (o.kind === "upper-mordent" || o.kind === "lower-mordent") {
+        target.ornaments.push({ kind: o.kind });
+      } else if (o.kind === "trill" && (o.subdivision === 8 || o.subdivision === 16 || o.subdivision === 32)) {
+        target.ornaments.push({ kind: "trill", subdivision: o.subdivision } as ChordOrnament);
+      }
+    }
   }
 }
 
@@ -424,6 +564,12 @@ export function fromJpw(f: JpwFile): Score | null {
     if (ensembleVoices.length !== voices.length) {
       throw new Error("总谱声部不能与 .Voice 或 .Voice.RH/.Voice.LH 混用");
     }
+    const seenVoiceKeys = new Set<string>();
+    for (const voice of ensembleVoices) {
+      const key = `${voice.instrumentName!.trim().toLowerCase()}\u0000${voice.voiceIndex}`;
+      if (seenVoiceKeys.has(key)) throw new Error(`总谱声部编号重复: ${voice.instrumentName}.V${voice.voiceIndex}`);
+      seenVoiceKeys.add(key);
+    }
     const groupOrder = new Map<string, number>();
     for (const voice of ensembleVoices) {
       const name = voice.instrumentName!;
@@ -435,7 +581,37 @@ export function fromJpw(f: JpwFile): Score | null {
     );
     for (const voice of ordered) res.parts.push(makePart(voice, kk, ts, keyChanges));
     res.ensemble = true;
-    applyTitleAnnotations(res, title?.tempoMarks ?? null, title?.arpeggios ?? null);
+    applyTitleAnnotations(res, title?.tempoMarks ?? null, title?.arpeggios ?? null, title?.annotations ?? null, title?.keyChanges ?? null);
+    const primary = res.parts[0];
+    const lrc = f.getLyric();
+    let pass = 0;
+    if (lrc !== null) {
+      assignLrcSection(primary, lrc);
+      for (const it of lrc.segments) pass = Math.max(pass, it.passLast);
+    }
+    normalizeOpeningPickup(res);
+    normalizeScoreRhythmicSpelling(res);
+    applyNoteTimingEdits(res, parseJpwNoteTimingEdits(title?.noteTimingEdits), "jpw");
+    processRepeat(res, primary, pass, f.getSection(RepeatSection));
+    return res;
+  }
+  // Multiple plain `.Voice` sections are independent simultaneous voices.
+  // Historically the fallback below called getVoice(), silently discarding
+  // every section after the first one. Keep them as an ensemble with stable
+  // ordinal voice indices so a text document can describe polyphony without
+  // requiring artificial instrument names.
+  const plainVoices = voices.filter((voice) => voice.hand === null);
+  if (plainVoices.length > 0 && plainVoices.length !== voices.length) {
+    throw new Error("普通 .Voice 不能与 .Voice.RH/.Voice.LH 混用");
+  }
+  if (plainVoices.length > 1) {
+    for (const [index, voice] of plainVoices.entries()) {
+      const part = makePart(voice, kk, ts, keyChanges);
+      part.voiceIndex = index + 1;
+      res.parts.push(part);
+    }
+    res.ensemble = true;
+    applyTitleAnnotations(res, title?.tempoMarks ?? null, title?.arpeggios ?? null, title?.annotations ?? null, title?.keyChanges ?? null);
     const primary = res.parts[0];
     const lrc = f.getLyric();
     let pass = 0;
@@ -451,6 +627,10 @@ export function fromJpw(f: JpwFile): Score | null {
   }
   const rightVoice = f.getVoice("right");
   const leftVoice = f.getVoice("left");
+  if (voices.filter((voice) => voice.hand === "right").length > 1
+    || voices.filter((voice) => voice.hand === "left").length > 1) {
+    throw new Error("钢琴声部 RH/LH 不能重复；更多声部请使用 .Voice.<乐器>.Vn");
+  }
   const piano = rightVoice !== null || leftVoice !== null;
   if (piano && (!rightVoice || !leftVoice)) {
     throw new Error("钢琴简谱需要同时包含 .Voice.RH 和 .Voice.LH");
@@ -469,7 +649,7 @@ export function fromJpw(f: JpwFile): Score | null {
     res.piano = true;
     if (!res.instrumentName.trim()) res.instrumentName = "钢琴";
   }
-  applyTitleAnnotations(res, title?.tempoMarks ?? null, title?.arpeggios ?? null);
+  applyTitleAnnotations(res, title?.tempoMarks ?? null, title?.arpeggios ?? null, title?.annotations ?? null, title?.keyChanges ?? null);
   normalizeOpeningPickup(res);
   normalizeScoreRhythmicSpelling(res);
   applyNoteTimingEdits(res, parseJpwNoteTimingEdits(title?.noteTimingEdits), "jpw");

@@ -1,5 +1,12 @@
 // Minimal modal dialogs (replacing options.fxml / SimpleLayout.fxml).
-import type { App } from "./app";
+import type { App, PageRenderSettings } from "./app";
+import { openInspector } from "../ui/inspector";
+import { retainDetailsScroll } from "../ui/details-scroll-retention";
+import { getThemePreference, setThemePreference, type ThemePreference } from "../ui/theme";
+import { openLayoutPreviewPane } from "../ui/layout-preview-pane";
+import { showShortcutSettingsDialog } from "../ui/shortcut-settings";
+import { showUnsavedSettingsDialog } from "../ui/app-dialog";
+import { staffBracePathD } from "../layout/brace";
 import { isTauriRuntime } from "./fileio";
 import {
   DEFAULT_ENGRAVING_STYLE,
@@ -16,7 +23,7 @@ interface ModalOptions {
   cancelText?: string;
   boxClass?: string;
   onCancel?: () => void;
-  backdropAction?: () => "apply" | "cancel" | "stay";
+  backdropAction?: () => "apply" | "cancel" | "stay" | Promise<"apply" | "cancel" | "stay">;
 }
 
 function modal(title: string, body: HTMLElement, onOk: () => void, options: ModalOptions = {}): void {
@@ -39,21 +46,25 @@ function modal(title: string, body: HTMLElement, onOk: () => void, options: Moda
   overlay.append(box);
   document.body.append(overlay);
 
-  const close = () => overlay.remove();
+  const releaseScroll = body.querySelector("details") ? retainDetailsScroll(body, box) : null;
+  const close = () => { releaseScroll?.(); overlay.remove(); };
   const cancelAndClose = () => {
     options.onCancel?.();
     close();
   };
   cancel.onclick = cancelAndClose;
-  overlay.onclick = (e) => {
-    if (e.target !== overlay) return;
-    const action = options.backdropAction?.() ?? "cancel";
-    if (action === "apply") {
-      onOk();
-      close();
-    } else if (action === "cancel") {
-      cancelAndClose();
-    }
+  let confirming = false;
+  overlay.onclick = async (e) => {
+    if (e.target !== overlay || confirming) return;
+    confirming = true;
+    try {
+      const action = await (options.backdropAction?.() ?? "cancel");
+      if (!overlay.isConnected) return;
+      if (action === "apply") {
+        onOk();
+        close();
+      } else if (action === "cancel") cancelAndClose();
+    } finally { confirming = false; }
   };
   ok.onclick = () => {
     onOk();
@@ -78,7 +89,7 @@ const RATIOS: Record<string, [number, number]> = {
   A3: [842, 1191],
 };
 
-/** 选项 — page ratio + base font size. */
+/** Application settings. Page and engraving controls live in the layout inspector. */
 export function showOptionsDialog(app: App): void {
   const body = document.createElement("div");
   const documentFormat = document.createElement("select");
@@ -93,26 +104,6 @@ export function showOptionsDialog(app: App): void {
     item.selected = app.documentFormat === value;
     documentFormat.append(item);
   }
-  const sel = document.createElement("select");
-  for (const k of Object.keys(RATIOS)) {
-    const o = document.createElement("option");
-    o.value = k;
-    o.textContent = k;
-    const expected = [...RATIOS[k]].sort((a, b) => a - b);
-    const current = [app.pageW, app.pageH].sort((a, b) => a - b);
-    if (expected[0] === current[0] && expected[1] === current[1]) o.selected = true;
-    sel.append(o);
-  }
-  const direction = document.createElement("select");
-  const landscape = document.createElement("option");
-  landscape.value = "landscape";
-  landscape.textContent = "横向";
-  landscape.selected = app.pageW >= app.pageH;
-  const portrait = document.createElement("option");
-  portrait.value = "portrait";
-  portrait.textContent = "纵向";
-  portrait.selected = app.pageH > app.pageW;
-  direction.append(landscape, portrait);
   const codePaneSide = document.createElement("select");
   const codeLeft = document.createElement("option");
   codeLeft.value = "left";
@@ -123,54 +114,53 @@ export function showOptionsDialog(app: App): void {
   codeRight.textContent = "右侧";
   codeRight.selected = app.codePaneSide === "right";
   codePaneSide.append(codeLeft, codeRight);
-  const fs = document.createElement("input");
-  fs.type = "number";
-  fs.min = "12";
-  fs.max = "72";
-  fs.value = String(app.fontSize);
-  const titleSz = document.createElement("input");
-  titleSz.type = "number";
-  titleSz.min = "12";
-  titleSz.max = "120";
-  titleSz.value = String(app.titleSize);
-  const creditSz = document.createElement("input");
-  creditSz.type = "number";
-  creditSz.min = "12";
-  creditSz.max = "120";
-  creditSz.value = String(app.creditSize);
-  const color = document.createElement("input");
-  color.type = "color";
-  color.value = "#" + ((app.color >>> 0) & 0xffffff).toString(16).padStart(6, "0");
-  const lines = document.createElement("input");
-  lines.type = "text";
-  lines.placeholder = "例如 4 或 4|3|3（留空=自动）";
-  lines.value = app.getLinesPerPage();
-  const instrumentName = document.createElement("input");
-  instrumentName.type = "text";
-  instrumentName.value = app.getInstrumentName();
+  const appearance = document.createElement("select");
+  for (const [value, label] of [["system", "跟随系统"], ["light", "浅色"], ["dark", "深色"]] as const) {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = label;
+    appearance.append(option);
+  }
+  appearance.value = getThemePreference();
+  const beatPosition = document.createElement("select");
+  for (const [value, label] of [["fraction", "分数"], ["decimal", "小数"]] as const) {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = label;
+    beatPosition.append(option);
+  }
+  beatPosition.value = app.beatPositionFormat;
+  const connectBarlines = document.createElement("input");
+  connectBarlines.type = "checkbox";
+  connectBarlines.checked = app.engravingStyle.connectBarlines;
+  const showTextOnStartup = document.createElement("input");
+  showTextOnStartup.type = "checkbox";
+  showTextOnStartup.checked = app.showTextOnStartup;
+  const restoreLastFileOnStartup = document.createElement("input");
+  restoreLastFileOnStartup.type = "checkbox";
+  restoreLastFileOnStartup.checked = app.restoreLastFileOnStartup;
+  const shortcuts = document.createElement("button");
+  shortcuts.type = "button";
+  shortcuts.textContent = "设置快捷键…";
+  shortcuts.onclick = () => showShortcutSettingsDialog();
+  const startup = document.createElement("details");
+  startup.open = true;
+  const startupTitle = document.createElement("summary");
+  startupTitle.textContent = "启动";
+  startup.append(
+    startupTitle,
+    labeled("启动时显示文本编辑器", showTextOnStartup),
+    labeled("启动时恢复上次文件", restoreLastFileOnStartup),
+  );
   body.append(
     labeled("当前谱子类型", documentFormat),
-    labeled("谱面比例", sel),
-    labeled("页面方向", direction),
     labeled("文本编辑器位置", codePaneSide),
+    labeled("外观", appearance),
+    labeled("拍数位置显示", beatPosition),
+    labeled("连接跨行小节线", connectBarlines),
+    labeled("快捷键", shortcuts),
+    startup,
   );
-  if (app.mode === "jp" && app.painter.score.piano) {
-    body.append(labeled("乐器名称", instrumentName));
-  }
-  body.append(
-    labeled("每页行数", lines),
-    labeled("基础字号", fs),
-    labeled("标题字号", titleSz),
-    labeled("词曲信息字号", creditSz),
-    labeled("颜色", color),
-  );
-  // 混排专属：隐藏小节号（仅混排模式下显示该选项）。
-  const hideBarNum = document.createElement("input");
-  hideBarNum.type = "checkbox";
-  hideBarNum.checked = app.mixedHideBarNumber;
-  if (app.mode === "mixed") {
-    body.append(labeled("隐藏小节号", hideBarNum));
-  }
   const voiceCount = document.createElement("input");
   voiceCount.type = "number";
   voiceCount.min = "1";
@@ -425,39 +415,42 @@ export function showOptionsDialog(app: App): void {
   };
   body.addEventListener("input", markDirty);
   body.addEventListener("change", markDirty);
-  modal("选项", body, () => {
+  modal("设置", body, () => {
     if (app.documentFormat !== "jpw") {
-      app.setSlashVoiceSettings(
-        parseInt(voiceCount.value, 10) || 1,
-        voiceColorInputs.map((input, index) =>
-          voiceColorEnabled[index]?.checked ? input.value : ""),
-        scoreVoiceColoring.checked,
-        showVoiceMarkers.checked,
-        textVoiceColoring.checked,
-      );
+      const count = parseInt(voiceCount.value, 10) || 1;
+      const colors = voiceColorInputs.map((input, index) =>
+        voiceColorEnabled[index]?.checked ? input.value : "");
+      const nextColors = app.slashVoiceColors.map((fallback, index) => {
+        const value = colors[index];
+        return value === "" || (typeof value === "string" && /^#[\da-f]{6}$/i.test(value))
+          ? value : fallback;
+      });
+      if (count !== app.getSlashVoiceCount()
+          || JSON.stringify(nextColors) !== JSON.stringify(app.slashVoiceColors)
+          || scoreVoiceColoring.checked !== app.scoreVoiceColoring
+          || showVoiceMarkers.checked !== app.showInvisibleVoiceMarkers
+          || textVoiceColoring.checked !== app.textVoiceColoring) {
+        app.setSlashVoiceSettings(
+          count, colors, scoreVoiceColoring.checked,
+          showVoiceMarkers.checked, textVoiceColoring.checked,
+        );
+      }
     }
     volSliders.forEach((s, i) => app.setPartVolume(i, (parseInt(s.value, 10) || 0) / 100));
-    app.setPlaybackSoundSettings(
-      soundSource.value === "sf2" ? "sf2" : "default",
-      soundfontFile.value,
-      pendingAssignments,
-    );
-    const [ratioW, ratioH] = RATIOS[sel.value] ?? [app.pageW, app.pageH];
-    const short = Math.min(ratioW, ratioH);
-    const long = Math.max(ratioW, ratioH);
-    const [w, h] = direction.value === "portrait" ? [short, long] : [long, short];
-    const fontSize = parseInt(fs.value, 10) || app.fontSize;
-    const titleSize = parseInt(titleSz.value, 10) || app.titleSize;
-    const creditSize = parseInt(creditSz.value, 10) || app.creditSize;
-    const argb = 0xff000000 | (parseInt(color.value.slice(1), 16) & 0xffffff);
-    const linesVal = lines.value.trim();
-    if (linesVal !== app.getLinesPerPage()) app.setLinesPerPage(linesVal);
-    if (app.mode === "jp" && app.painter.score.piano && instrumentName.value.trim() !== app.getInstrumentName()) {
-      app.setInstrumentName(instrumentName.value);
+    const playbackSource = soundSource.value === "sf2" ? "sf2" : "default";
+    if (playbackSource !== app.playbackSoundSource
+        || (playbackSource === "sf2" && soundfontFile.value !== app.selectedSoundfontId)
+        || JSON.stringify(pendingAssignments) !== JSON.stringify(app.soundfontInstrumentByGroup)) {
+      app.setPlaybackSoundSettings(playbackSource, soundfontFile.value, pendingAssignments);
     }
-    app.applyRenderSettings({ pageW: w, pageH: h, fontSize, titleSize, creditSize, color: argb >>> 0 });
-    if (app.mode === "mixed") void app.setMixedHideBarNumber(hideBarNum.checked);
     app.setCodePaneSide(codePaneSide.value === "right" ? "right" : "left");
+    setThemePreference(appearance.value as ThemePreference);
+    const beatFormat = beatPosition.value === "decimal" ? "decimal" : "fraction";
+    if (beatFormat !== app.beatPositionFormat) app.setBeatPositionFormat(beatFormat);
+    if (connectBarlines.checked !== app.engravingStyle.connectBarlines) {
+      app.setBarlineConnectionsEnabled(connectBarlines.checked);
+    }
+    app.setStartupPreferences(showTextOnStartup.checked, restoreLastFileOnStartup.checked);
     if (documentFormat.value !== app.documentFormat) {
       void app.changeDocumentFormat(documentFormat.value as "jpw" | "keyboard" | "number");
     }
@@ -465,9 +458,7 @@ export function showOptionsDialog(app: App): void {
     boxClass: "options-box",
     backdropAction: () => {
       if (!dirty) return "cancel";
-      return window.confirm("选项尚未保存，是否立即保存并应用？")
-        ? "apply"
-        : "stay";
+      return showUnsavedSettingsDialog();
     },
   });
 }
@@ -522,15 +513,11 @@ function renderEngravingPreview(svg: SVGSVGElement, style: EngravingStyle, instr
   const lineTop = y(rightY - numberSize * 0.85);
   const lineBottom = y(leftY + numberSize * 0.22);
   const braceWidth = 14 * style.braceWidthScale;
-  const braceGlyphWidth = Math.max(braceWidth * 0.2, braceWidth - style.braceStrokeWidth);
   const instrumentFontSize = 15 / 1.5;
   const instrumentWidth = Math.min(96, Math.max(20, Array.from(instrumentName).length * instrumentFontSize));
   const lineX = Math.max(82, 8 + instrumentWidth + 8 + braceWidth + 3);
   const braceRight = lineX - 3;
   const braceLeft = braceRight - braceWidth;
-  const braceChar = String.fromCharCode(0xe000);
-  const braceScaleX = braceGlyphWidth / (28 * 0.08);
-  const braceScaleY = (lineBottom - lineTop) / 28;
   const xChord = lineX + 63;
   const xSecond = xChord + 94 * style.noteGapScale;
   const xBar = xSecond + 78 * style.noteGapScale;
@@ -602,7 +589,7 @@ function renderEngravingPreview(svg: SVGSVGElement, style: EngravingStyle, instr
   svg.innerHTML = `
     <text data-preview-meta="true" x="8" y="30" font-family="PingFang SC, Microsoft YaHei, sans-serif" font-size="${numberSize * 0.87}" fill="currentColor">1=C  4/4  ♩=90</text>
     <text x="${braceLeft - 8}" y="${(lineTop + lineBottom) / 2 + instrumentFontSize * 0.35}" text-anchor="end" font-family="PingFang SC, Microsoft YaHei, Microsoft YaHei UI, Noto Sans CJK SC, Yu Gothic UI, Meiryo, Malgun Gothic, sans-serif" font-size="${instrumentFontSize}" fill="currentColor">${escapedInstrument}</text>
-    <text data-preview-brace="true" x="0" y="0" font-family="Bravura" font-size="28" fill="currentColor" stroke="currentColor" stroke-width="${style.braceStrokeWidth}" stroke-linejoin="round" paint-order="stroke fill" vector-effect="non-scaling-stroke" transform="translate(${braceLeft + style.braceStrokeWidth / 2} ${lineBottom}) scale(${braceScaleX} ${braceScaleY})">${braceChar}</text>
+    <path data-preview-brace="true" d="${staffBracePathD(braceWidth, lineBottom - lineTop, style.braceStrokeWidth)}" transform="translate(${braceLeft} ${lineTop})" fill="currentColor"/>
     <line x1="${lineX}" y1="${lineTop}" x2="${lineX}" y2="${lineBottom}" stroke="currentColor" stroke-width="${style.pianoLeftLineWidth}"/>
     ${text("5", xChord, y(topChordBaseline), numberSize, 'data-preview-number="high-owner"')}
     ${text("3", xChord, y(rightY - automaticChordGap))}
@@ -626,24 +613,34 @@ function renderEngravingPreview(svg: SVGSVGElement, style: EngravingStyle, instr
 /** Live global controls for numbered-notation engraving geometry. */
 export function showEngravingStyleDialog(app: App): void {
   const original = normalizeEngravingStyle(app.engravingStyle);
+  const originalRender: PageRenderSettings = {
+    pageW: app.pageW,
+    pageH: app.pageH,
+    fontSize: app.fontSize,
+    titleSize: app.titleSize,
+    creditSize: app.creditSize,
+    color: app.color,
+  };
   const instrumentName = app.painter.score.instrumentName.trim() || "钢琴";
   const body = document.createElement("div");
   body.className = "engraving-dialog-body";
 
   const hint = document.createElement("div");
   hint.className = "modal-hint engraving-hint";
-  hint.textContent = "拖动时只更新这里的独立样张，不会改动当前谱面或总谱；点击“应用到整个软件”后才会保存并重新排版所有简谱。";
-  const preview = document.createElement("div");
-  preview.className = "engraving-preview";
+  hint.textContent = "调整后会在当前谱面实时预览；应用后保存为全局排版参数，取消则恢复原样。";
+  const expandPreview = document.createElement("button");
+  expandPreview.type = "button";
+  expandPreview.className = "engraving-preview-expand";
+  expandPreview.textContent = "放大查看样张";
   const previewSvg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
-  previewSvg.setAttribute("aria-label", "全局简谱排版独立实时预览");
-  preview.append(previewSvg);
+  previewSvg.setAttribute("aria-label", "钢琴双行排版样张");
 
   const workspace = document.createElement("div");
   workspace.className = "engraving-workspace";
   const controls = document.createElement("div");
   controls.className = "engraving-controls";
   const numericInputs = new Map<NumericStyleKey, HTMLInputElement>();
+  const numericTouched = new Set<NumericStyleKey>();
   const outputs = new Map<NumericStyleKey, HTMLOutputElement>();
   const formatters = new Map<NumericStyleKey, (value: number) => string>();
 
@@ -694,8 +691,98 @@ export function showEngravingStyleDialog(app: App): void {
     format: (value: number) => string,
   ): void => {
     const [min, max, step] = ENGRAVING_STYLE_RANGES[key];
-    addRange(target, labelText, key, min, max, step, format);
+    // The publication-gap default is 0.88, between the shared 0.05 ticks.
+    // Let the slider represent that value exactly when resetting the form.
+    const existing = original[key];
+    // Keep an older out-of-range value visible and adjustable until the user
+    // deliberately moves the slider into its current range.
+    addRange(target, labelText, key, Math.min(min, existing), Math.max(max, existing),
+      key === "publicationFirstSystemGap" ? 0.01 : step, format);
   };
+
+  const paperSection = section("纸张与字号");
+  const pagePreset = document.createElement("select");
+  pagePreset.name = "pagePreset";
+  pagePreset.setAttribute("aria-label", "纸张比例");
+  const originalDimensions = [originalRender.pageW, originalRender.pageH].sort((a, b) => a - b);
+  const originalPreset = Object.entries(RATIOS).find(([, dimensions]) => {
+    const sorted = [...dimensions].sort((a, b) => a - b);
+    return sorted[0] === originalDimensions[0] && sorted[1] === originalDimensions[1];
+  })?.[0] ?? "custom";
+  if (originalPreset === "custom") {
+    const custom = document.createElement("option");
+    custom.value = "custom";
+    custom.textContent = `自定义（${originalRender.pageW} × ${originalRender.pageH}）`;
+    pagePreset.append(custom);
+  }
+  for (const preset of Object.keys(RATIOS)) {
+    const option = document.createElement("option");
+    option.value = preset;
+    option.textContent = preset;
+    pagePreset.append(option);
+  }
+  pagePreset.value = originalPreset;
+  const pageDirection = document.createElement("select");
+  pageDirection.name = "pageDirection";
+  pageDirection.setAttribute("aria-label", "页面方向");
+  for (const [value, label] of [["portrait", "纵向"], ["landscape", "横向"]] as const) {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = label;
+    pageDirection.append(option);
+  }
+  pageDirection.value = originalRender.pageW >= originalRender.pageH ? "landscape" : "portrait";
+  const pageSizeHint = document.createElement("div");
+  pageSizeHint.className = "modal-hint";
+  const sizeInput = (name: string, value: number, max: number): HTMLInputElement => {
+    const input = document.createElement("input");
+    input.type = "number";
+    input.name = name;
+    input.min = "12";
+    input.max = String(max);
+    input.step = "any";
+    input.value = String(value);
+    return input;
+  };
+  const baseFontSize = sizeInput("fontSize", originalRender.fontSize, 72);
+  const titleFontSize = sizeInput("titleSize", originalRender.titleSize, 120);
+  const creditFontSize = sizeInput("creditSize", originalRender.creditSize, 120);
+  const inkColor = document.createElement("input");
+  inkColor.type = "color";
+  inkColor.name = "inkColor";
+  inkColor.value = "#" + ((originalRender.color >>> 0) & 0xffffff).toString(16).padStart(6, "0");
+  const linesPerPage = document.createElement("input");
+  linesPerPage.type = "text";
+  linesPerPage.name = "linesPerPage";
+  linesPerPage.placeholder = "例如 4 或 4|3|3（留空=自动）";
+  linesPerPage.value = app.getLinesPerPage();
+  linesPerPage.disabled = app.documentFormat !== "jpw";
+  const originalLinesPerPage = linesPerPage.value;
+  const hideBarNum = document.createElement("input");
+  hideBarNum.type = "checkbox";
+  hideBarNum.name = "hideBarNumber";
+  hideBarNum.checked = app.mixedHideBarNumber;
+  const originalHideBarNum = hideBarNum.checked;
+  const instrumentNameInput = document.createElement("input");
+  instrumentNameInput.type = "text";
+  instrumentNameInput.name = "instrumentName";
+  instrumentNameInput.value = app.getInstrumentName();
+  const originalInstrumentName = instrumentNameInput.value;
+  const renderTouched = new Set<"fontSize" | "titleSize" | "creditSize">();
+  paperSection.append(
+    labeled("纸张比例", pagePreset),
+    labeled("页面方向", pageDirection),
+    pageSizeHint,
+    labeled("简谱基础字号", baseFontSize),
+    labeled("标题字号", titleFontSize),
+    labeled("署名字号", creditFontSize),
+    labeled("谱面颜色", inkColor),
+    labeled("每页行数", linesPerPage),
+  );
+  if (app.mode === "mixed") paperSection.append(labeled("隐藏小节号", hideBarNum));
+  if (app.mode === "jp" && app.painter.score.piano) {
+    paperSection.append(labeled("乐器名称", instrumentNameInput));
+  }
 
   const numberSection = section("数字、和弦与点");
   addStyleRange(numberSection, "数字大小", "numberScale", (v) => `${v.toFixed(2)}×`);
@@ -765,6 +852,11 @@ export function showEngravingStyleDialog(app: App): void {
   rhythmGuideDivision.value = String(original.rhythmGuideDivision);
   rhythmGuideDivision.disabled = original.rhythmGuideMode !== "manual";
   rhythmSection.append(labeled("手动最短时值", rhythmGuideDivision));
+  const rhythmGuideDotted = document.createElement("input");
+  rhythmGuideDotted.type = "checkbox";
+  rhythmGuideDotted.name = "rhythmGuideDotted";
+  rhythmGuideDotted.checked = original.rhythmGuideDotted;
+  rhythmSection.append(labeled("突出附点时值", rhythmGuideDotted));
   const rhythmHint = document.createElement("div");
   rhythmHint.className = "modal-hint";
   rhythmHint.textContent = "长刻度始终落在拍号的每一拍。自动模式按各小节实际最短时值补短刻度；手动模式固定使用指定的全音符至 64 分音符网格。顶部快速刻度与这里保持同步。";
@@ -803,12 +895,12 @@ export function showEngravingStyleDialog(app: App): void {
   reset.type = "button";
   reset.className = "engraving-reset";
   reset.textContent = "恢复默认参数";
-  workspace.append(controls, preview);
+  workspace.append(controls);
   body.append(hint, workspace, reset);
 
   const readStyle = (): EngravingStyle => {
     const value = {
-      ...DEFAULT_ENGRAVING_STYLE,
+      ...original,
       numberBold: bold.checked,
       tieContinuationGray: tieContinuationGray.checked,
       rhythmicSpacingEnabled: rhythmicSpacingEnabled.checked,
@@ -816,9 +908,51 @@ export function showEngravingStyleDialog(app: App): void {
       rhythmGuideEnabled: rhythmGuideEnabled.checked,
       rhythmGuideMode: rhythmGuideMode.value as RhythmGuideMode,
       rhythmGuideDivision: parseInt(rhythmGuideDivision.value, 10) as RhythmGuideDivision,
+      rhythmGuideDotted: rhythmGuideDotted.checked,
     } as EngravingStyle;
-    for (const [key, input] of numericInputs) value[key] = parseFloat(input.value);
+    for (const [key, input] of numericInputs) {
+      value[key] = numericTouched.has(key) ? parseFloat(input.value) : original[key];
+    }
     return normalizeEngravingStyle(value);
+  };
+  const readRender = (): PageRenderSettings => {
+    const dimensions = pagePreset.value === "custom"
+      ? [originalRender.pageW, originalRender.pageH]
+      : RATIOS[pagePreset.value] ?? [originalRender.pageW, originalRender.pageH];
+    const short = Math.min(...dimensions);
+    const long = Math.max(...dimensions);
+    const numeric = (key: "fontSize" | "titleSize" | "creditSize", input: HTMLInputElement): number => {
+      const fallback = originalRender[key];
+      if (!renderTouched.has(key)) return fallback;
+      const value = Number(input.value);
+      return input.value && Number.isFinite(value)
+        ? Math.max(Number(input.min), Math.min(Number(input.max), value))
+        : fallback;
+    };
+    return {
+      ...originalRender,
+      pageW: pageDirection.value === "landscape" ? long : short,
+      pageH: pageDirection.value === "landscape" ? short : long,
+      fontSize: numeric("fontSize", baseFontSize),
+      titleSize: numeric("titleSize", titleFontSize),
+      creditSize: numeric("creditSize", creditFontSize),
+      color: (0xff000000 | (parseInt(inkColor.value.slice(1), 16) & 0xffffff)) >>> 0,
+    };
+  };
+  const writeRender = (render: PageRenderSettings): void => {
+    const sorted = [render.pageW, render.pageH].sort((a, b) => a - b);
+    pagePreset.value = Object.entries(RATIOS).find(([, dimensions]) => {
+      const preset = [...dimensions].sort((a, b) => a - b);
+      return preset[0] === sorted[0] && preset[1] === sorted[1];
+    })?.[0] ?? "custom";
+    pageDirection.value = render.pageW >= render.pageH ? "landscape" : "portrait";
+    baseFontSize.value = String(render.fontSize);
+    titleFontSize.value = String(render.titleSize);
+    creditFontSize.value = String(render.creditSize);
+    inkColor.value = "#" + ((render.color >>> 0) & 0xffffff).toString(16).padStart(6, "0");
+    renderTouched.add("fontSize");
+    renderTouched.add("titleSize");
+    renderTouched.add("creditSize");
   };
   const writeStyle = (style: EngravingStyle): void => {
     bold.checked = style.numberBold;
@@ -828,8 +962,12 @@ export function showEngravingStyleDialog(app: App): void {
     rhythmGuideEnabled.checked = style.rhythmGuideEnabled;
     rhythmGuideMode.value = style.rhythmGuideMode;
     rhythmGuideDivision.value = String(style.rhythmGuideDivision);
+    rhythmGuideDotted.checked = style.rhythmGuideDotted;
     rhythmGuideDivision.disabled = style.rhythmGuideMode !== "manual";
-    for (const [key, input] of numericInputs) input.value = String(style[key]);
+    for (const [key, input] of numericInputs) {
+      numericTouched.add(key);
+      input.value = String(style[key]);
+    }
   };
   const updateOutputs = (style: EngravingStyle): void => {
     for (const [key, output] of outputs) {
@@ -837,38 +975,202 @@ export function showEngravingStyleDialog(app: App): void {
     }
   };
 
+  let previewTimer: ReturnType<typeof setTimeout> | null = null;
+  let previewPane: { close: () => void } | null = null;
+  let viewerOverlay: HTMLDivElement | null = null;
+  let largePreviewSvg: SVGSVGElement | null = null;
+  const syncLargePreview = (): void => {
+    if (!largePreviewSvg) return;
+    largePreviewSvg.setAttribute("viewBox", previewSvg.getAttribute("viewBox") ?? "0 0 620 220");
+    largePreviewSvg.setAttribute("preserveAspectRatio", "xMidYMin meet");
+    largePreviewSvg.dataset.previewSource = previewSvg.dataset.previewSource ?? "sample";
+    largePreviewSvg.innerHTML = previewSvg.innerHTML;
+  };
+  const closeLargePreview = (restoreFocus: boolean): void => {
+    viewerOverlay?.remove();
+    viewerOverlay = null;
+    largePreviewSvg = null;
+    if (restoreFocus && expandPreview.isConnected) expandPreview.focus();
+  };
+  expandPreview.onclick = () => {
+    if (viewerOverlay) return;
+    renderEngravingPreview(previewSvg, readStyle(), instrumentName, app);
+    const overlay = document.createElement("div");
+    overlay.className = "engraving-preview-overlay";
+    overlay.setAttribute("role", "dialog");
+    overlay.setAttribute("aria-modal", "true");
+    const titleId = "engraving-preview-viewer-title";
+    overlay.setAttribute("aria-labelledby", titleId);
+    const viewer = document.createElement("div");
+    viewer.className = "engraving-preview-viewer";
+    const header = document.createElement("div");
+    header.className = "engraving-preview-viewer-header";
+    const title = document.createElement("h2");
+    title.id = titleId;
+    title.textContent = "钢琴双行排版样张";
+    const close = document.createElement("button");
+    close.type = "button";
+    close.className = "engraving-preview-viewer-close";
+    close.textContent = "关闭";
+    close.onclick = () => closeLargePreview(true);
+    header.append(title, close);
+    const zoomControls = document.createElement("div");
+    zoomControls.className = "engraving-preview-zoom";
+    const zoomOut = document.createElement("button");
+    zoomOut.type = "button";
+    zoomOut.textContent = "−";
+    zoomOut.setAttribute("aria-label", "缩小样张");
+    const zoomLabel = document.createElement("output");
+    const zoomIn = document.createElement("button");
+    zoomIn.type = "button";
+    zoomIn.textContent = "+";
+    zoomIn.setAttribute("aria-label", "放大样张");
+    zoomControls.append(zoomOut, zoomLabel, zoomIn);
+    const scroll = document.createElement("div");
+    scroll.className = "engraving-preview-viewer-scroll";
+    const largeSvg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    largeSvg.classList.add("engraving-preview-large-svg");
+    largeSvg.setAttribute("aria-label", "放大的钢琴双行排版样张");
+    largePreviewSvg = largeSvg;
+    syncLargePreview();
+    let zoom = 100;
+    const updateZoom = (): void => {
+      largeSvg.style.width = `${zoom}%`;
+      zoomLabel.textContent = `${zoom}%`;
+      zoomOut.disabled = zoom <= 100;
+      zoomIn.disabled = zoom >= 200;
+    };
+    zoomOut.onclick = () => { zoom = Math.max(100, zoom - 25); updateZoom(); };
+    zoomIn.onclick = () => { zoom = Math.min(200, zoom + 25); updateZoom(); };
+    updateZoom();
+    scroll.append(largeSvg);
+    viewer.append(header, zoomControls, scroll);
+    overlay.append(viewer);
+    overlay.onclick = (event) => {
+      if (event.target === overlay) closeLargePreview(true);
+    };
+    overlay.onkeydown = (event) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        event.stopPropagation();
+        closeLargePreview(true);
+      } else if (event.key === "Tab") {
+        const buttons = [close, zoomOut, zoomIn].filter((button) => !button.disabled);
+        const first = buttons[0];
+        const last = buttons[buttons.length - 1];
+        if (event.shiftKey && document.activeElement === first) {
+          event.preventDefault();
+          last.focus();
+        } else if (!event.shiftKey && document.activeElement === last) {
+          event.preventDefault();
+          first.focus();
+        }
+      }
+    };
+    viewerOverlay = overlay;
+    document.body.append(overlay);
+    close.focus();
+  };
+  const clearPreviewTimer = (): void => {
+    if (previewTimer !== null) clearTimeout(previewTimer);
+    previewTimer = null;
+  };
+  const schedulePreview = (): void => {
+    clearPreviewTimer();
+    previewTimer = setTimeout(() => {
+      previewTimer = null;
+      app.setEngravingPreview(readStyle(), readRender());
+      renderEngravingPreview(previewSvg, readStyle(), instrumentNameInput.value.trim() || instrumentName, app);
+      syncLargePreview();
+    }, 200);
+  };
   const refresh = (): void => {
     const style = readStyle();
+    const render = readRender();
     const spacingExponent = numericInputs.get("rhythmicSpacingExponent");
     if (spacingExponent) spacingExponent.disabled = !style.rhythmicSpacingEnabled;
     rhythmGuideDivision.disabled = style.rhythmGuideMode !== "manual";
     updateOutputs(style);
-    renderEngravingPreview(previewSvg, style, instrumentName, app);
+    pageSizeHint.textContent = `页面尺寸：${render.pageW} × ${render.pageH}`;
+    renderEngravingPreview(previewSvg, style, instrumentNameInput.value.trim() || instrumentName, app);
+    syncLargePreview();
+    schedulePreview();
   };
-  for (const input of numericInputs.values()) input.addEventListener("input", refresh);
+  for (const [key, input] of numericInputs) input.addEventListener("input", () => {
+    numericTouched.add(key);
+    refresh();
+  });
   bold.addEventListener("change", refresh);
   tieContinuationGray.addEventListener("change", refresh);
+  rhythmicSpacingEnabled.addEventListener("change", refresh);
+  justifyLastSystem.addEventListener("change", refresh);
   rhythmGuideEnabled.addEventListener("change", refresh);
   rhythmGuideMode.addEventListener("change", refresh);
   rhythmGuideDivision.addEventListener("change", refresh);
+  rhythmGuideDotted.addEventListener("change", refresh);
+  pagePreset.addEventListener("change", refresh);
+  pageDirection.addEventListener("change", refresh);
+  inkColor.addEventListener("input", refresh);
+  instrumentNameInput.addEventListener("input", refresh);
+  for (const [key, input] of [
+    ["fontSize", baseFontSize],
+    ["titleSize", titleFontSize],
+    ["creditSize", creditFontSize],
+  ] as const) input.addEventListener("input", () => {
+    renderTouched.add(key);
+    refresh();
+  });
   reset.onclick = () => {
     writeStyle(normalizeEngravingStyle(DEFAULT_ENGRAVING_STYLE));
+    writeRender({ ...originalRender, pageW: 595, pageH: 842, fontSize: 28, titleSize: 48, creditSize: 36 });
+    linesPerPage.value = "";
+    hideBarNum.checked = false;
     refresh();
   };
-  renderEngravingPreview(previewSvg, original, instrumentName, app);
-
-  modal("全局排版样式", body, () => {
-    app.setEngravingStyle(readStyle(), true);
-  }, {
-    okText: "应用到整个软件",
-    cancelText: "取消",
-    boxClass: "engraving-box",
-    backdropAction: () => {
-      const dirty = JSON.stringify(readStyle()) !== JSON.stringify(original);
-      if (!dirty) return "cancel";
-      return window.confirm("排版参数尚未应用，是否立即应用到整个软件？")
-        ? "apply"
-        : "stay";
+  pageSizeHint.textContent = `页面尺寸：${originalRender.pageW} × ${originalRender.pageH}`;
+  let releaseScroll: (() => void) | null = null;
+  void openInspector({
+    id: "layout",
+    title: "排版",
+    body,
+    isDirty: () => JSON.stringify(readStyle()) !== JSON.stringify(original)
+      || JSON.stringify(readRender()) !== JSON.stringify(originalRender)
+      || linesPerPage.value.trim() !== originalLinesPerPage
+      || (app.mode === "mixed" && hideBarNum.checked !== originalHideBarNum)
+      || (app.mode === "jp" && app.painter.score.piano
+        && instrumentNameInput.value.trim() !== originalInstrumentName),
+    onApply: () => {
+      clearPreviewTimer();
+      app.setEngravingStyle(readStyle(), true, readRender());
+      if (linesPerPage.value.trim() !== app.getLinesPerPage()) {
+        app.setLinesPerPage(linesPerPage.value.trim());
+      }
+      if (app.mode === "jp" && app.painter.score.piano
+          && instrumentNameInput.value.trim() !== app.getInstrumentName()) {
+        app.setInstrumentName(instrumentNameInput.value);
+      }
+      if (app.mode === "mixed" && hideBarNum.checked !== app.mixedHideBarNumber) {
+        void app.setMixedHideBarNumber(hideBarNum.checked);
+      }
+      return true;
     },
+    onDiscard: () => {
+      clearPreviewTimer();
+      app.setEngravingPreview(null);
+    },
+    onClosed: () => {
+      releaseScroll?.();
+      releaseScroll = null;
+      closeLargePreview(false);
+      previewPane?.close();
+      previewPane = null;
+    },
+    applyText: "应用到全部简谱",
+  }).then((opened) => {
+    if (!opened) return;
+    const content = body.closest<HTMLElement>(".inspector-content");
+    if (content) releaseScroll = retainDetailsScroll(body, content);
+    previewPane = openLayoutPreviewPane(app, previewSvg, expandPreview);
+    renderEngravingPreview(previewSvg, readStyle(), instrumentName, app);
   });
 }

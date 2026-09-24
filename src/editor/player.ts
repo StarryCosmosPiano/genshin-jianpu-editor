@@ -32,6 +32,20 @@ export interface Sf2PlaybackOptions {
   instrumentByPart: string[];
 }
 
+/** A short input-mode audition request. `part` selects that row's timbre. */
+export interface InputAuditionNote {
+  pitch: number;
+  part: number;
+  /** Full sounding duration in seconds. Omitted for a short cursor preview. */
+  durationSeconds?: number;
+}
+
+interface AuditionSession {
+  ctx: AudioContext;
+  instruments: Smplr[];
+  timer: number;
+}
+
 export class ScorePlayer {
   state: PlayState = "stopped";
 
@@ -46,6 +60,8 @@ export class ScorePlayer {
   private duration = 0; // seconds
   private curIdx = -1;
   private gen = 0; // invalidates in-flight async play() when stop()/replay happens
+  private auditionSessions = new Set<AuditionSession>();
+  private auditionGen = 0;
 
   constructor(
     private onChord: (chords: Chord[] | null, pass: number) => void,
@@ -54,6 +70,81 @@ export class ScorePlayer {
 
   get playing(): boolean {
     return this.state === "playing";
+  }
+
+  /** Play a short cursor audition using the assigned SF2 instrument per row. */
+  async audition(notes: InputAuditionNote[], sf2?: Sf2PlaybackOptions): Promise<void> {
+    if (notes.length === 0) return;
+    // Do not stop the previous session here.  A new cursor position may be
+    // selected while the previous chord is still sounding; Web Audio can
+    // overlap these sessions naturally and stopAudition() remains the explicit
+    // cancellation point used when leaving input mode.
+    const gen = this.auditionGen;
+    const ctx = new AudioContext();
+    await ctx.resume();
+    let instruments: Smplr[] = [];
+    let byPart: Smplr[] = [];
+    if (sf2) {
+      try {
+        byPart = await this.loadSf2Instruments(ctx, sf2, instruments);
+      } catch (error) {
+        console.warn("input audition SF2 failed; using piano", error);
+        for (const instrument of instruments) instrument.dispose();
+        instruments = [];
+        byPart = [];
+      }
+    }
+    if (instruments.length === 0) {
+      const piano = Soundfont(ctx, {
+        kit: "FluidR3_GM",
+        instrument: "acoustic_grand_piano",
+      });
+      instruments.push(piano);
+      await piano.ready;
+      byPart = notes.map(() => piano);
+    }
+    if (gen !== this.auditionGen) {
+      for (const instrument of instruments) instrument.dispose();
+      void ctx.close();
+      return;
+    }
+    const now = ctx.currentTime + 0.015;
+    const sessionDuration = Math.max(
+      0.05,
+      ...notes.map((note) => note.durationSeconds ?? 0.8),
+    );
+    for (const note of notes) {
+      const instrument = byPart[note.part] ?? instruments[0];
+      instrument.start({
+        note: note.pitch,
+        time: now,
+        duration: Math.max(0.05, note.durationSeconds ?? 0.8),
+        velocity: 100,
+      });
+    }
+    const session: AuditionSession = { ctx, instruments, timer: 0 };
+    this.auditionSessions.add(session);
+    session.timer = window.setTimeout(() => {
+      this.auditionSessions.delete(session);
+      for (const instrument of session.instruments) {
+        instrument.stop();
+        instrument.dispose();
+      }
+      void session.ctx.close();
+    }, Math.ceil((sessionDuration + 0.35) * 1000));
+  }
+
+  stopAudition(): void {
+    this.auditionGen++;
+    for (const session of this.auditionSessions) {
+      window.clearTimeout(session.timer);
+      for (const instrument of session.instruments) {
+        instrument.stop();
+        instrument.dispose();
+      }
+      void session.ctx.close();
+    }
+    this.auditionSessions.clear();
   }
 
   async play(
@@ -205,6 +296,7 @@ export class ScorePlayer {
 
   stop(): void {
     this.gen++; // invalidate any in-flight play()
+    this.stopAudition();
     if (this.raf) {
       cancelAnimationFrame(this.raf);
       this.raf = 0;

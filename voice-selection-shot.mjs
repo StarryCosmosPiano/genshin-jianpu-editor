@@ -56,6 +56,7 @@ Q../A../Z../X../
 
 try {
   await page.goto(`http://127.0.0.1:${port}/`, { waitUntil: "networkidle" });
+  await page.evaluate(() => window.__app.setCodePaneCollapsed(false));
   await page.evaluate((source) => {
     const app = window.__app;
     app.documentFormat = "keyboard";
@@ -182,6 +183,10 @@ try {
       parts: app.painter.score.parts.length,
       vc: app.slashOptions?.voiceCount,
       markers: (app.getText().match(/\u2063/g) ?? []).length,
+      pitchMarkers: [...app.getText().matchAll(/\u2063+(?=[#♯b♭+\-',]*[A-Z1-7])/g)]
+        .reduce((sum, match) => sum + match[0].length, 0),
+      restMarkers: [...app.getText().matchAll(/\u2063+(?=0)/g)]
+        .reduce((sum, match) => sum + match[0].length, 0),
     };
     await app.changeDocumentFormat("jpw");
     return {
@@ -191,7 +196,8 @@ try {
     };
   });
   if (conversion.number.format !== "number" || conversion.number.parts !== 3
-    || conversion.number.vc !== 3 || conversion.number.markers !== 2
+    || conversion.number.vc !== 3 || conversion.number.pitchMarkers !== 2
+    || conversion.number.restMarkers !== 1 || conversion.number.markers !== 3
     || conversion.jpw !== "jpw" || conversion.voiceSections !== 3) {
     throw new Error(`current recognition format conversion failed: ${JSON.stringify(conversion)}`);
   }

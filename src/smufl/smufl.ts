@@ -82,6 +82,11 @@ export const GlyphCodes = {
   articStaccatissimoBelow: String.fromCharCode(0xe4a7),
   articMarcatoAbove: String.fromCharCode(0xe4ac),
   articMarcatoBelow: String.fromCharCode(0xe4ad),
+  // Standard SMuFL ornaments. The un-crossed short trill is the upper
+  // mordent; ornamentMordent carries the vertical stroke for the lower one.
+  ornamentTrill: String.fromCharCode(0xe566),
+  ornamentShortTrill: String.fromCharCode(0xe56c),
+  ornamentMordent: String.fromCharCode(0xe56d),
   wiggleTrillSlow: String.fromCharCode(0xeaa5),
   // Repeats / navigation
   segno: String.fromCharCode(0xe047),
@@ -164,6 +169,9 @@ const codeToName: Record<string, string> = {
   [GlyphCodes.articStaccatissimoBelow]: "articStaccatissimoBelow",
   [GlyphCodes.articMarcatoAbove]: "articMarcatoAbove",
   [GlyphCodes.articMarcatoBelow]: "articMarcatoBelow",
+  [GlyphCodes.ornamentTrill]: "ornamentTrill",
+  [GlyphCodes.ornamentShortTrill]: "ornamentShortTrill",
+  [GlyphCodes.ornamentMordent]: "ornamentMordent",
   [GlyphCodes.wiggleTrillSlow]: "wiggleTrillSlow",
   [GlyphCodes.segno]: "segno",
   [GlyphCodes.coda]: "coda",

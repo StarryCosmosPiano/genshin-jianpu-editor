@@ -1,8 +1,8 @@
 <div align="center">
 
-# 原琴简谱编辑器
+# 原琴助手编辑器
 
-### Genshin Jianpu Editor
+### 简谱 · MIDI 转谱 · 乐谱排版
 
 面向原神琴谱制作的开源简谱编辑、MIDI 转谱与排版工具<br>
 An open-source jianpu editor, MIDI converter, and score typesetter for Genshin musicians
@@ -17,18 +17,25 @@ An open-source jianpu editor, MIDI converter, and score typesetter for Genshin m
 
 </div>
 
-![原琴简谱编辑器界面](docs/screenshot.png)
+![原琴助手编辑器界面](docs/screenshot.png)
 
 ## 中文
 
+### 最新更新 · v0.4.0
+
+本版加入完整的谱面打谱流程、可自定义快捷键、浅色/深色主题与悬浮设置窗口，
+完善三连音、多声部、延音及格式往返，并优化长谱的解析、排版与页面复用。
+
+完整变更、兼容说明和验证结果见 [v0.4.0 更新说明](docs/releases/v0.4.0.md)。
+
 ### 项目简介
 
-**原琴简谱编辑器**用于把 MIDI、键盘谱、数字斜杠谱、MusicXML、ABC
+**原琴助手编辑器**用于把 MIDI、键盘谱、数字斜杠谱、MusicXML、ABC
 记谱和简谱图片整理成可继续编辑、播放和导出的数字简谱。它特别适合制作原神风物之诗琴等乐器使用的
 琴谱，同时也可以作为通用的 JP-Word / `.jpwabc` 简谱排版工具。
 
-左侧是带语法高亮的文本编辑器，右侧是实时 SVG 乐谱预览。修改音符后会立即重新排版，也可以直接在
-谱面上点选、改音、调整八度和控制播放位置。
+打开后以 SVG 乐谱为主视图；需要直接修改谱文时，可展开左侧的语法高亮文本编辑器。两处保持同步，
+也可以在谱面上点选、改音、调整八度和控制播放位置。
 
 ### 主要功能
 
@@ -37,6 +44,9 @@ An open-source jianpu editor, MIDI converter, and score typesetter for Genshin m
 - **原琴常用文本谱**：支持键盘谱 TXT 和数字斜杠谱 TXT，可自定义键位、时值字符、
   括号和弦、多个同步声部，并在文本与谱面之间双向定位。混合 TXT 可随时切换当前识别谱型，
   未选择的谱文会原样保留，不参与排版、播放或小节计算。
+- **可切换打谱模式**：在谱面内按节奏刻度定位光标，用 1–7 输入、改音或叠加和弦；支持
+  Ctrl 调时值/八度、Alt 移动音符/跨声部、触屏数字键盘、即时试听和虚拟尾小节，并可右键添加
+  琶音、波音、Tr、三连音、倚音、速度、精确换调和自由文本。
 - **钢琴双手与多轨总谱**：支持 `.Voice.RH` / `.Voice.LH` 双行简谱，以及多乐器、多声部
   的同步排版、播放和分轨 MIDI 导出。
 - **多格式导入**：支持 `.jpwabc`、MIDI、MusicXML、ABC、键盘谱、数字谱以及 PNG / JPG /
@@ -110,6 +120,8 @@ Windows 用户也可以双击根目录的 `启动网页端.cmd` 启动网页端�
 npm run dev          # Vite 开发服务器
 npm run build        # TypeScript 严格检查 + Web 构建
 npx tsc --noEmit     # 仅运行类型检查
+npm run check:core   # 格式、排版、钢琴、MIDI、文本谱核心回归
+npm run check:all    # 核心回归 + Edge 浏览器端完整回归
 npm run tauri dev    # 启动 Tauri 桌面应用
 ```
 
@@ -133,15 +145,21 @@ JP-Word 解析、SVG 排版、MusicXML / ABC / OMR 等基础能力。
 
 ## English
 
+### Latest update · v0.4.0
+
+This release adds score-based note entry, customizable shortcuts, light/dark themes,
+and floating settings windows. It improves tuplets, multiple voices, ties, format
+round trips, and long-score performance. See the [full release notes](docs/releases/v0.4.0.md).
+
 ### About
 
-**Genshin Jianpu Editor** turns MIDI, keyboard notation, slash-number notation,
+**原琴助手编辑器** turns MIDI, keyboard notation, slash-number notation,
 MusicXML, ABC notation, and jianpu images into editable numbered scores. It is
 designed for preparing music for Genshin instruments while remaining a
 general-purpose JP-Word / `.jpwabc` editor and typesetter.
 
-The source editor on the left and the live SVG preview on the right stay in
-sync. Notes can also be selected and edited directly on the rendered score.
+The live SVG score is the default view. Expand the source editor on the left
+when needed; both views stay in sync, and notes can be edited on the score.
 
 ### Highlights
 

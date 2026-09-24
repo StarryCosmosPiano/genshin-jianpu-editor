@@ -8,10 +8,12 @@ import {
   formatTempoBpm,
   LineBreak,
   Measure,
+  Key,
   normalizeOpeningPickup,
   Part,
   Score,
 } from "./score";
+import { Fraction } from "../common/fraction";
 import { computePhraseBreaks, type PhraseBreaks } from "./phrase";
 import { serializeJpwNoteTimingEdits } from "./note-timing";
 
@@ -25,8 +27,42 @@ function displayKeyName(name: string): string {
     : name;
 }
 
-function ensembleVoiceSection(part: Part, partIndex: number): string {
-  const instrument = (part.instrumentName.trim() || `乐器 ${partIndex + 1}`)
+function annotationPayload(scr: Score): Record<string, unknown> {
+  const ornaments: unknown[] = [];
+  scr.parts.forEach((part, partIndex) => {
+    part.measures.forEach((measure) => {
+      measure.entries.forEach((entry) => {
+        if (!(entry instanceof Chord) || entry.ornaments.length === 0) return;
+        ornaments.push({
+          part: partIndex,
+          measure: measure.index,
+          offset: serializationPosition(entry).toString(),
+          items: entry.ornaments,
+        });
+      });
+    });
+  });
+  return {
+    ornaments,
+    crossPartArpeggios: scr.crossPartArpeggios.map((mark) => ({
+      measure: mark.measure,
+      offset: mark.offset.toString(),
+      parts: mark.parts,
+      pitches: mark.pitches,
+      direction: mark.direction,
+    })),
+    textMarks: scr.textMarks.map((mark) => ({
+      partIndex: mark.partIndex,
+      measure: mark.measure,
+      offset: mark.offset.toString(),
+      text: mark.text,
+      placement: mark.placement,
+    })),
+  };
+}
+
+function ensembleVoiceSection(part: Part, partIndex: number, scoreInstrument = ""): string {
+  const instrument = (part.instrumentName.trim() || scoreInstrument.trim() || `乐器 ${partIndex + 1}`)
     .replace(/[\r\n]+/g, " ")
     .replace(/^\.+/, "") || `乐器 ${partIndex + 1}`;
   return `.Voice.${instrument}.V${Math.max(1, Math.round(part.voiceIndex))}`;
@@ -227,7 +263,7 @@ class JpScore {
     this.makeMetaData(scr);
     this._breaks = this.phrase ? computePhraseBreaks(scr.parts[0]) : null;
     if (scr.ensemble && scr.parts.length > 0) {
-      scr.parts.forEach((part, index) => this.makeVoiceData(part, ensembleVoiceSection(part, index)));
+      scr.parts.forEach((part, index) => this.makeVoiceData(part, ensembleVoiceSection(part, index, scr.instrumentName)));
     } else if (scr.piano && scr.parts.length >= 2) {
       this.makeVoiceData(scr.parts[0], ".Voice.RH");
       this.makeVoiceData(scr.parts[1], ".Voice.LH");
@@ -301,12 +337,27 @@ class JpScore {
       });
       this.lines.push(`TempoMarks = {${marks.join(";")}}`);
     }
-    const keyChanges = scr.parts[0]?.measures
-      .filter((measure) => measure.index > 0 && measure.keyChange)
-      .map((measure) => `${measure.index + 1}=${displayKeyName(measure.key.name)}`)
+    const keyChanges = scr.keyMarks.length > 0
+      ? scr.keyMarks
+        .filter((mark) => mark.measure > 0 || mark.offset.compareTo(new Fraction(0)) > 0)
+        .sort((left, right) => left.measure - right.measure || left.offset.compareTo(right.offset))
+        .map((mark) => {
+          const key = new Key();
+          key.fifths = mark.fifths;
+          return mark.offset.equals(0)
+            ? `${mark.measure + 1}=${displayKeyName(key.name)}`
+            : `${mark.measure + 1}@${mark.offset.toString()}=${displayKeyName(key.name)}`;
+        })
+      : scr.parts[0]?.measures
+        .filter((measure) => measure.index > 0 && measure.keyChange)
+        .map((measure) => `${measure.index + 1}=${displayKeyName(measure.key.name)}`)
       ?? [];
     if (keyChanges.length > 0) {
       this.lines.push(`KeyChanges = {${keyChanges.join(";")}}`);
+    }
+    const annotations = annotationPayload(scr);
+    if (Object.values(annotations).some((value) => Array.isArray(value) && value.length > 0)) {
+      this.lines.push(`Annotations = {${JSON.stringify(annotations)}}`);
     }
     const arpeggios: string[] = [];
     scr.parts.forEach((part, partIndex) => {

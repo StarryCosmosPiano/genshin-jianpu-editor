@@ -1,10 +1,12 @@
 import type { Score, TempoBeatUnit } from "../score/score";
 
-export type MidiQuantizeDivision = 4 | 8 | 16 | 32 | 64;
+/** Import UI/recommendations stop at 64; 128 is reserved for one explicit
+ * TXT subdivision layer (for example a 64th-note grid inside `<...>`). */
+export type MidiQuantizeDivision = 4 | 8 | 16 | 32 | 64 | 128;
 export type MidiHandMode = "auto" | "single" | "double";
 export type MidiOutputFormat = "jpw" | "keyboard" | "number";
 export type MidiScoreMode = "hands" | "ensemble";
-export type MidiSlashGroupMode = "none" | "grace" | "arpeggio" | "triplet" | "subdivide";
+export type MidiSlashGroupMode = "none" | "chord" | "grace" | "arpeggio" | "triplet" | "subdivide";
 export type MidiSlashOrdering =
   | "voice-asc"
   | "voice-desc"
@@ -71,6 +73,8 @@ export interface MidiDurationCounts {
   16: number;
   32: number;
   64: number;
+  /** Internal explicit-subdivision bucket; normal MIDI analysis UI omits it. */
+  128: number;
 }
 
 export interface MidiAnalysis {
@@ -117,6 +121,8 @@ export interface MidiImportOptions {
   outputFormat?: MidiOutputFormat;
   /** Keyboard TXT output only: render key names on the staff instead of 1-7. */
   keyboardKeyLabels?: boolean;
+  /** Keyboard/number TXT output only: keep explicit 0 rest tokens. */
+  showExplicitRests?: boolean;
   /** Keyboard-key view only: show tied continuation labels as visual 0s. */
   keyboardTieAsZero?: boolean;
   /** Keyboard-key view only: hide tied continuation labels; takes precedence over 0. */
@@ -124,6 +130,9 @@ export interface MidiImportOptions {
   /** Meaning assigned to curly/square groups in generated keyboard/number text. */
   slashBraceMode?: MidiSlashGroupMode;
   slashBracketMode?: MidiSlashGroupMode;
+  slashBarMode?: MidiSlashGroupMode;
+  slashAngleMode?: MidiSlashGroupMode;
+  slashParenMode?: MidiSlashGroupMode;
   /** Ordering used inside generated keyboard/number vertical chords. */
   slashOrdering?: MidiSlashOrdering;
   /**

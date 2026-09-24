@@ -6,6 +6,7 @@ import {
   type TempoBeatUnit,
 } from "../score/score";
 import { detectMidiSlashGestures } from "../midi";
+import { fileStem } from "./file-format";
 import type {
   MidiAnalysis,
   MidiHandMode,
@@ -49,12 +50,17 @@ function pitchName(pitch: number): string {
 
 function slashGroupSelect(value: MidiSlashGroupMode): HTMLSelectElement {
   const select = document.createElement("select");
+  if (value === "subdivide") {
+    const legacy = option("subdivide", "旧版细分（兼容读取）", true);
+    legacy.hidden = true;
+    select.append(legacy);
+  }
   select.append(
     option("none", "留空（不使用此括号）", value === "none"),
+    option("chord", "和弦（括号内音符同时发声）", value === "chord"),
     option("grace", "倚音（装饰音不占拍长）", value === "grace"),
     option("arpeggio", "琶音（三个及以上音的滚奏和弦）", value === "arpeggio"),
     option("triplet", "三连音（3:2 均分）", value === "triplet"),
-    option("subdivide", "普通细分（最低时值÷2）", value === "subdivide"),
   );
   return select;
 }
@@ -72,7 +78,7 @@ export function showMidiImportDialog(parsed: ParsedMidi, analysis: MidiAnalysis,
 
     const info = document.createElement("div");
     info.className = "midi-import-info";
-    const title = parsed.title || fileName.replace(/\.(?:mid|midi)$/i, "") || "未命名 MIDI";
+    const title = parsed.title || fileStem(fileName) || "未命名 MIDI";
     const bars = analysis.durationQuarterNotes / (analysis.beats * 4 / analysis.beatType);
     info.textContent = `${title} · ${parsed.trackCount} 轨 · ${analysis.noteCount} 音符 · 约 ${bars.toFixed(1)} 小节 · ` +
       `${analysis.beats}/${analysis.beatType} · ${analysis.tempoBpm} BPM`;
@@ -102,6 +108,11 @@ export function showMidiImportDialog(parsed: ParsedMidi, analysis: MidiAnalysis,
       option("keyboard", "键盘谱文本（完整排版）"),
       option("number", "数字谱文本（完整排版）"),
     );
+    const showExplicitRests = document.createElement("input");
+    showExplicitRests.type = "checkbox";
+    showExplicitRests.checked = true;
+    const showExplicitRestsRow = row("保留 0 休止符", showExplicitRests);
+    showExplicitRestsRow.title = "仅用于键盘谱/数字谱文本；关闭后内部空拍由前一个音延长填充，开头静默仍保留休止符";
     const keyboardKeyLabels = document.createElement("input");
     keyboardKeyLabels.type = "checkbox";
     keyboardKeyLabels.checked = false;
@@ -124,12 +135,15 @@ export function showMidiImportDialog(parsed: ParsedMidi, analysis: MidiAnalysis,
       option("voice-asc", "声部正序（V1 到 VN）"),
       option("voice-desc", "声部逆序（VN 到 V1）"),
     );
-    const braceMode = slashGroupSelect(analysis.arpeggioGroupCount > 0 ? "arpeggio" : "grace");
+    const braceMode = slashGroupSelect("arpeggio");
     const bracketMode = slashGroupSelect("triplet");
+    const barMode = slashGroupSelect("none");
+    // Compact/stuck-together notation is now implicit. Keep legacy values
+    // readable in the importer, but do not expose a separate subdivision mode.
+    const angleMode = slashGroupSelect("grace");
+    const parenMode = slashGroupSelect("chord");
     const liveGestureCounts = document.createElement("div");
     liveGestureCounts.className = "midi-live-gesture-counts";
-    let autoBraceMode = true;
-    braceMode.addEventListener("change", () => { autoBraceMode = false; });
     const slashGroups = document.createElement("details");
     slashGroups.className = "midi-slash-groups";
     slashGroups.open = analysis.graceGroupCount > 0 || analysis.arpeggioGroupCount > 0 || analysis.tripletNoteCount > 0;
@@ -143,6 +157,9 @@ export function showMidiImportDialog(parsed: ParsedMidi, analysis: MidiAnalysis,
       slashGroupHint,
       row("花括号 {}", braceMode),
       row("方括号 []", bracketMode),
+      row("竖线括号 || ||", barMode),
+      row("尖括号 <>", angleMode),
+      row("圆括号 ()", parenMode),
     );
     const updateGestureAnalysis = (): void => {
       const division = parseInt(quantize.value, 10) as MidiQuantizeDivision;
@@ -150,9 +167,6 @@ export function showMidiImportDialog(parsed: ParsedMidi, analysis: MidiAnalysis,
       liveGestureCounts.textContent =
         `当前 ${division} 分量化重新识别：倚音 ${gestures.grace.length} 组，` +
         `琶音 ${gestures.arpeggio.length} 组，三连音 ${gestures.triplet.length} 组`;
-      if (autoBraceMode) {
-        braceMode.value = gestures.arpeggio.length > 0 ? "arpeggio" : "grace";
-      }
       slashGroups.open = slashGroups.open ||
         gestures.grace.length > 0 ||
         gestures.arpeggio.length > 0 ||
@@ -314,7 +328,11 @@ export function showMidiImportDialog(parsed: ParsedMidi, analysis: MidiAnalysis,
 
     const key = document.createElement("select");
     for (let fifths = -7; fifths <= 7; fifths++) {
-      key.append(option(String(fifths), `1=${MusicCommon.keys[fifths + 7]}`, fifths === analysis.fifths));
+      const rawName = MusicCommon.keys[fifths + 7];
+      const displayName = rawName.startsWith("#") || rawName.startsWith("b")
+        ? `${rawName.slice(1)}${rawName[0]}`
+        : rawName;
+      key.append(option(String(fifths), `1=${displayName}`, fifths === analysis.fifths));
     }
     const beats = document.createElement("input");
     beats.type = "number";
@@ -380,6 +398,7 @@ export function showMidiImportDialog(parsed: ParsedMidi, analysis: MidiAnalysis,
     const orderingRow = row("文本谱和弦书写顺序", slashOrdering);
     controls.append(
       row("导入后格式", outputFormat),
+      showExplicitRestsRow,
       keyboardKeyLabelsRow,
       keyboardTieAsZeroRow,
       keyboardHideTieLabelsRow,
@@ -445,6 +464,8 @@ export function showMidiImportDialog(parsed: ParsedMidi, analysis: MidiAnalysis,
       splitRow.hidden = ensemble;
       instrumentRow.hidden = ensemble;
       slashGroups.hidden = outputFormat.value === "jpw";
+      showExplicitRestsRow.hidden = outputFormat.value === "jpw";
+      showExplicitRestsRow.style.display = outputFormat.value === "jpw" ? "none" : "";
       keyboardKeyLabelsRow.hidden = outputFormat.value !== "keyboard";
       keyboardKeyLabelsRow.style.display = outputFormat.value === "keyboard" ? "" : "none";
       const tieOptionsVisible =
@@ -529,11 +550,15 @@ export function showMidiImportDialog(parsed: ParsedMidi, analysis: MidiAnalysis,
         scoreMode: scoreMode.value as MidiScoreMode,
         trackAssignments,
         outputFormat: outputFormat.value as MidiOutputFormat,
+        showExplicitRests: outputFormat.value !== "jpw" && showExplicitRests.checked,
         keyboardKeyLabels: outputFormat.value === "keyboard" && keyboardKeyLabels.checked,
         keyboardTieAsZero: keyboardTieAsZero.checked,
         keyboardHideTieLabels: keyboardHideTieLabels.checked,
         slashBraceMode: braceMode.value as MidiSlashGroupMode,
         slashBracketMode: bracketMode.value as MidiSlashGroupMode,
+        slashBarMode: barMode.value as MidiSlashGroupMode,
+        slashAngleMode: angleMode.value as MidiSlashGroupMode,
+        slashParenMode: parenMode.value as MidiSlashGroupMode,
         slashOrdering: slashOrdering.value as MidiSlashOrdering,
       });
     };

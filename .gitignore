@@ -22,6 +22,13 @@ testdata
 artifacts
 tmp
 PACKAGE-NOTES.txt
+/-
+/.tmp-overlap-probe.ts
+/slashscore-keyboard.png
+/slashscore-midi-number.png
+
+# 本地 AI 外部控制与诊断工具（含脚本、场景、日志和截图，不上传 GitHub）
+/ai-control.local/
 
 # 用户自行准备的曲目与 SF2 音源不随源码分发；仅保留指定的 Avid MIDI 示例
 examples/*.mid

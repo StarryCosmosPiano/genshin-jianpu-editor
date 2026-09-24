@@ -1,8 +1,8 @@
 // Ported from mp/score/score.kt.
-// MusicXML import methods (Score.load / Part.load / Measure.load / Note.load /
-// parse*) are intentionally omitted — that path moves to the Rust backend
-// (Phase 5) which emits .jpwabc. This module is the model + the jpw/layout/
-// repeat logic that has no MusicXML (JAXB) dependency.
+// Legacy JAXB-bound MusicXML methods (Score.load / Part.load / Measure.load /
+// Note.load / parse*) are intentionally omitted. Browser-native MusicXML
+// import/export lives in musicxml.ts and musicxml-export.ts; this file remains
+// the format-neutral score, repeat and playback model.
 
 import { Fraction } from "../common/fraction";
 import { BarStyle, StartStopDiscontinue } from "./enums";
@@ -55,8 +55,22 @@ export function doPairTuplet(tupletNotes: Note[]): void {
     const a = tupletNotes[2 * i];
     const b = tupletNotes[2 * i + 1];
     const tup = new Tuplet(a, b);
-    a.tuplet = tup;
-    b.tuplet = tup;
+    // MusicXML may expose only the first/last notes of a tuplet. Bind every
+    // note in the same chord range so cursor editing does not fall back to
+    // binary timing when it lands on a middle member.
+    const measure = a.chord.measure === b.chord.measure ? a.chord.measure : null;
+    const low = a.absoluteTick.compareTo(b.absoluteTick) <= 0 ? a.absoluteTick : b.absoluteTick;
+    const high = a.absoluteTick.compareTo(b.absoluteTick) <= 0 ? b.absoluteTick : a.absoluteTick;
+    const members = measure
+      ? measure.entries.flatMap((entry) => entry instanceof Chord ? entry.notes : [])
+        .filter((note) => note.absoluteTick.compareTo(low) >= 0
+          && note.absoluteTick.compareTo(high) <= 0)
+      : [a, b];
+    for (const note of [...new Set([a, b, ...members])]) note.tuplet = tup;
+    tup.writtenUnit = b.chord.duration
+      ? b.chord.duration.timesInt(tup.ratioNumerator).divInt(tup.ratioDenominator)
+      : null;
+    tup.refreshTiming();
   }
 }
 
@@ -107,12 +121,78 @@ export class BeamGroup {
 }
 
 export class Tuplet {
+  /**
+   * Editable slash-score ownership.  A tuplet created from the score input
+   * cursor belongs to one concrete part/voice; a delimiter typed directly in
+   * TXT keeps the legacy all-voices scope.  These fields are intentionally
+   * optional so old JPW/MusicXML imports remain fully compatible.
+   */
+  partIndex: number | null = null;
+  voiceIndex: number | null = null;
+  scope: "voice" | "all" = "all";
+  /** Written-to-real ratio. A normal triplet writes 3 values in the time of 2. */
+  ratioNumerator = 3;
+  ratioDenominator = 2;
+  /** The actual timeline range occupied by this tuplet, when known. */
+  actualStart: Fraction | null = null;
+  actualEnd: Fraction | null = null;
+  /** One member's ordinary written value (before the tuplet ratio is applied). */
+  writtenUnit: Fraction | null = null;
+  /** Binary grid restored when the editable tuplet is removed. Compact input
+   * can be finer than this grid (for example 32nd members created from a
+   * selected 16th cell). */
+  binaryRestoreUnit: Fraction | null = null;
+  /** Fixed 3:2 timing used to spell a TXT mordent. It remains serializable
+   * text timing, but the numbered score shows the semantic mordent symbol
+   * instead of a second, redundant tuplet bracket. */
+  ornamentProxy = false;
+
   constructor(
     public first: Note,
     public last: Note,
   ) {
-    if (first.tupletEnd) throw new Error("");
-    if (last.tupletBegin) throw new Error("");
+    // A complete 3:2 span may be notated as one combined member (for
+    // example three written sixteenths merged into one dotted eighth).  In
+    // that spelling the same note legitimately carries both boundary flags.
+    if (first !== last && first.tupletEnd) throw new Error("");
+    if (first !== last && last.tupletBegin) throw new Error("");
+  }
+
+  /** Chords carrying this Tuplet, including explicit rest members. */
+  memberChords(): Chord[] {
+    const measure = this.first.chord.measure;
+    return measure.entries
+      .filter((entry): entry is Chord => entry instanceof Chord
+        && entry.notes.some((note) => note.tuplet === this))
+      .sort((left, right) => left.position.compareTo(right.position));
+  }
+
+  /** Refresh the cached actual range and written member unit from members. */
+  refreshTiming(): void {
+    const members = this.memberChords();
+    if (members.length === 0) return;
+    const first = members[0];
+    const last = members[members.length - 1];
+    this.actualStart = first.position;
+    this.actualEnd = last.position.plus(last.duration ?? new Fraction(0));
+    if (this.writtenUnit === null) {
+      const span = this.actualEnd.minus(this.actualStart);
+      if (span.compareTo(new Fraction(0)) > 0) {
+        // The ratio numerator is the number of written attacks. The base
+        // written unit is the complete real span divided by the normal-time
+        // denominator; it must not shrink when a member is split into finer
+        // 32nd slots.
+        this.writtenUnit = span.divInt(this.ratioDenominator);
+      }
+    }
+  }
+
+  actualMemberDuration(written: Fraction = this.writtenUnit ?? new Fraction(0)): Fraction {
+    return written.timesInt(this.ratioDenominator).divInt(this.ratioNumerator);
+  }
+
+  writtenMemberDuration(actual: Fraction): Fraction {
+    return actual.timesInt(this.ratioNumerator).divInt(this.ratioDenominator);
   }
 }
 
@@ -294,6 +374,8 @@ export class Chord extends Entry {
   slurEnd = false;
   slurEndChord: Chord | null = null;
   fermata = false;
+  /** Compact ornament data; legacy fermata/arpeggio fields remain unchanged. */
+  ornaments: ChordOrnament[] = [];
 
   hasLrc(num: number): boolean {
     for (const nt of this.notes) {
@@ -683,8 +765,50 @@ export class TempoMark {
   softDeleted = false;
 }
 
+/** A precise local key-signature change used by notation input and JPW. */
+export class KeyMark {
+  constructor(
+    public measure = 0,
+    public offset = new Fraction(0),
+    public fifths = 0,
+  ) {}
+}
+
+export type ChordOrnament =
+  | { kind: "upper-mordent" }
+  | { kind: "lower-mordent" }
+  /** Nominal member division used by a semantic trill. 128 is an internal
+   * value reached only when a configured 64th-note grid is subdivided; it is
+   * not exposed as a normal toolbar/input division. */
+  | { kind: "trill"; subdivision: 128 | 64 | 32 | 16 | 8 };
+
+/** A rolled gesture spanning notes in more than one part/voice. */
+export class CrossPartArpeggio {
+  measure = 0;
+  offset = new Fraction(0);
+  parts: number[] = [];
+  pitches: Array<{ part: number; pitch: number }> = [];
+  direction: "up" | "down" = "up";
+}
+
+/** Free text anchored to a score position, for example a local instruction. */
+export class ScoreTextMark {
+  /** Part/voice row containing the anchored text; 0 keeps legacy global marks. */
+  partIndex = 0;
+  measure = 0;
+  offset = new Fraction(0);
+  text = "";
+  placement: "above" | "below" | "left" | "right" = "above";
+}
+
 export class Score {
   parts: Part[] = [];
+  /**
+   * The opening meter came from an explicit editable notation setting rather
+   * than a MIDI-style pickup encoding.  A complete 3/4 first measure followed
+   * by 4/4 must therefore stay 3/4 when layout normalizes genuine anacruses.
+   */
+  openingMeterIsAuthoritative = false;
   /** True when parts[0]/parts[1] form a paired right/left-hand jianpu system. */
   piano = false;
   /** True when all parts are synchronized rows of a multi-instrument full score. */
@@ -695,6 +819,12 @@ export class Score {
   tempoBeatUnit: TempoBeatUnit = "quarter";
   /** Imported accelerando/ritardando and settled-tempo annotations. */
   tempoMarks: TempoMark[] = [];
+  /** Precise key changes; Measure.key/keyChange remain the rendering cache. */
+  keyMarks: KeyMark[] = [];
+  /** Cross-part rolled chords, kept separate from Chord.arpeggio. */
+  crossPartArpeggios: CrossPartArpeggio[] = [];
+  /** User-entered text/technique marks anchored to the score timeline. */
+  textMarks: ScoreTextMark[] = [];
   /** Persisted per-source-chord move/length deltas used by direct score editing. */
   noteTimingEdits: Array<{
     part: number;
@@ -805,7 +935,7 @@ export function normalizeOpeningPickup(score: Score): boolean {
   const explicitlyMarked = firstMeasures.some((measure) =>
     measure.pickup || measure.displayNumber === null);
   const shortInFullMeter = firstActualDuration < firstMeterDuration - tolerance;
-  const encodedAsShortMeter = second !== null &&
+  const encodedAsShortMeter = !score.openingMeterIsAuthoritative && second !== null &&
     second.timeChange &&
     !sameTime(first.time, second.time) &&
     firstMeterDuration < second.time.beats * 4 / second.time.beatType - tolerance &&

@@ -12,10 +12,31 @@ import {
   PageItem,
   TextFrame,
   SmuflText,
+  type RhythmInputSpan,
 } from "./layout";
 import { Chord, type Note, Score } from "../score/score";
 
 const SVG_NS = "http://www.w3.org/2000/svg";
+
+export interface RhythmInputHitSpan extends RhythmInputSpan {
+  item: PageItem;
+  svgRect: Rect;
+  screenRect: { left: number; top: number; right: number; bottom: number; width: number; height: number };
+}
+
+interface CachedPageItem {
+  item: PageItem;
+  group: SVGGElement;
+  self: SVGElement | null;
+  hit: SVGRectElement | null;
+  visualKey: string;
+  children: CachedPageItem[];
+}
+
+interface CachedPage {
+  svg: SVGSVGElement;
+  root: CachedPageItem;
+}
 
 export class JinpuPainter {
   layout: Layout;
@@ -24,9 +45,13 @@ export class JinpuPainter {
   pageHeight = 0;
   /** PageItem -> rendered <g>, populated each renderPage (for DOM picking). */
   nodeMap = new WeakMap<PageItem, SVGGElement>();
+  /** Rendered SVG node -> PageItem, so semantic marks are not obscured by a
+   * nearby note when a browser click is converted back through geometry. */
+  private itemMap = new WeakMap<Element, PageItem>();
   /** Chord -> its note-entry groups (one per rendered verse/pass), for playback cursor. */
   private chordItem = new Map<Chord, { page: number; item: PageItem; verse: number }[]>();
   private highlighted: PageItem[] = [];
+  private pageCache: CachedPage[] = [];
 
   constructor(fontSize: number) {
     this.layout = new Layout(fontSize);
@@ -40,6 +65,11 @@ export class JinpuPainter {
     // on the first music page. titlePage() remains available for the dedicated
     // title-layout example in the help panel, but is no longer inserted here.
     for (const p of this.layout.pages) p.update();
+    this.pageCache.length = this.layout.pages.length;
+    // A relayout replaces PageItem and often Chord objects. Cached DOM groups
+    // are rebound as their pages render; old object lookups must stop here.
+    this.nodeMap = new WeakMap<PageItem, SVGGElement>();
+    this.itemMap = new WeakMap<Element, PageItem>();
     this.buildChordIndex();
   }
 
@@ -212,8 +242,140 @@ export class JinpuPainter {
     svg.setAttribute("class", "score-page");
     svg.setAttribute("viewBox", `0 0 ${this.pageWidth} ${this.pageHeight}`);
     const pg = this.layout.pages[pageIndex];
-    svg.appendChild(renderPageItem(pg, this.nodeMap));
+    svg.appendChild(renderPageItem(pg, this.nodeMap, this.itemMap));
     return svg;
+  }
+
+  /** Reconcile an interactive page with its previous SVG without detaching it. */
+  renderCachedPage(pageIndex: number): SVGSVGElement {
+    const page = this.layout.pages[pageIndex];
+    if (!page) throw new RangeError(`Page ${pageIndex} does not exist`);
+    let cached = this.pageCache[pageIndex];
+    if (!cached) {
+      const svg = document.createElementNS(SVG_NS, "svg");
+      svg.setAttribute("class", "score-page");
+      svg.setAttribute("viewBox", `0 0 ${this.pageWidth} ${this.pageHeight}`);
+      const group = renderPageItem(page, this.nodeMap, this.itemMap);
+      svg.appendChild(group);
+      cached = { svg, root: indexCachedPageItem(page, group) };
+      this.pageCache[pageIndex] = cached;
+      return svg;
+    }
+    syncAttribute(cached.svg, "class", "score-page");
+    syncAttribute(cached.svg, "viewBox", `0 0 ${this.pageWidth} ${this.pageHeight}`);
+    cached.root = this.reconcilePageItem(page, cached.root);
+    if (cached.root.group.parentNode !== cached.svg) {
+      cached.svg.insertBefore(cached.root.group, cached.svg.firstChild);
+    }
+    return cached.svg;
+  }
+
+  private reconcilePageItem(item: PageItem, cached: CachedPageItem): CachedPageItem {
+    if (item.constructor !== cached.item.constructor) {
+      const group = renderPageItem(item, this.nodeMap, this.itemMap);
+      return indexCachedPageItem(item, group);
+    }
+    const group = cached.group;
+    const classes = [...item.classes].join(" ");
+    syncAttribute(group, "class", classes || null);
+    syncAttribute(group, "transform", item.matrix.isIdentity ? null : item.matrix.toSvg());
+    // Voice coloring, selection, playback and input focus are applied after
+    // rendering. Reset them before the editor reapplies the current model.
+    if (group.style.getPropertyValue("--score-voice-color")) {
+      group.style.removeProperty("--score-voice-color");
+      if (!group.getAttribute("style")) group.removeAttribute("style");
+    }
+    const visualKey = pageItemVisualKey(item);
+    if (visualKey !== cached.visualKey) {
+      cached.self?.remove();
+      cached.hit?.remove();
+      cached.self = renderSelf(item);
+      if (cached.self) {
+        if (item.classes.has("notation-hidden-label")) {
+          cached.self.setAttribute("visibility", "hidden");
+        }
+        group.insertBefore(cached.self, group.firstChild);
+      }
+      cached.hit = cached.self && item.classes.has("tuplet-number")
+        ? createTupletHit(item, cached.self, group) : null;
+      cached.visualKey = visualKey;
+    } else {
+      // applyScoreVoiceColors changes presentation attributes directly.
+      // Restore their canonical value even when the notation is unchanged.
+      restoreSelfPaint(item, cached.self, cached.hit);
+    }
+    this.nodeMap.set(item, group);
+    this.itemMap.set(group, item);
+    if (cached.self) this.itemMap.set(cached.self, item);
+    if (cached.hit) this.itemMap.set(cached.hit, item);
+
+    const previous = cached.children;
+    const children = item.children.map((child, index) => previous[index]
+      ? this.reconcilePageItem(child, previous[index])
+      : indexCachedPageItem(child, renderPageItem(child, this.nodeMap, this.itemMap)));
+    const retained = new Set(children.map((child) => child.group));
+    for (const old of previous) {
+      if (!retained.has(old.group)) old.group.remove();
+    }
+    // Keep unchanged groups mounted. Only inserted/replaced/moved children
+    // touch the DOM; a note edit does not rebuild the rest of the page.
+    for (let index = children.length - 1; index >= 0; index--) {
+      const child = children[index].group;
+      const next = children[index + 1]?.group ?? null;
+      if (child.parentNode !== group || child.nextSibling !== next) group.insertBefore(child, next);
+    }
+    cached.item = item;
+    cached.children = children;
+    return cached;
+  }
+
+  /** Resolve the innermost rendered PageItem that owns an event target. */
+  pageItemForTarget(target: EventTarget | null): PageItem | null {
+    if (!(target instanceof Element)) return null;
+    let element: Element | null = target;
+    while (element) {
+      const item = this.itemMap.get(element);
+      if (item) return item;
+      element = element.parentElement;
+    }
+    return null;
+  }
+
+  /**
+   * Enumerate invisible rhythm hit regions for one rendered page. The SVG
+   * rectangle is in viewBox coordinates; screenRect uses the SVG's current
+   * screen CTM when the element is mounted, so callers can use either direct
+   * score-space hit testing or browser pointer coordinates.
+   */
+  rhythmInputSpansForPage(pageIndex: number, svg?: SVGSVGElement): RhythmInputHitSpan[] {
+    const matrix = svg?.getScreenCTM() ?? null;
+    const transform = (x: number, y: number): { x: number; y: number } => {
+      if (!matrix || typeof DOMPoint === "undefined") return { x, y };
+      const point = new DOMPoint(x, y).matrixTransform(matrix);
+      return { x: point.x, y: point.y };
+    };
+    return this.layout.rhythmInputSpans
+      .filter((span) => span.pageIndex === pageIndex)
+      .map((span): RhythmInputHitSpan => {
+        const item = span.owner ?? this.layout.pages[pageIndex];
+        const svgRect = new Rect(span.xStart, span.yTop, span.xEnd, span.yBottom);
+        const corners = [
+          transform(svgRect.left, svgRect.top),
+          transform(svgRect.right, svgRect.top),
+          transform(svgRect.left, svgRect.bottom),
+          transform(svgRect.right, svgRect.bottom),
+        ];
+        const left = Math.min(...corners.map((point) => point.x));
+        const right = Math.max(...corners.map((point) => point.x));
+        const top = Math.min(...corners.map((point) => point.y));
+        const bottom = Math.max(...corners.map((point) => point.y));
+        return {
+          ...span,
+          item,
+          svgRect,
+          screenRect: { left, top, right, bottom, width: right - left, height: bottom - top },
+        };
+      });
   }
 
   /** Walk up from a picked item to its enclosing "entry" group (else the item). */
@@ -230,7 +392,7 @@ export class JinpuPainter {
     return this.layout.pages.length;
   }
 
-  // ---------------- picking (Phase 3) ----------------
+  // ---------------- SVG picking ----------------
 
   private calcDist(x: number, y: number, inn: Rect): number {
     let dx = 0;
@@ -299,9 +461,88 @@ export class JinpuPainter {
 
 // Recursively build an SVG <g> for a PageItem (matrix transform + self shape +
 // children), mirroring draw.kt's drawPageItem (save/concat/drawTo/recurse).
+function syncAttribute(element: Element, name: string, value: string | null): void {
+  if (value === null) {
+    if (element.hasAttribute(name)) element.removeAttribute(name);
+  } else if (element.getAttribute(name) !== value) {
+    element.setAttribute(name, value);
+  }
+}
+
+function pageItemVisualKey(item: PageItem): string {
+  const hidden = item.classes.has("notation-hidden-label");
+  const hit = item.classes.has("tuplet-number");
+  const hitBounds = hit ? [item.bound.left, item.bound.top, item.bound.width, item.bound.height] : null;
+  if (item instanceof GraphicPath) {
+    return JSON.stringify(["path", item.d, item.fill, item.fill ? colorToCss(item.fillColor) : null,
+      item.stroke, item.stroke ? colorToCss(item.strokeColor) : null,
+      item.stroke ? item.strokeWidth : null, hidden, hit, hitBounds]);
+  }
+  if (item instanceof GraphicLine) {
+    return JSON.stringify(["line", item.p0.x, item.p0.y, item.p1.x, item.p1.y,
+      colorToCss(item.strokeColor), item.strokeWidth, hidden, hit, hitBounds]);
+  }
+  if (item instanceof TextFrame) {
+    return JSON.stringify(["text", item.text,
+      item instanceof SmuflText ? "Bravura" : item.font.family,
+      item.font.size, item.font.bold, colorToCss(item.color),
+      item.strokeWidth > 0 ? colorToCss(item.strokeColor) : null,
+      item.strokeWidth, item.strokeWidth > 0 && item.nonScalingStroke,
+      hidden, hit, hitBounds]);
+  }
+  return "group";
+}
+
+function createTupletHit(item: PageItem, self: SVGElement, group: SVGGElement): SVGRectElement {
+  self.setAttribute("pointer-events", "none");
+  const hit = document.createElementNS(SVG_NS, "rect");
+  const bounds = item.bound;
+  hit.setAttribute("x", String(bounds.left));
+  hit.setAttribute("y", String(bounds.top));
+  hit.setAttribute("width", String(bounds.width));
+  hit.setAttribute("height", String(bounds.height));
+  hit.setAttribute("fill", "transparent");
+  hit.setAttribute("pointer-events", "all");
+  group.insertBefore(hit, self.nextSibling);
+  return hit;
+}
+
+function restoreSelfPaint(item: PageItem, self: SVGElement | null, hit: SVGRectElement | null): void {
+  if (self) {
+    if (item instanceof GraphicPath) {
+      syncAttribute(self, "fill", item.fill ? colorToCss(item.fillColor) : "none");
+      syncAttribute(self, "stroke", item.stroke ? colorToCss(item.strokeColor) : null);
+    } else if (item instanceof GraphicLine) {
+      syncAttribute(self, "stroke", colorToCss(item.strokeColor));
+    } else if (item instanceof TextFrame) {
+      syncAttribute(self, "fill", colorToCss(item.color));
+      syncAttribute(self, "stroke", item.strokeWidth > 0 ? colorToCss(item.strokeColor) : null);
+    }
+  }
+  if (hit) syncAttribute(hit, "fill", "transparent");
+}
+
+function indexCachedPageItem(item: PageItem, group: SVGGElement): CachedPageItem {
+  const elements = Array.from(group.children);
+  const drawsSelf = item instanceof GraphicPath || item instanceof GraphicLine || item instanceof TextFrame;
+  const self = drawsSelf ? elements.shift() as SVGElement : null;
+  const hit = self && item.classes.has("tuplet-number")
+    ? elements.shift() as SVGRectElement : null;
+  return {
+    item,
+    group,
+    self,
+    hit,
+    visualKey: pageItemVisualKey(item),
+    children: item.children.map((child, index) =>
+      indexCachedPageItem(child, elements[index] as SVGGElement)),
+  };
+}
+
 export function renderPageItem(
   item: PageItem,
   nodeMap?: WeakMap<PageItem, SVGGElement>,
+  itemMap?: WeakMap<Element, PageItem>,
 ): SVGGElement {
   const g = document.createElementNS(SVG_NS, "g");
   if (item.classes.size > 0) g.setAttribute("class", [...item.classes].join(" "));
@@ -315,9 +556,19 @@ export function renderPageItem(
       self.setAttribute("visibility", "hidden");
     }
     g.appendChild(self);
+    if (item.classes.has("tuplet-number")) {
+      // Bravura's SVG text hit box includes a large blank descent. When the
+      // numeral sits above the middle member it can intercept that note's
+      // clicks. Keep the glyph unchanged and use its tight SMuFL bounds for
+      // the selectable area instead.
+      const hit = createTupletHit(item, self, g);
+      itemMap?.set(hit, item);
+    }
   }
-  for (const ch of item.children) g.appendChild(renderPageItem(ch, nodeMap));
+  for (const ch of item.children) g.appendChild(renderPageItem(ch, nodeMap, itemMap));
   nodeMap?.set(item, g);
+  itemMap?.set(g, item);
+  if (self) itemMap?.set(self, item);
   return g;
 }
 

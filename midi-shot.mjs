@@ -30,6 +30,20 @@ const errors = [];
 page.on("console", (message) => { if (message.type() === "error") errors.push(message.text()); });
 page.on("pageerror", (error) => errors.push(error.message));
 
+const readBraceVisual = () => {
+  const path = document.querySelector("#score-pane .piano-brace-path path");
+  const rect = path?.getBoundingClientRect();
+  const numbers = (path?.getAttribute("d")?.match(/[-+]?(?:\d*\.)?\d+(?:e[-+]?\d+)?/gi) ?? []).map(Number);
+  return rect && numbers.length >= 20 ? {
+    width: rect.width,
+    height: rect.height,
+    quarterThickness: numbers[18] - numbers[6],
+    topTipX: numbers[0],
+    middleTipX: numbers[12],
+    fill: path.getAttribute("fill"),
+  } : null;
+};
+
 try {
   await page.goto(`http://127.0.0.1:${port}/`, { waitUntil: "networkidle" });
   const gbkBytes = await readFile(join(root, "midi-gbk-title.mid"));
@@ -71,12 +85,14 @@ try {
   }
   await page.getByLabel("导入后格式").selectOption("keyboard");
   if (await page.getByLabel("花括号 {}").inputValue() !== "arpeggio" ||
-      await page.getByLabel("方括号 []").inputValue() !== "triplet") {
-    throw new Error("detected arpeggio/triplet defaults were not assigned to braces and brackets");
+      await page.getByLabel("方括号 []").inputValue() !== "triplet" ||
+      await page.getByLabel("尖括号 <>").inputValue() !== "grace" ||
+      await page.getByLabel("竖线括号 || ||").inputValue() !== "none") {
+    throw new Error("arpeggio/triplet/grace defaults were not assigned to {}, [] and <>");
   }
   await page.getByRole("button", { name: "导入并转为简谱" }).click();
   await page.waitForFunction(() =>
-    window.__app.getText().includes("花括号=琶音") &&
+    window.__app.getText().includes("花括号 = 琶音") &&
     window.__app.getText().split(/\r?\n/).some((line) =>
       !line.trimStart().startsWith("//") && line.includes("/") && /\{[^}]+\}/.test(line)));
   const gestureSlashText = await page.evaluate(() => window.__app.getText());
@@ -140,26 +156,13 @@ try {
       viewBox: document.querySelector("#score-pane svg")?.getAttribute("viewBox"),
     };
   });
-  await page.locator("#btn-options").click();
-  await page.getByLabel("页面方向").selectOption("landscape");
-  await page.getByRole("button", { name: "确定" }).click();
-  await page.waitForFunction(() => {
-    const wrap = document.querySelector(".score-page-wrap")?.getBoundingClientRect();
-    return window.__app.pageW > window.__app.pageH && Boolean(wrap && wrap.width > wrap.height);
-  });
-  await page.locator("#btn-options").click();
-  await page.getByLabel("页面方向").selectOption("portrait");
-  await page.getByLabel("乐器名称").fill("中国钢琴");
-  await page.getByRole("button", { name: "确定" }).click();
-  await page.waitForFunction(() => window.__app.pageH > window.__app.pageW && window.__app.getText().includes("Instrument = {中国钢琴}"));
-  const defaultBraceVisual = await page.evaluate(() => {
-    const text = [...document.querySelectorAll("#score-pane svg text")]
-      .find((node) => node.textContent === String.fromCharCode(0xe000));
-    const rect = text?.getBoundingClientRect();
-    return rect ? { width: rect.width, height: rect.height } : null;
-  });
+  const defaultBraceVisual = await page.evaluate(readBraceVisual);
+  const defaultConnectorSegments = await page.locator("#score-pane .piano-barline-connector").count();
   await page.locator("#btn-layout-style").click();
-  await page.locator(".engraving-box").waitFor();
+  await page.locator('#inspector-pane[data-inspector-id="layout"]').waitFor();
+  await page.locator("#inspector-pane details.engraving-section").evaluateAll((sections) => {
+    for (const section of sections) section.open = true;
+  });
   await page.locator('input[name="measuresPerSystem"]').fill("4");
   await page.locator('input[name="rhythmicSpacingExponent"]').fill("0.7");
   await page.locator('input[name="rhythmicSpacingEnabled"]').check();
@@ -175,55 +178,84 @@ try {
   await page.getByLabel("谱行上下间距").fill("0.75");
   await page.getByLabel("花括号宽度").fill("0.5");
   await page.getByLabel("花括号粗细").fill("0.5");
-  await page.waitForTimeout(180);
-  const thinBraceVisual = await page.evaluate(() => {
-    const text = document.querySelector("#score-pane .piano-brace-glyph text");
-    const rect = text?.getBoundingClientRect();
-    return rect ? {
-      width: rect.width,
-      strokeWidth: text.getAttribute("stroke-width"),
-      vectorEffect: text.getAttribute("vector-effect"),
-    } : null;
-  });
+  await page.waitForFunction(() =>
+    document.querySelector("#score-pane .piano-brace-path path")
+    && window.__app.painter.layout.options.engravingStyle.braceStrokeWidth === 0.5);
+  const thinBraceVisual = await page.evaluate(readBraceVisual);
   if (process.argv[4]) await page.screenshot({ path: process.argv[4], fullPage: false });
-  await page.getByLabel("花括号宽度").fill("2.2");
+  await page.locator('#inspector-pane select[name="pagePreset"]').selectOption("A3");
+  await page.locator('#inspector-pane select[name="pageDirection"]').selectOption("landscape");
+  await page.locator('#inspector-pane input[name="fontSize"]').fill("32");
+  await page.locator('#inspector-pane input[name="titleSize"]').fill("54");
+  await page.locator('#inspector-pane input[name="creditSize"]').fill("40");
+  await page.waitForFunction(() =>
+    document.querySelector("#score-pane svg")?.getAttribute("viewBox") === "0 0 1191 842"
+    && window.__app.painter.layout.fontSize === 32);
+  const paperFontPreview = await page.evaluate(() => ({
+    previewViewBox: document.querySelector("#score-pane svg")?.getAttribute("viewBox"),
+    previewBaseFontSize: window.__app.painter.layout.fontSize,
+    savedPageW: window.__app.pageW,
+    savedPageH: window.__app.pageH,
+    savedBaseFontSize: window.__app.fontSize,
+    savedTitleSize: window.__app.titleSize,
+    savedCreditSize: window.__app.creditSize,
+  }));
+  await page.locator('#inspector-pane select[name="pagePreset"]').selectOption("A4");
+  await page.locator('#inspector-pane select[name="pageDirection"]').selectOption("portrait");
+  await page.locator('#inspector-pane input[name="fontSize"]').fill("28");
+  await page.locator('#inspector-pane input[name="titleSize"]').fill("48");
+  await page.locator('#inspector-pane input[name="creditSize"]').fill("36");
+  await page.getByLabel("乐器名称").fill("中国钢琴");
+  await page.waitForFunction(() =>
+    document.querySelector("#score-pane svg")?.getAttribute("viewBox") === "0 0 595 842"
+    && window.__app.painter.layout.fontSize === 28);
+  await page.getByLabel("花括号宽度").fill("2");
   await page.getByLabel("花括号粗细").fill("5");
   await page.getByLabel("上下连接线粗细").fill("1.2");
   await page.getByLabel("双实线粗细").fill("5");
   await page.getByLabel("显示节奏刻度线（默认开启）").check();
   await page.getByLabel("刻度模式").selectOption("manual");
   await page.getByLabel("手动最短时值").selectOption("32");
+  await page.waitForFunction(() =>
+    document.querySelector("#score-pane .piano-brace-path path")
+    && window.__app.painter.layout.options.engravingStyle.braceStrokeWidth === 5
+    && window.__app.painter.layout.options.engravingStyle.rhythmGuideDivision === 32);
+  const previewBraceVisual = await page.evaluate(readBraceVisual);
   const styleDialog = await page.evaluate(() => ({
-    controls: document.querySelectorAll(".engraving-box input[type=range]").length,
-    preview: document.querySelector(".engraving-preview svg")?.getAttribute("viewBox"),
-    previewSource: document.querySelector(".engraving-preview svg")?.getAttribute("data-preview-source"),
-    previewText: document.querySelector(".engraving-preview svg")?.textContent,
-    previewMeasures: document.querySelector('[data-preview-horizontal-layout="true"]')?.getAttribute("data-preview-measures"),
-    previewSpacing: document.querySelector('[data-preview-horizontal-layout="true"]')?.getAttribute("data-preview-spacing"),
-    metaSize: Number(document.querySelector('.engraving-preview [data-preview-meta="true"]')?.getAttribute("font-size")),
-    previewRhythmGuide: document.querySelectorAll(".engraving-preview .rhythm-guide-line").length,
-    previewRhythmMode: document.querySelector('[data-preview-rhythm-guide="true"]')?.getAttribute("data-preview-rhythm-mode"),
-    previewRhythmDivision: document.querySelector('[data-preview-rhythm-guide="true"]')?.getAttribute("data-preview-rhythm-division"),
-    previewSystems: document.querySelectorAll(".engraving-preview .piano-system").length,
-    previewGraceNotes: document.querySelectorAll(".engraving-preview .jianpu-grace-note").length,
-    previewGraceLinks: document.querySelectorAll(".engraving-preview .jianpu-grace-link").length,
-    previewArpeggios: document.querySelectorAll(".engraving-preview .jianpu-arpeggio").length,
-    previewSharps: document.querySelectorAll(".engraving-preview .jianpu-accidental-sharp").length,
-    previewFlats: document.querySelectorAll(".engraving-preview .jianpu-accidental-flat").length,
-    previewBraceStroke: document.querySelector(".engraving-preview .piano-brace-glyph text")?.getAttribute("stroke-width"),
-    upperDotGap: (() => {
-      const dot = document.querySelector('.engraving-preview [data-preview-octave="high"]');
-      const owner = document.querySelector('.engraving-preview [data-preview-number="high-owner"]');
-      return dot && owner
-        ? Number(owner.getAttribute("y")) - Number(dot.getAttribute("cy")) - Number(dot.getAttribute("r"))
-        : -1;
-    })(),
+    controls: document.querySelectorAll("#inspector-pane input[type=range]").length,
+    inspectorOpen: !document.querySelector("#inspector-pane")?.hasAttribute("hidden"),
+    preview: document.querySelector("#score-pane svg")?.getAttribute("viewBox"),
+    previewText: document.querySelector("#score-pane svg")?.textContent,
+    previewRhythmGuide: document.querySelectorAll("#score-pane .rhythm-guide-line").length,
+    previewSystems: document.querySelectorAll("#score-pane .piano-system").length,
+    pendingStyle: window.__app.painter.layout.options.engravingStyle,
+    savedStyleStillOriginal: window.__app.engravingStyle.braceStrokeWidth !== 5,
   }));
+  const samplePreview = await page.evaluate(() => {
+    const app = window.__app;
+    const svg = app.renderEngravingStylePreview(app.painter.layout.options.engravingStyle);
+    if (!svg) return null;
+    return {
+      source: svg.getAttribute("data-actual-layout-preview"),
+      title: svg.textContent?.includes("全功能排版预览"),
+      systems: svg.querySelectorAll(".piano-system").length,
+      graceNotes: svg.querySelectorAll(".jianpu-grace-note").length,
+      graceLinks: svg.querySelectorAll(".jianpu-grace-link").length,
+      arpeggios: svg.querySelectorAll(".jianpu-arpeggio").length,
+      sharps: svg.querySelectorAll(".jianpu-accidental-sharp").length,
+      flats: svg.querySelectorAll(".jianpu-accidental-flat").length,
+    };
+  });
   if (process.argv[3]) {
-    await page.locator(".engraving-preview").screenshot({ path: process.argv[3] });
+    await page.locator("#score-pane").screenshot({ path: process.argv[3] });
   }
-  await page.getByRole("button", { name: "应用到整个软件" }).click();
+  await page.getByRole("button", { name: "应用到全部简谱" }).click();
   await page.waitForFunction(() => Math.abs(window.__app.engravingStyle.finalBarlineWidth - 5) < 0.001);
+  await page.locator("#btn-options").click();
+  await page.getByLabel("连接跨行小节线").check();
+  await page.locator(".modal-overlay .modal-footer").getByRole("button", { name: "确定" }).click();
+  await page.waitForFunction(() => window.__app.engravingStyle.connectBarlines
+    && document.querySelectorAll("#score-pane .piano-barline-connector").length >= 2);
   await page.waitForTimeout(250);
   const result = await page.evaluate(() => ({
     piano: window.__app.painter.score.piano,
@@ -264,16 +296,6 @@ try {
     rhythmGuideLines: document.querySelectorAll("#score-pane .rhythm-guide-line").length,
     rhythmGuideMajorTicks: document.querySelectorAll("#score-pane .rhythm-guide-major").length,
     rhythmGuideMinorTicks: document.querySelectorAll("#score-pane .rhythm-guide-minor").length,
-    braceVisual: (() => {
-      const text = document.querySelector("#score-pane .piano-brace-glyph text");
-      const rect = text?.getBoundingClientRect();
-      return rect ? {
-        width: rect.width,
-        height: rect.height,
-        strokeWidth: text.getAttribute("stroke-width"),
-        vectorEffect: text.getAttribute("vector-effect"),
-      } : null;
-    })(),
     headerVisual: (() => {
       const svg = document.querySelector("#score-pane svg");
       const title = [...document.querySelectorAll("#score-pane svg text")]
@@ -295,7 +317,8 @@ try {
     engravingStyle: window.__app.engravingStyle,
     storedStyle: JSON.parse(localStorage.getItem("jpeditor-render-settings") ?? "{}").engravingStyle,
   }));
-  console.log(JSON.stringify({ decodedChineseTitle, fallbackFileTitle, gestureSlash, dialog, defaultPage, defaultBraceVisual, thinBraceVisual, styleDialog, result, errors: errors.filter((x) => !/favicon/.test(x)) }, null, 2));
+  const finalBraceVisual = await page.evaluate(readBraceVisual);
+  console.log(JSON.stringify({ decodedChineseTitle, fallbackFileTitle, gestureSlash, dialog, defaultPage, defaultBraceVisual, defaultConnectorSegments, thinBraceVisual, previewBraceVisual, finalBraceVisual, paperFontPreview, styleDialog, samplePreview, result, errors: errors.filter((x) => !/favicon/.test(x)) }, null, 2));
   if (!defaultPage.portraitSetting || !defaultPage.portraitPaper || defaultPage.viewBox !== "0 0 595 842") {
     throw new Error("default page is not truly portrait");
   }
@@ -305,7 +328,16 @@ try {
   if (result.engravingStyle.measuresPerSystem !== 4 || Math.abs(result.engravingStyle.rhythmicSpacingExponent - 0.7) > 0.001 || !result.engravingStyle.rhythmicSpacingEnabled || !result.engravingStyle.justifyLastSystem || result.storedStyle?.measuresPerSystem !== 4 || Math.abs(result.storedStyle?.rhythmicSpacingExponent - 0.7) > 0.001) {
     throw new Error("rhythmic measure layout settings did not preview or persist");
   }
-  if (styleDialog.controls < 17 || !styleDialog.preview || styleDialog.previewSource !== "actual-layout" || !styleDialog.previewText?.includes("全功能排版预览") || /右手|左手/.test(styleDialog.previewText) || styleDialog.previewSystems < 2 || styleDialog.previewGraceNotes < 1 || styleDialog.previewGraceLinks < 1 || styleDialog.previewArpeggios < 1 || styleDialog.previewSharps < 1 || styleDialog.previewFlats < 1 || styleDialog.previewRhythmGuide < 2 || styleDialog.previewBraceStroke !== "5" || !thinBraceVisual || thinBraceVisual.strokeWidth !== "0.5" || thinBraceVisual.vectorEffect !== "non-scaling-stroke" || !result.braceVisual || result.braceVisual.width < thinBraceVisual.width * 2.5 || result.braceVisual.strokeWidth !== "5" || result.braceVisual.vectorEffect !== "non-scaling-stroke" || result.engravingStyle.numberScale !== 1.2 || result.engravingStyle.octaveDotDistance !== 0.55 || result.engravingStyle.octaveDotClearance !== 1.8 || result.engravingStyle.accidentalScale !== 1.15 || result.engravingStyle.accidentalGapScale !== 1.8 || !result.engravingStyle.tieContinuationGray || result.engravingStyle.systemGapScale !== 0.75 || result.engravingStyle.braceWidthScale !== 2.2 || result.engravingStyle.braceStrokeWidth !== 5 || result.systemGap <= 0 || !result.engravingStyle.rhythmGuideEnabled || result.engravingStyle.rhythmGuideMode !== "manual" || result.engravingStyle.rhythmGuideDivision !== 32 || result.storedStyle?.finalBarlineWidth !== 5 || result.storedStyle?.octaveDotDistance !== 0.55 || result.storedStyle?.octaveDotClearance !== 1.8 || result.storedStyle?.accidentalScale !== 1.15 || result.storedStyle?.accidentalGapScale !== 1.8 || result.storedStyle?.tieContinuationGray !== true || result.storedStyle?.systemGapScale !== 0.75 || result.storedStyle?.braceWidthScale !== 2.2 || result.storedStyle?.braceStrokeWidth !== 5 || result.storedStyle?.rhythmGuideMode !== "manual" || result.storedStyle?.rhythmGuideDivision !== 32) {
+  if (paperFontPreview.previewViewBox !== "0 0 1191 842"
+    || paperFontPreview.previewBaseFontSize !== 32
+    || paperFontPreview.savedPageW !== 595
+    || paperFontPreview.savedPageH !== 842
+    || paperFontPreview.savedBaseFontSize !== 28
+    || paperFontPreview.savedTitleSize !== 48
+    || paperFontPreview.savedCreditSize !== 36) {
+    throw new Error("paper and font preview changed saved settings before Apply");
+  }
+  if (styleDialog.controls < 17 || !styleDialog.inspectorOpen || !styleDialog.preview || !styleDialog.previewText?.includes("Piano Quantize Test") || styleDialog.previewSystems < 1 || styleDialog.previewRhythmGuide < 1 || styleDialog.pendingStyle?.measuresPerSystem !== 4 || styleDialog.pendingStyle?.rhythmicSpacingExponent !== 0.7 || styleDialog.pendingStyle?.rhythmGuideDivision !== 32 || styleDialog.pendingStyle?.connectBarlines !== false || !styleDialog.savedStyleStillOriginal || !samplePreview || samplePreview.source !== "true" || !samplePreview.title || samplePreview.systems < 2 || samplePreview.graceNotes < 1 || samplePreview.graceLinks < 1 || samplePreview.arpeggios < 1 || samplePreview.sharps < 1 || samplePreview.flats < 1 || defaultConnectorSegments !== 0 || !defaultBraceVisual || !thinBraceVisual || !previewBraceVisual || !finalBraceVisual || defaultBraceVisual.middleTipX >= defaultBraceVisual.topTipX || thinBraceVisual.fill === "none" || previewBraceVisual.quarterThickness <= thinBraceVisual.quarterThickness * 2.5 || finalBraceVisual.width < thinBraceVisual.width * 2.5 || finalBraceVisual.quarterThickness <= thinBraceVisual.quarterThickness * 2.5 || result.engravingStyle.numberScale !== 1.2 || result.engravingStyle.octaveDotDistance !== 0.55 || result.engravingStyle.octaveDotClearance !== 1.8 || result.engravingStyle.accidentalScale !== 1.15 || result.engravingStyle.accidentalGapScale !== 1.8 || !result.engravingStyle.tieContinuationGray || result.engravingStyle.systemGapScale !== 0.75 || result.engravingStyle.braceWidthScale !== 2 || result.engravingStyle.braceStrokeWidth !== 5 || !result.engravingStyle.connectBarlines || result.systemGap <= 0 || !result.engravingStyle.rhythmGuideEnabled || result.engravingStyle.rhythmGuideMode !== "manual" || result.engravingStyle.rhythmGuideDivision !== 32 || result.storedStyle?.finalBarlineWidth !== 5 || result.storedStyle?.octaveDotDistance !== 0.55 || result.storedStyle?.octaveDotClearance !== 1.8 || result.storedStyle?.accidentalScale !== 1.15 || result.storedStyle?.accidentalGapScale !== 1.8 || result.storedStyle?.tieContinuationGray !== true || result.storedStyle?.systemGapScale !== 0.75 || result.storedStyle?.braceWidthScale !== 2 || result.storedStyle?.braceStrokeWidth !== 5 || result.storedStyle?.connectBarlines !== true || result.storedStyle?.rhythmGuideMode !== "manual" || result.storedStyle?.rhythmGuideDivision !== 32) {
     throw new Error("global engraving style dialog did not apply or persist");
   }
   if (errors.filter((x) => !/favicon/.test(x)).length) throw new Error("Browser console errors occurred");

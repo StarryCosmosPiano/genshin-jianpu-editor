@@ -9,6 +9,7 @@ import {
 } from "../score/score";
 import { Fraction } from "../common/fraction";
 import { scorePartBaseName, scorePartTrackName } from "../score/part-label";
+import { fileStem } from "./file-format";
 import type {
   MidiOutputFormat,
   MidiQuantizeDivision,
@@ -32,11 +33,16 @@ export interface MusicXmlImportOptions {
   beatType: number;
   tempoBpm: number;
   tempoBeatUnit: TempoBeatUnit;
+  /** Keyboard/number TXT output only: keep explicit 0 rest tokens. */
+  showExplicitRests: boolean;
   keyboardKeyLabels: boolean;
   keyboardTieAsZero: boolean;
   keyboardHideTieLabels: boolean;
   slashBraceMode: MidiSlashGroupMode;
   slashBracketMode: MidiSlashGroupMode;
+  slashBarMode: MidiSlashGroupMode;
+  slashAngleMode: MidiSlashGroupMode;
+  slashParenMode: MidiSlashGroupMode;
   slashOrdering: MidiSlashOrdering;
 }
 
@@ -65,12 +71,17 @@ function displayKeyName(name: string): string {
 
 function slashGroupSelect(value: MidiSlashGroupMode): HTMLSelectElement {
   const select = document.createElement("select");
+  if (value === "subdivide") {
+    const legacy = option("subdivide", "旧版细分（兼容读取）", true);
+    legacy.hidden = true;
+    select.append(legacy);
+  }
   select.append(
     option("none", "留空（不使用此括号）", value === "none"),
+    option("chord", "和弦（括号内音符同时发声）", value === "chord"),
     option("grace", "倚音（装饰音不占拍长）", value === "grace"),
     option("arpeggio", "琶音", value === "arpeggio"),
     option("triplet", "三连音（3:2 均分）", value === "triplet"),
-    option("subdivide", "普通细分（最低时值÷2）", value === "subdivide"),
   );
   return select;
 }
@@ -155,7 +166,7 @@ export function showMusicXmlImportDialog(
     const info = document.createElement("div");
     info.className = "midi-import-info";
     const title = score.title.trim()
-      || fileName.replace(/\.(?:xml|musicxml)$/i, "")
+      || fileStem(fileName)
       || "未命名 MusicXML";
     const measureCount = Math.max(0, ...score.parts.map((part) => part.measures.length));
     const structure = score.piano
@@ -182,11 +193,16 @@ export function showMusicXmlImportDialog(
       ));
     }
     const divisionRow = row("文本谱最短时值", division);
-    divisionRow.title = "MusicXML 原始时值不会重新量化；此项只控制键盘谱/数字谱的文本细分";
+    divisionRow.title = "MusicXML 原始时值不会重新量化；此项只控制键盘谱/数字谱文本的最小时值";
 
     const keyboardKeyLabels = document.createElement("input");
     keyboardKeyLabels.type = "checkbox";
     const keyboardKeyLabelsRow = row("谱面显示键盘按键", keyboardKeyLabels);
+    const showExplicitRests = document.createElement("input");
+    showExplicitRests.type = "checkbox";
+    showExplicitRests.checked = true;
+    const showExplicitRestsRow = row("保留 0 休止符", showExplicitRests);
+    showExplicitRestsRow.title = "仅用于键盘谱/数字谱文本；关闭后内部空拍由前一个音延长填充，开头静默仍保留休止符";
     const keyboardTieAsZero = document.createElement("input");
     keyboardTieAsZero.type = "checkbox";
     const keyboardTieAsZeroRow = row("延音用 0 替代", keyboardTieAsZero);
@@ -205,8 +221,13 @@ export function showMusicXmlImportDialog(
     );
     const orderingRow = row("文本谱和弦书写顺序", ordering);
 
-    const braceMode = slashGroupSelect("grace");
+    const braceMode = slashGroupSelect("arpeggio");
     const bracketMode = slashGroupSelect("triplet");
+    const barMode = slashGroupSelect("none");
+    // Compact/stuck-together notation is implicit now; retain legacy values
+    // only when reading old metadata, without offering subdivision in the UI.
+    const angleMode = slashGroupSelect("grace");
+    const parenMode = slashGroupSelect("chord");
     const groups = document.createElement("details");
     const groupsSummary = document.createElement("summary");
     groupsSummary.textContent = "键盘谱 / 数字谱括号用途";
@@ -214,12 +235,16 @@ export function showMusicXmlImportDialog(
       groupsSummary,
       row("花括号 {}", braceMode),
       row("方括号 []", bracketMode),
+      row("竖线括号 || ||", barMode),
+      row("尖括号 <>", angleMode),
+      row("圆括号 ()", parenMode),
     );
 
     const controls = document.createElement("div");
     controls.append(
       row("导入后格式", format),
       divisionRow,
+      showExplicitRestsRow,
       keyboardKeyLabelsRow,
       keyboardTieAsZeroRow,
       keyboardHideTieLabelsRow,
@@ -361,6 +386,8 @@ export function showMusicXmlImportDialog(
       const keyboardOutput = format.value === "keyboard";
       divisionRow.hidden = !textOutput;
       divisionRow.style.display = textOutput ? "" : "none";
+      showExplicitRestsRow.hidden = !textOutput;
+      showExplicitRestsRow.style.display = textOutput ? "" : "none";
       orderingRow.hidden = !textOutput;
       orderingRow.style.display = textOutput ? "" : "none";
       groups.hidden = !textOutput;
@@ -412,6 +439,7 @@ export function showMusicXmlImportDialog(
       if (event.target === overlay) close(null);
     };
     confirm.onclick = () => {
+      const textOutput = format.value === "keyboard" || format.value === "number";
       close({
         outputFormat: format.value as MusicXmlOutputFormat,
         textDivision: parseInt(division.value, 10) as MidiQuantizeDivision,
@@ -437,11 +465,15 @@ export function showMusicXmlImportDialog(
           ),
         ),
         tempoBeatUnit: displayedTempoUnit,
+        showExplicitRests: textOutput && showExplicitRests.checked,
         keyboardKeyLabels: format.value === "keyboard" && keyboardKeyLabels.checked,
         keyboardTieAsZero: keyboardTieAsZero.checked,
         keyboardHideTieLabels: keyboardHideTieLabels.checked,
         slashBraceMode: braceMode.value as MidiSlashGroupMode,
         slashBracketMode: bracketMode.value as MidiSlashGroupMode,
+        slashBarMode: barMode.value as MidiSlashGroupMode,
+        slashAngleMode: angleMode.value as MidiSlashGroupMode,
+        slashParenMode: parenMode.value as MidiSlashGroupMode,
         slashOrdering: ordering.value as MidiSlashOrdering,
       });
     };

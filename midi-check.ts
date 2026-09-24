@@ -9,8 +9,10 @@ import {
 import {
   analyzeSlashScore,
   defaultSlashScoreOptions,
+  notationAnnotationsFromScore,
   parseSlashScore,
   scoreToSlashScore,
+  slashPitchSources,
   SLASH_VOICE_SEPARATOR,
 } from "./src/slashscore";
 import { scoreToJpwabc } from "./src/score/jpscore";
@@ -23,7 +25,8 @@ import {
   tempoBpmAtQuarter,
 } from "./src/score/timeline";
 import { Chord } from "./src/score/score";
-import { writeFile } from "node:fs/promises";
+import { buildSlashSourceNotes } from "./src/editor/note-selection";
+import { readFile, writeFile } from "node:fs/promises";
 
 function check(value: unknown, message: string): asserts value {
   if (!value) throw new Error(message);
@@ -155,6 +158,114 @@ check(fullKeyboardTxt.includes(SLASH_VOICE_SEPARATOR)
   && fullKeyboardScore.piano
   && fullKeyboardScore.parts.length === 2,
 "MIDI keyboard-text output merged the two hands instead of retaining full voice layout");
+
+// Repeated attacks of the same pitch inside one slash beat used to reuse the
+// preceding source mapping.  The real second chord was then left black and a
+// click on it could not reveal any text selection, which looked like a V1 note
+// had fallen into the uncoloured/default V2 row.
+const repeatedVoiceParsed = parseMidi(midi([
+  conductor,
+  noteTrack("Right Hand", [
+    { start: 0, end: 240, pitch: 72 },
+    { start: 240, end: 480, pitch: 72 },
+    { start: 480, end: 720, pitch: 74 },
+    { start: 720, end: 960, pitch: 74 },
+  ]),
+  noteTrack("Left Hand", [
+    { start: 0, end: 480, pitch: 48 },
+    { start: 480, end: 960, pitch: 50 },
+  ]),
+]));
+const repeatedVoiceScore = midiToScore(
+  repeatedVoiceParsed,
+  options(16, "double"),
+).score;
+const repeatedVoiceText = scoreToSlashScore(
+  repeatedVoiceScore,
+  "keyboard",
+  16,
+  ".",
+  {
+    sourceMidi: repeatedVoiceParsed,
+    braceMode: "grace",
+    bracketMode: "triplet",
+  },
+  2,
+);
+const repeatedVoiceAnalysis = analyzeSlashScore(repeatedVoiceText);
+const repeatedVoiceOptions = defaultSlashScoreOptions("keyboard", repeatedVoiceAnalysis);
+repeatedVoiceOptions.voiceCount = 2;
+const repeatedVoiceRoundTrip = parseSlashScore(
+  repeatedVoiceText,
+  repeatedVoiceOptions,
+).score;
+const repeatedVoiceSources = buildSlashSourceNotes(
+  repeatedVoiceText,
+  repeatedVoiceOptions,
+  repeatedVoiceRoundTrip,
+);
+const repeatedVoiceRenderedNotes = repeatedVoiceRoundTrip.parts.flatMap((part) =>
+  part.measures.flatMap((measure) => measure.entries)
+    .filter((entry): entry is Chord =>
+      entry instanceof Chord && !entry.rest && !entry.generatedTimingContinuation)
+    .flatMap((chord) => chord.notes.filter((note) => !note.rest)));
+const repeatedUpperC = repeatedVoiceSources.filter((source) =>
+  source.voiceIndex === 1 && source.note.pitch === 72);
+check(repeatedVoiceSources.length === repeatedVoiceRenderedNotes.length
+  && new Set(repeatedVoiceSources.map((source) => source.note)).size
+    === repeatedVoiceRenderedNotes.length,
+"repeated MIDI attacks did not retain a one-to-one editable TXT mapping");
+check(repeatedUpperC.length === 2
+  && new Set(repeatedUpperC.map((source) => source.note)).size === 2
+  && repeatedVoiceSources.filter((source) => source.voiceIndex === 1)
+    .every((source) => source.partIndex === 0 && source.markerCount === 1)
+  && repeatedVoiceSources.filter((source) => source.voiceIndex === 2)
+    .every((source) => source.partIndex === 1 && source.markerCount === 0),
+"MIDI V1/V2 source ownership or invisible markers changed during TXT round-trip");
+
+// A triplet can contain the same MIDI pitch in both hands.  Pitch-only Set
+// deduplication previously discarded one voice from every bracket atom.
+const unisonTripletParsed = parseMidi(midi([
+  conductor,
+  noteTrack("Right Hand", [
+    { start: 0, end: 160, pitch: 60 },
+    { start: 160, end: 320, pitch: 60 },
+    { start: 320, end: 480, pitch: 60 },
+  ]),
+  noteTrack("Left Hand", [
+    { start: 0, end: 160, pitch: 60 },
+    { start: 160, end: 320, pitch: 60 },
+    { start: 320, end: 480, pitch: 60 },
+  ]),
+]));
+const unisonTripletScore = midiToScore(
+  unisonTripletParsed,
+  options(8, "double"),
+).score;
+const unisonTripletText = scoreToSlashScore(
+  unisonTripletScore,
+  "keyboard",
+  8,
+  ".",
+  {
+    sourceMidi: unisonTripletParsed,
+    braceMode: "grace",
+    bracketMode: "triplet",
+  },
+  2,
+);
+const unisonTripletOptions = defaultSlashScoreOptions(
+  "keyboard",
+  analyzeSlashScore(unisonTripletText),
+);
+unisonTripletOptions.voiceCount = 2;
+const unisonTripletSources = slashPitchSources(
+  unisonTripletText,
+  unisonTripletOptions,
+).filter((source) => !source.grace);
+check(unisonTripletSources.filter((source) => source.voiceIndex === 1).length === 3
+  && unisonTripletSources.filter((source) => source.voiceIndex === 2).length === 3,
+"same-pitch two-voice MIDI triplets lost one voice in TXT serialization");
 const jpw = scoreToJpwabc(imported.score);
 check(jpw.includes(".Voice.RH") && jpw.includes(".Voice.LH") && jpw.includes("Tempo = {120}"), "piano/tempo serialization failed");
 check(jpw.includes("SubTitle = {钢琴双手示例}") && jpw.includes("Composer = {作曲测试}") && jpw.includes("Arranger = {编曲测试}"), "publication metadata serialization failed");
@@ -261,6 +372,74 @@ const tempoRampRoundTrip = tempoRampFile ? fromJpw(tempoRampFile) : null;
 check(tempoRampRoundTrip?.tempoMarks.length === tempoRampScore.tempoMarks.length,
   "tempo annotations did not round-trip through jpwabc");
 
+// Real mixed-meter regression: a duration-only silent TXT row must remain a
+// measure, otherwise the following 3/4 section and every tempo ramp shift one
+// bar left compared with the JPW import.
+const avidParsed = parseMidi(new Uint8Array(await readFile("examples/Avid - 86 -不存在的战区.mid")));
+const avidAnalysis = analyzeMidi(avidParsed);
+const avidOptions: MidiImportOptions = {
+  quantize: avidAnalysis.recommendedQuantize,
+  detectTriplets: true,
+  handMode: avidAnalysis.autoHandMode,
+  splitPitch: avidAnalysis.splitPitch,
+  fifths: avidAnalysis.fifths,
+  beats: avidAnalysis.beats,
+  beatType: avidAnalysis.beatType,
+  tempoBpm: avidAnalysis.tempoBpm,
+  scoreMode: "hands",
+  preserveSourceRhythmSpelling: true,
+};
+const avidScore = midiToScore(avidParsed, avidOptions).score;
+const avidSlashText = scoreToSlashScore(
+  avidScore,
+  "keyboard",
+  avidAnalysis.recommendedQuantize,
+  ".",
+  {
+    sourceMidi: avidParsed,
+    braceMode: "grace",
+    bracketMode: "triplet",
+    ordering: "pitch-asc",
+    showExplicitRests: true,
+  },
+  Math.min(9, avidScore.parts.length),
+);
+const avidSlashOptions = defaultSlashScoreOptions("keyboard", analyzeSlashScore(avidSlashText));
+avidSlashOptions.voiceCount = Math.min(9, avidScore.parts.length);
+avidSlashOptions.tempoBpm = avidScore.tempoBpm;
+avidSlashOptions.tempoBeatUnit = avidScore.tempoBeatUnit;
+avidSlashOptions.fifths = avidAnalysis.fifths;
+avidSlashOptions.beats = avidAnalysis.beats;
+avidSlashOptions.beatType = avidAnalysis.beatType;
+avidSlashOptions.braceMode = "grace";
+avidSlashOptions.bracketMode = "triplet";
+avidSlashOptions.tempoMarks = avidScore.tempoMarks.map((mark) => ({
+  measure: mark.measure,
+  offset: mark.offset.toFloat(),
+  kind: mark.kind,
+  bpm: mark.bpm,
+}));
+avidSlashOptions.annotations = notationAnnotationsFromScore(avidScore);
+const avidSlashScore = parseSlashScore(avidSlashText, avidSlashOptions).score;
+const tempoAbsolutePositions = (score: typeof avidScore): Array<[string, number | null, number]> =>
+  score.tempoMarks.map((mark) => [
+    mark.kind,
+    mark.bpm,
+    score.parts[0].measures[mark.measure].position.toFloat() + mark.offset.toFloat(),
+  ]);
+const avidJpwTempo = tempoAbsolutePositions(avidScore);
+const avidTxtTempo = tempoAbsolutePositions(avidSlashScore);
+check(avidSlashScore.parts[0].measures.length === avidScore.parts[0].measures.length
+  && avidTxtTempo.length === avidJpwTempo.length
+  && avidTxtTempo.every((item, index) => item[0] === avidJpwTempo[index][0]
+    && item[1] === avidJpwTempo[index][1]
+    && Math.abs(item[2] - avidJpwTempo[index][2]) < 1e-8),
+`MIDI keyboard TXT shifted mixed-meter tempo marks: ${JSON.stringify({
+  jpw: avidJpwTempo,
+  text: avidTxtTempo,
+  measures: [avidScore.parts[0].measures.length, avidSlashScore.parts[0].measures.length],
+})}`);
+
 const linearPlaybackFile = JpwFile.fromString(`.Title
 KeyAndMeters = {1=C,4/4}
 Tempo = {72}
@@ -334,8 +513,10 @@ check(ensembleRoundTrip?.ensemble && ensembleRoundTrip.parts.length === 3,
 const ensembleMidi = scoreToMidi(ensembleRoundTrip);
 check(((ensembleMidi[10] << 8) | ensembleMidi[11]) === 4, "full-score MIDI export must contain tempo plus three voice tracks");
 const exportedEnsembleParsed = parseMidi(ensembleMidi);
-check(exportedEnsembleParsed.tracks.some((track) => track.name === "钢琴 声部 1") &&
-      exportedEnsembleParsed.tracks.some((track) => track.name === "小提琴"),
+const ensembleTrackNames = exportedEnsembleParsed.tracks.map((track) => track.name);
+check(ensembleTrackNames.includes(`${ensembleRoundTrip.parts[0].instrumentName}V1`)
+      && ensembleTrackNames.includes(`${ensembleRoundTrip.parts[1].instrumentName}V2`)
+      && ensembleTrackNames.includes(ensembleRoundTrip.parts[2].instrumentName),
   "full-score MIDI export lost instrument/voice track names");
 
 const tripletParsed = parseMidi(midi([noteTrack("Triplet", [
@@ -568,9 +749,45 @@ for (let i = 0; i < 7; i++) meterNotes.push({ start: i * 480, end: (i + 1) * 480
 const meterScore = midiToScore(parseMidi(midi([meterConductor, noteTrack("Meter", meterNotes)])), options(4, "single")).score;
 const meterText = scoreToJpwabc(meterScore);
 check(meterText.includes("3/4"), "mid-score time signature was not serialized");
+const meterSlashText = scoreToSlashScore(meterScore, "number", 16, ".");
+const meterSlashLines = meterSlashText.split(/\r?\n/);
+const meterSlashDirective = meterSlashLines.findIndex((line) => line.trim() === "3/4拍:");
+const meterSlashMeasure = meterSlashDirective >= 0 ? meterSlashLines[meterSlashDirective + 1] ?? "" : "";
+check(meterSlashDirective >= 0 && meterSlashMeasure.split("/").length - 1 === 3,
+  "MIDI-to-TXT did not preserve the changed meter or emit its three beat groups");
 const meterFile = JpwFile.fromString(meterText);
 const meterRoundTrip = meterFile ? fromJpw(meterFile) : null;
 check(meterRoundTrip?.parts[0].measures[1].time.beats === 3, "inline time signature did not round-trip");
+
+// A tick-zero signature is the source timeline, not merely dialog metadata.
+// TXT import also passes through midiToScore; ignoring this 3/4 event used to
+// build a hidden 4/4 first bar and shifted the first following 4/4 bar by one
+// beat even though its displayed time signature was later corrected.
+const openingThreeParsed = parseMidi(midi([
+  track([...timeSignatureMeta(0, 3, 4)]),
+  noteTrack("Opening 3/4", [
+    { start: 0, end: 480, pitch: 60 },
+    { start: 480, end: 960, pitch: 62 },
+    { start: 960, end: 1440, pitch: 64 },
+  ]),
+]));
+const openingThreeScore = midiToScore(openingThreeParsed, {
+  ...options(16, "single"),
+  preserveSourceRhythmSpelling: true,
+}).score;
+check(openingThreeScore.parts[0].measures.length === 1
+  && openingThreeScore.parts[0].measures[0].time.beats === 3
+  && openingThreeScore.parts[0].measures[0].time.beatType === 4
+  && openingThreeScore.parts[0].measures[0].duration.equals(3),
+`a tick-zero 3/4 signature was ignored in favor of the 4/4 dialog fallback: ${JSON.stringify(
+  openingThreeScore.parts[0].measures.map((measure) => ({
+    position: measure.position.toString(),
+    duration: measure.duration.toString(),
+    beats: measure.time.beats,
+    beatType: measure.time.beatType,
+    pickup: measure.pickup,
+  })),
+)}`);
 
 const oddDuration = parseMidi(midi([noteTrack("Odd duration", [{ start: 0, end: 150, pitch: 60 }])]));
 const oddText = scoreToJpwabc(midiToScore(oddDuration, options(64, "single")).score);
