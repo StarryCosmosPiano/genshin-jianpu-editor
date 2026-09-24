@@ -2667,8 +2667,13 @@ export class App {
       this.auditionInputCursor(false);
       return;
     }
-    const currentIndex = cursor.verticalIndex ?? Math.max(0,
-      notes.findIndex((note) => note.pitch === this._input.focusPitch));
+    // Editing fills the placeholder and may reorder the chord. Resolve the
+    // current row from the same lane/focus that paints the cursor, rather than
+    // reusing the former placeholder index and skipping to another part.
+    const focusedNote = inputNoteClosestToPitch(chord, this._input.focusPitch);
+    const currentIndex = cursor.lane === "above" ? notes.length
+      : cursor.lane === "below" ? -1
+        : Math.max(0, notes.findIndex((note) => note === focusedNote));
     const nextIndex = currentIndex + (direction < 0 ? 1 : -1);
     if (nextIndex > notes.length || nextIndex < -1) {
       if (!canMoveToAdjacentPart()) return;
