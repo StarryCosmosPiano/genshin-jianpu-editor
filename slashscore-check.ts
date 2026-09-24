@@ -18,7 +18,6 @@ import {
   moveInputTieChainByNotationDomain,
   resizeInputTupletMember,
 } from "./src/score/input-edit";
-import { readFileSync } from "node:fs";
 import {
   analyzeSlashScore,
   defaultSlashScoreOptions,
@@ -1542,15 +1541,23 @@ check(JSON.stringify(sourceNoteSignature(buildSlashSourceNotes(
   cachedSourceText, cachedSourceParse.slashOptions, cachedSourceParse.score,
 ))), "shared and independent TXT source-note association differ");
 
-const fullKeyboard = readFileSync("examples/所念皆星河 - 键盘谱.txt", "utf8");
-const fullNumber = readFileSync("examples/所念皆星河 - 数字谱.txt", "utf8");
+// A long paired TXT score must remain a portable core regression: local song
+// exports are intentionally ignored by Git and absent from CI checkouts.
+const fullKeyboard = `键盘谱\n4/4拍：\n点=八分音符\n${Array.from(
+  { length: 48 }, () => "(VJ).Q./(ZG)../B.S./D.Q./",
+).join("\n")}\n`;
+const fullNumber = `数字谱\n4/4拍：\n点=八分音符\n${Array.from(
+  { length: 48 }, () => "(-47).+1./(-15)../-5.2./3.+1./",
+).join("\n")}\n`;
 const fullKeyboardResult = parseSlashScore(fullKeyboard, defaultSlashScoreOptions("keyboard", analyzeSlashScore(fullKeyboard)));
 const fullNumberResult = parseSlashScore(fullNumber, defaultSlashScoreOptions("number", analyzeSlashScore(fullNumber)));
-check(fullKeyboardResult.summary.measures === 48, "generated keyboard example has 48 measures");
-check(fullNumberResult.summary.measures === 48, "generated number example has 48 measures");
-check(!fullKeyboardResult.score.piano && !fullNumberResult.score.piano, "generated MIDI examples stay single-staff");
-check(fullKeyboardResult.summary.clippedGroups === 0 && fullNumberResult.summary.clippedGroups === 0, "generated examples fit every slash group");
-check(fullKeyboardResult.summary.ignoredCharacters === 0 && fullNumberResult.summary.ignoredCharacters === 0, "generated examples contain no unknown score symbols");
+check(fullKeyboardResult.summary.measures === 48, "long keyboard fixture has 48 measures");
+check(fullNumberResult.summary.measures === 48, "long number fixture has 48 measures");
+check(!fullKeyboardResult.score.piano && !fullNumberResult.score.piano, "long TXT fixtures stay single-staff");
+check(fullKeyboardResult.summary.clippedGroups === 0 && fullNumberResult.summary.clippedGroups === 0, "long TXT fixtures fit every slash group");
+check(fullKeyboardResult.summary.ignoredCharacters === 0 && fullNumberResult.summary.ignoredCharacters === 0, "long TXT fixtures contain no unknown score symbols");
+check(JSON.stringify(sounding(fullKeyboardResult.score)) === JSON.stringify(sounding(fullNumberResult.score)),
+  "long keyboard and number fixtures changed pitch or timing correspondence");
 
 const readableDirectives = [
   "// @key m=3 beat=2.5 1=D",
