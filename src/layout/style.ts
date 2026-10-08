@@ -1,8 +1,14 @@
+import { A4_NOTATION_SCALE } from "./notation-density";
+
 export type RhythmGuideDivision = 1 | 2 | 4 | 8 | 16 | 32 | 64;
 export type RhythmGuideMode = "auto" | "manual";
 
 /** Global engraving controls shared by every numbered-notation document. */
 export interface EngravingStyle {
+  /** Scale all page content, including text, without changing the paper size. */
+  contentScale: number;
+  /** Scale music glyphs and their layout, independently of lyrics and header text. */
+  notationScale: number;
   /** Number size relative to the base font size. */
   numberScale: number;
   numberBold: boolean;
@@ -65,6 +71,8 @@ export interface EngravingStyle {
 }
 
 export const DEFAULT_ENGRAVING_STYLE: Readonly<EngravingStyle> = Object.freeze({
+  contentScale: 1,
+  notationScale: A4_NOTATION_SCALE,
   numberScale: 0.6,
   numberBold: false,
   chordRowGap: 0.88,
@@ -77,7 +85,7 @@ export const DEFAULT_ENGRAVING_STYLE: Readonly<EngravingStyle> = Object.freeze({
   noteGapScale: 0.8,
   rhythmicSpacingEnabled: true,
   rhythmicSpacingExponent: 1,
-  measuresPerSystem: 4,
+  measuresPerSystem: 6,
   justifyLastSystem: true,
   systemGapScale: 1,
   publicationTitleScale: 1,
@@ -108,23 +116,28 @@ export const DEFAULT_ENGRAVING_STYLE: Readonly<EngravingStyle> = Object.freeze({
   finalBarlineGap: 2.8,
 });
 
-export const ENGRAVING_STYLE_SETTINGS_VERSION = 1;
+export const ENGRAVING_STYLE_SETTINGS_VERSION = 2;
 
-/** Old installations persisted the entire style, including the former brace
- * defaults. Update that exact pair once while preserving every other setting
- * and any brace value the user changed. */
+/** Migrate former defaults once per version: the brace pair before v1 and the
+ * four-measure target before v2. Preserve other settings and custom values. */
 export function restorePersistedEngravingStyle(
   value: Partial<EngravingStyle> | null | undefined,
   version: unknown,
 ): { style: EngravingStyle; needsVersionSave: boolean } {
   const needsVersionSave = !(typeof version === "number" && Number.isFinite(version)
     && version >= ENGRAVING_STYLE_SETTINGS_VERSION);
-  const legacyDefaults = needsVersionSave
+  const needsBraceMigration = !(typeof version === "number" && Number.isFinite(version) && version >= 1);
+  const legacyDefaults = needsBraceMigration
     && value?.braceWidthScale === 0.7 && value.braceStrokeWidth === 0.5;
-  const source = legacyDefaults
+  const braceSource = legacyDefaults
     ? { ...value, braceWidthScale: DEFAULT_ENGRAVING_STYLE.braceWidthScale,
       braceStrokeWidth: DEFAULT_ENGRAVING_STYLE.braceStrokeWidth }
     : value;
+  // Older installations persisted the former target of four measures. Move
+  // that exact default to the denser six-measure A4 setting on upgrade.
+  const source = needsVersionSave && braceSource?.measuresPerSystem === 4
+    ? { ...braceSource, measuresPerSystem: DEFAULT_ENGRAVING_STYLE.measuresPerSystem }
+    : braceSource;
   return { style: normalizeEngravingStyle(source), needsVersionSave };
 }
 
@@ -137,6 +150,8 @@ export type NumericEngravingStyleKey = Exclude<
 
 /** Shared slider/normalization ranges: [minimum, maximum, step]. */
 export const ENGRAVING_STYLE_RANGES: Readonly<Record<NumericEngravingStyleKey, readonly [number, number, number]>> = Object.freeze({
+  contentScale: [0.25, 2, 0.01],
+  notationScale: [0.5, 1.5, 0.01],
   numberScale: [0.25, 2.4, 0.05],
   chordRowGap: [0.3, 2.2, 0.02],
   octaveDotScale: [0.25, 2.5, 0.05],

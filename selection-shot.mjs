@@ -1205,30 +1205,34 @@ A../S../D../F../
     || await exportBox.getByRole("button", { name: "MusicXML" }).count() !== 1) {
     throw new Error("score export menu is missing all-page PNG, PDF or MusicXML");
   }
-  const pngDownloadPromise = page.waitForEvent("download");
   await exportBox.getByRole("button", { name: "PNG（全部页面）" }).click();
-  const pngOptionsBox = page.locator(".modal-box").filter({ hasText: "透明背景" });
+  const pngOptionsBox = page.locator(".watermark-dialog").filter({ hasText: "透明背景" });
   await pngOptionsBox.waitFor();
-  const pngChecks = pngOptionsBox.locator('input[type="checkbox"]');
-  if (await pngChecks.count() !== 2 || !await pngChecks.nth(0).isChecked()) {
+  const transparentBackground = pngOptionsBox.locator("label", { hasText: "透明背景" }).locator('input[type="checkbox"]');
+  const zipPages = pngOptionsBox.locator("label", { hasText: "ZIP" }).locator('input[type="checkbox"]');
+  if (!await transparentBackground.isChecked()) {
     throw new Error("PNG export does not default to a transparent background");
   }
-  await pngChecks.nth(1).check();
+  const exportsZip = await zipPages.count() === 1;
+  if (exportsZip) await zipPages.check();
+  const pngDownloadPromise = page.waitForEvent("download");
   await pngOptionsBox.getByRole("button", { name: "导出" }).click();
   const pngDownload = await pngDownloadPromise;
   const pngDownloadPath = await pngDownload.path();
   const pngDownloadBytes = pngDownloadPath ? await readFile(pngDownloadPath) : null;
-  if (!pngDownload.suggestedFilename().endsWith(".zip")
-    || !pngDownloadBytes
-    || pngDownloadBytes[0] !== 0x50
-    || pngDownloadBytes[1] !== 0x4b) {
-    throw new Error("PNG ZIP export did not create a valid downloadable archive");
+  if (!pngDownloadBytes || (exportsZip
+    ? !pngDownload.suggestedFilename().endsWith(".zip") || pngDownloadBytes[0] !== 0x50 || pngDownloadBytes[1] !== 0x4b
+    : !pngDownload.suggestedFilename().endsWith(".png") || pngDownloadBytes.subarray(1, 4).toString() !== "PNG")) {
+    throw new Error("PNG export did not create a valid downloadable image or archive");
   }
 
   await page.locator("#btn-export").click();
   exportBox = page.locator(".modal-box").filter({ hasText: "键盘谱 TXT" });
-  const pdfDownloadPromise = page.waitForEvent("download");
   await exportBox.getByRole("button", { name: "PDF（全部页面）" }).click();
+  const pdfOptionsBox = page.locator(".watermark-dialog").filter({ hasText: "导出 PDF" });
+  await pdfOptionsBox.waitFor();
+  const pdfDownloadPromise = page.waitForEvent("download");
+  await pdfOptionsBox.getByRole("button", { name: "导出" }).click();
   const pdfDownload = await pdfDownloadPromise;
   const pdfDownloadPath = await pdfDownload.path();
   const pdfDownloadBytes = pdfDownloadPath ? await readFile(pdfDownloadPath) : null;
@@ -1491,6 +1495,7 @@ Tempo = {90}
     return {
       incoming: document.querySelectorAll("#score-pane .tie-system-incoming").length,
       outgoing: document.querySelectorAll("#score-pane .tie-system-outgoing").length,
+      musicScale: app.painter.layout.options.musicLength(1),
       curveHeights: [...document.querySelectorAll(
         "#score-pane .tie-system-incoming path, #score-pane .tie-system-outgoing path",
       )].map((path) => path.getBBox().height),
@@ -1506,7 +1511,8 @@ Tempo = {90}
     || !crossSystemContinuation.tied
     || !crossSystemContinuation.transparent
     || crossSystemContinuation.curveHeights.length < 4
-    || crossSystemContinuation.curveHeights.some((height) => height < 3)
+    || crossSystemContinuation.curveHeights.some((height) =>
+      height / crossSystemContinuation.musicScale < 3 - 1e-4)
     || crossSystemContinuation.fills.length < 2
     || crossSystemContinuation.fills.some((fill) => !fill || fill === "#000000")) {
     throw new Error(
@@ -1772,7 +1778,8 @@ Tempo = {90}
     engravingInspectorLivePreview: true,
     engravingInlineDirtyGuard: true,
     builtInMetadata: true,
-    pngZipExport: true,
+    pngExport: true,
+    pngZipExport: exportsZip,
     pdfExport: true,
     musicXmlExport: true,
     musicXmlImportDialog: true,

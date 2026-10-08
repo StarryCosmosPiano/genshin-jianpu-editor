@@ -13,8 +13,9 @@ const server = remoteUrl ? null : createServer(async (request, response) => {
   try {
     const path = decodeURIComponent((request.url ?? "/").split("?")[0]);
     const file = path === "/" ? "/index.html" : path;
+    const data = await readFile(join(dist, normalize(file)));
     response.writeHead(200, { "content-type": mime[extname(file)] ?? "application/octet-stream" });
-    response.end(await readFile(join(dist, normalize(file))));
+    response.end(data);
   } catch { response.writeHead(404); response.end(); }
 });
 if (server) await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -57,7 +58,7 @@ async function check(label, initial, expected, extra = () => {}) {
     const first = await state(page);
     assert.equal(first.style.braceWidthScale, expected.braceWidthScale, `${label}: width`);
     assert.equal(first.style.braceStrokeWidth, expected.braceStrokeWidth, `${label}: stroke`);
-    assert.equal(first.saved.engravingStyleVersion, 1, `${label}: version was not saved`);
+    assert.equal(first.saved.engravingStyleVersion, 2, `${label}: version was not saved`);
     assert.deepEqual({
       braceWidthScale: first.saved.engravingStyle?.braceWidthScale,
       braceStrokeWidth: first.saved.engravingStyle?.braceStrokeWidth,
@@ -70,7 +71,8 @@ async function check(label, initial, expected, extra = () => {}) {
       braceWidthScale: reopened.style.braceWidthScale,
       braceStrokeWidth: reopened.style.braceStrokeWidth,
     }, expected, `${label}: style changed on reload`);
-    assert.equal(reopened.saved.engravingStyleVersion, 1, `${label}: version changed on reload`);
+    assert.equal(reopened.saved.engravingStyleVersion, 2, `${label}: version changed on reload`);
+    extra(reopened);
     assert.equal(errors.length, 0, `${label}: browser errors: ${errors.join("; ")}`);
   } finally {
     await context.close();
@@ -79,16 +81,20 @@ async function check(label, initial, expected, extra = () => {}) {
 
 try {
   await check("fresh", null, newBrace, (result) => {
-    assert(Math.abs(result.braceWidth - 7.056) < 0.01,
+    assert(Math.abs(result.braceWidth - 7.056 * Math.SQRT1_2) < 0.01,
       `fresh: unexpected brace path width ${result.braceWidth}`);
+    assert.equal(result.style.measuresPerSystem, 6);
+    assert(Math.abs(result.style.notationScale - Math.SQRT1_2) < 1e-10);
   });
   await check("legacy pair", {
-    engravingStyle: { ...oldBrace, pianoHandGap: 1.8, numberBold: true },
+    engravingStyle: { ...oldBrace, pianoHandGap: 1.8, numberBold: true, measuresPerSystem: 4 },
     pageOrientationVersion: 1, pageW: 700, pageH: 900,
     titleSize: 52, codePaneWidth: 440, beatPositionFormat: "decimal",
   }, newBrace, (result) => {
-    assert(Math.abs(result.braceWidth - 7.056) < 0.01,
+    assert(Math.abs(result.braceWidth - 7.056 * Math.SQRT1_2) < 0.01,
       `legacy pair: old brace geometry remained ${result.braceWidth}`);
+    assert.equal(result.style.measuresPerSystem, 6, "old default measure count was not migrated");
+    assert.equal(result.saved.engravingStyle.measuresPerSystem, 6);
     assert.equal(result.style.pianoHandGap, 1.8);
     assert.equal(result.style.numberBold, true);
     assert.equal(result.pageW, 700);
@@ -106,6 +112,23 @@ try {
     { braceWidthScale: 0.7, braceStrokeWidth: 1.4 });
   await check("already new", { engravingStyle: newBrace }, newBrace);
   await check("versioned old pair", { engravingStyleVersion: 1, engravingStyle: oldBrace }, oldBrace);
+  await check("version-one density upgrade", {
+    engravingStyleVersion: 1,
+    engravingStyle: { ...oldBrace, measuresPerSystem: 4 },
+  }, oldBrace, (result) => {
+    assert.equal(result.style.measuresPerSystem, 6, "version-one default count was not upgraded");
+    assert.equal(result.saved.engravingStyle.measuresPerSystem, 6);
+    assert(Math.abs(result.style.notationScale - Math.SQRT1_2) < 1e-10);
+  });
+  await check("custom measures", {
+    engravingStyleVersion: 1,
+    engravingStyle: { ...newBrace, measuresPerSystem: 5, notationScale: 0.83 },
+  }, newBrace, (result) => {
+    assert.equal(result.style.measuresPerSystem, 5, "custom target measure count changed");
+    assert.equal(result.saved.engravingStyle.measuresPerSystem, 5);
+    assert.equal(result.style.notationScale, 0.83, "custom notation scale changed");
+    assert.equal(result.saved.engravingStyle.notationScale, 0.83);
+  });
   console.log(`engraving-defaults-check: ok (${url})`);
 } finally {
   await browser.close();

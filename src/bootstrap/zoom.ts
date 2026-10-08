@@ -5,7 +5,7 @@ import { remapShortcutEvent } from "../editor/shortcuts";
 export function wireZoomControls(app: App, scorePane: HTMLElement): void {
   const zoomLabel = document.getElementById("btn-zoom-reset");
   const updateZoom = (): void => {
-    if (zoomLabel) zoomLabel.textContent = `${Math.round(app.zoom * 100)}%`;
+    if (zoomLabel) zoomLabel.textContent = `${Math.round((app.workspaceSummary().zoom ?? app.zoom) * 100)}%`;
   };
   const on = (id: string, listener: () => void): void => {
     document.getElementById(id)?.addEventListener("click", listener);
@@ -14,6 +14,7 @@ export function wireZoomControls(app: App, scorePane: HTMLElement): void {
   on("btn-zoom-out", () => { app.zoomBy(1 / 1.2); updateZoom(); });
   on("btn-zoom-reset", () => { app.resetZoom(); updateZoom(); });
   updateZoom();
+  document.addEventListener("staff:navigation-change", updateZoom);
 
   // A gesture keeps one normalized point inside its page under the pointer.
   // Wheel/gesture updates are coalesced to one layout write per animation frame.

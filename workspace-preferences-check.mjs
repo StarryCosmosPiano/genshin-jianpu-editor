@@ -162,10 +162,13 @@ try {
   assert.deepEqual(await page.evaluate(() => window.__playCalls), { play: 1, stop: 1 },
     "the single playback button did not toggle play and stop");
 
+  // Explicit page breaks keep page-five navigation meaningful at any music
+  // density; plain system breaks can all fit on one A4 page after shrinking.
   const systems = Array.from({ length: 8 }, (_, index) =>
-    `${"1 2 3 4 | ".repeat(4)}${index === 7 ? "]$(true,0,0,true)" : "$(true)"}`);
-  const multiPageScore = `.Title\nTitle = {翻页回归}\nKeyAndMeters = {1=C,4/4}\n.Layout\nLinesPerPage = 1\n.Voice\n${systems.join("\n")}\n`;
+    `${"1 2 3 4 | ".repeat(4).trimEnd()}${index === 7 ? "]" : ""}$(true,0,0,true)`);
+  const multiPageScore = `.Title\nTitle = {翻页回归}\nKeyAndMeters = {1=C,4/4}\n.Voice\n${systems.join("\n")}\n`;
   await page.evaluate((text) => window.__app.loadText(text, null), multiPageScore);
+  await page.waitForFunction(() => window.__app.painter.score.title === "翻页回归");
   await page.waitForFunction(() => window.__app.pageEls.length >= 6);
   await page.evaluate(() => window.__app.goToPage(4));
   await page.waitForFunction(() => window.__app.pageIndex === 4);

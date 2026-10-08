@@ -1,6 +1,8 @@
 // App controller: CodeMirror editor <-> live relayout/render <-> paging <-> file I/O.
 // Mirrors EditorController in CodeEditor.kt (doBind/tryLoad/updateLayout/paint/load/doSave).
 
+import { createStaffNoteRegistry } from "../staff-preview/identity";
+import type { StaffNoteRef, StaffNoteRegistry, StaffPreviewSnapshot, StaffSelectionState, StaffPlaybackState, StaffPreviewNavigation } from "../staff-preview/types";
 import { EditorView, keymap, lineNumbers } from "@codemirror/view";
 import { Compartment, EditorState, EditorSelection, Prec } from "@codemirror/state";
 import { defaultKeymap, history, historyKeymap, redo, undo } from "@codemirror/commands";
@@ -336,6 +338,15 @@ export class App {
   private previewDirty = false;
   private zoomSaveTimer: ReturnType<typeof setTimeout> | undefined;
   private selectedEls = new Set<SVGGElement>();
+  private _staffRevision = 0;
+  private _staffCurrent = false;
+  private _staffRegistry: StaffNoteRegistry | null = null;
+  private _staffNavigation: StaffPreviewNavigation | null = null;
+  private _staffSelectionOrigin: StaffSelectionState["origin"] = "score";
+  private _staffPlaybackStart: ScoreNote | null = null;
+  private _staffPlaybackChords: readonly Chord[] | null = null;
+  private _staffPlaybackPass = 0;
+  private _staffReadonlySelection = false;
   private _sourceNotes: JpwSourceNote[] = [];
   private _slashTimingDiagnostics: SlashScoreDiagnostic[] = [];
   private _selectedNotes: SelectedScoreNote[] = [];
@@ -389,7 +400,11 @@ export class App {
     this.configurePainter(this.painter);
     this.scorePane = scorePane;
     this.scorePane.tabIndex = 0;
-    this.scorePane.addEventListener("pointerdown", () => { this._lastInteraction = "score"; });
+    this.scorePane.addEventListener("pointerdown", () => { this._lastInteraction = "score"; this.staffInteraction("score"); });
+    this.scorePane.addEventListener("keydown", () => this.staffInteraction("score"), { capture: true });
+    this.scorePane.addEventListener("wheel", event => {
+      if (!event.ctrlKey && !event.metaKey) this.setJianpuPlaybackFollow(false);
+    }, { passive: true });
     this.scorePane.addEventListener("keydown", (event) => this.onScoreKeyDown(event));
     document.addEventListener("pointerdown", (event) => {
       if (this._inputContextMenu && !this._inputContextMenu.contains(event.target as Node)) {
@@ -880,9 +895,11 @@ export class App {
     this.zoomSaveTimer = setTimeout(() => this.saveSettings(), 400);
   }
   zoomBy(factor: number): void {
+    if (this._staffNavigation?.activeSurface === "staff") { this._staffNavigation.zoomBy(factor); return; }
     this.setZoom(this.zoom * factor);
   }
   resetZoom(): void {
+    if (this._staffNavigation?.activeSurface === "staff") { this._staffNavigation.resetZoom(); return; }
     this.setZoom(1);
   }
   private _applyZoom(): void {
@@ -985,6 +1002,7 @@ export class App {
         this.scheduleReload();
       } else if (u.selectionSet && !this._syncingCodeSelection) {
         this._lastInteraction = "text";
+        this.staffInteraction("text");
         this.syncScoreSelectionsFromCode();
       }
     });
@@ -1004,8 +1022,8 @@ export class App {
           slashVoiceHighlighter,
           Prec.high(EditorView.domEventHandlers({
             keydown: (event) => this.onEditorKeyDown(event),
-            pointerdown: () => { this._lastInteraction = "text"; return false; },
-            focus: () => { this._lastInteraction = "text"; return false; },
+            pointerdown: () => { this._lastInteraction = "text"; this.staffInteraction("text"); return false; },
+            focus: () => { this._lastInteraction = "text"; this.staffInteraction("text"); return false; },
           })),
           updateListener,
           this._readOnlyCompartment.of(EditorState.readOnly.of(false)),
@@ -1059,6 +1077,7 @@ export class App {
   }
 
   private scheduleReload(): void {
+    this.staffStale();
     clearTimeout(this.debounceTimer);
     if (this.previewLocked) {
       this.previewDirty = true;
@@ -1087,9 +1106,10 @@ export class App {
       parsedDocument = parseEditableDocument(text, this.documentFormat, this.slashOptions);
     } catch (e) {
       console.error(`${this.documentFormat === "jpw" ? "JPW" : "slash-score"} import failed`, e);
+      this.staffStale();
       return false;
     }
-    if (!parsedDocument) return false;
+    if (!parsedDocument) { this.staffStale(); return false; }
     const score = parsedDocument.score;
     const slashTimingDiagnostics: SlashScoreDiagnostic[] = parsedDocument.slashTimingDiagnostics;
     const breakDesc = parsedDocument.breakDescription;
@@ -1110,6 +1130,7 @@ export class App {
       this.painter.resize(this._pagePreview?.pageW ?? this.pageW, this._pagePreview?.pageH ?? this.pageH, breakDesc);
     } catch (e) {
       console.error("layout failed", e);
+      this.staffStale();
       return false;
     }
     this.renderPages();
@@ -1132,6 +1153,8 @@ export class App {
       );
     }
     this.previewDirty = false;
+    this._staffCurrent = true;
+    this.staffModelChanged();
     this.notifyWorkspaceChange();
     return true;
   }
@@ -1610,7 +1633,9 @@ export class App {
       this.painter.resize(this._pagePreview?.pageW ?? this.pageW, this._pagePreview?.pageH ?? this.pageH, this._layoutBreakDescription);
       this.renderPages();
       this.applyScoreVoiceColors();
+      this.staffModelChanged();
     } catch (error) {
+      this.staffStale();
       console.error("input-mode relayout failed", error);
     } finally {
       this.scorePane.scrollTop = scrollTop;
@@ -3372,6 +3397,7 @@ export class App {
   }
 
   private onPageClick(pageIndex: number, svg: SVGSVGElement, ev: MouseEvent): void {
+    this.staffInteraction("score");
     if (this._suppressPageClick) {
       this._suppressPageClick = false;
       ev.preventDefault();
@@ -3655,7 +3681,7 @@ export class App {
     visualNote: ScoreNote = source.note,
   ): void {
     if (this._selectedNotes.some((selection) =>
-      selection.source.from === source.from && selection.source.to === source.to)) return;
+      selection.visualNote === visualNote && selection.source.from === source.from && selection.source.to === source.to)) return;
     const el = element ?? this.painter.noteGroupEl(source.chord, source.note, verse);
     if (!el) return;
     el.classList.add("selected");
@@ -3669,7 +3695,7 @@ export class App {
     selection.element.classList.remove("selected");
     this.selectedEls.delete(selection.element);
     this._selectedNotes.splice(index, 1);
-    if (this._selectedNotes.length === 0) this.queueDuplicatePitchMerge();
+    if (this._selectedNotes.length === 0 && !this._staffReadonlySelection) this.queueDuplicatePitchMerge();
   }
 
   private addScoreObjectSelection(selection: SelectedScoreObject): void {
@@ -4244,7 +4270,7 @@ export class App {
     this._selectedNotes = [];
     this._selectedObjects = [];
     this._pendingSelectionAnchors = null;
-    if (releasedNotes) this.queueDuplicatePitchMerge();
+    if (releasedNotes && !this._staffReadonlySelection) this.queueDuplicatePitchMerge();
   }
 
   private scoreHasDuplicateChordPitches(): boolean {
@@ -4282,10 +4308,11 @@ export class App {
     this._rangeAnchorPosition = null;
     if (!this.view) return;
     if (syncCode) this.syncCodeSelections(false);
-    else this.view.dispatch({ effects: setScoreSourceHighlights.of([]) });
+    else { this.view.dispatch({ effects: setScoreSourceHighlights.of([]) }); this.notifyStaffSelection(); }
   }
 
   private syncCodeSelections(scroll: boolean): void {
+    this.notifyStaffSelection();
     if (!this.view) return;
     this.notifyWorkspaceChange();
     if (this._selectedNotes.length === 0) {
@@ -4326,7 +4353,7 @@ export class App {
 
   /** Mirror a keyboard/number/JPW source selection back onto rendered notes. */
   private syncScoreSelectionsFromCode(): void {
-    if (!this.view || this.mode !== "jp") return;
+    if (!this.view || this.mode !== "jp" || !this.isStaffPreviewCurrent()) return;
     const ranges = this.view.state.selection.ranges;
     const sources = this._sourceNotes.filter((source) => ranges.some((range) =>
       range.empty
@@ -4336,10 +4363,14 @@ export class App {
         ? range.head > source.from && range.head < source.to
         : range.from < source.to && range.to > source.from));
     this.clearSelectedItems();
-    for (const source of sources) {
+    const main = this.view.state.selection.main;
+    const primarySource = sourceAtActiveEnd(sources, main.head, main.anchor);
+    const orderedSources = primarySource ? [...sources.filter(source => source !== primarySource), primarySource] : sources;
+    for (const source of orderedSources) {
       const rendered = this.painter.noteGroupEls(source.chord, source.note)[0];
       if (rendered) this.addScoreSelection(source, rendered.verse, rendered.element);
     }
+    this.notifyStaffSelection();
     const last = sources[sources.length - 1];
     this._rangeAnchorPosition = last?.from ?? null;
     this.view.dispatch({
@@ -4393,6 +4424,7 @@ export class App {
   }
 
   private onEditorKeyDown(event: KeyboardEvent): boolean {
+    this.staffInteraction("text");
     if (handleTextShortcut(event, this.view, (mapped) => this.handleInvisibleVoiceMarkerKey(mapped))) return true;
     const mapped = remapShortcutEvent(event, "text");
     if (!mapped) return true;
@@ -5152,10 +5184,11 @@ export class App {
 
   workspaceSummary(): {
     documentName: string; format: string; position: string; pages: number; page: number;
-    inputEnabled: boolean; waitingForInput: boolean; diagnostics: number;
+    inputEnabled: boolean; waitingForInput: boolean; diagnostics: number; zoom: number;
   } {
     const selection = this._selectedNotes[this._selectedNotes.length - 1];
-    const cursor = this._input.cursor;
+    const cursor = this._staffPlaybackStart ? null : this._input.cursor;
+    const staffPage = this._staffNavigation?.activeSurface === "staff" ? this._staffNavigation.getPageSummary() : null;
     const part = cursor?.partIndex ?? selection?.source.partIndex;
     const measure = cursor?.measureIndex ?? selection?.visualNote.chord.measure.index;
     const offset = cursor?.offset ?? selection?.visualNote.chord.position;
@@ -5167,7 +5200,8 @@ export class App {
       position: part !== undefined && measure !== undefined && offset
         ? `${this.getPartLabel(part)} · 第 ${measure + 1} 小节 · ${this.formatBeatPosition(offset.plus(new Fraction(1)))} 拍`
         : this._input.enabled ? "等待选择起点" : "选择音符以查看位置",
-      pages: this.pageEls.length, page: this.pageIndex + 1,
+      pages: staffPage?.pages ?? this.pageEls.length, page: staffPage?.page ?? this.pageIndex + 1,
+      zoom: staffPage?.zoom ?? this.zoom,
       inputEnabled: this._input.enabled, waitingForInput: this._input.enabled && cursor === null,
       diagnostics: this._slashTimingDiagnostics.length,
     };
@@ -5594,8 +5628,145 @@ export class App {
     };
   }
 
+  getStaffPreviewAvailability(): { supported: boolean; reason: string } {
+    const score = this.painter.score;
+    if (this.mode !== "jp") return { supported: false, reason: "五线谱预览仅支持简谱编辑模式" };
+    if (score.ensemble) return { supported: false, reason: "总谱暂不支持五线谱预览" };
+    if (score.parts.length === 1 || (score.piano && score.parts.length === 2)) return { supported: true, reason: "" };
+    return { supported: false, reason: "五线谱预览支持单声部或钢琴双手乐谱" };
+  }
+
+  isStaffPreviewCurrent(): boolean {
+    return this._staffCurrent && this.mode === "jp" && this.debounceTimer === undefined && !this.previewDirty;
+  }
+
+  getStaffPreviewSnapshot(): StaffPreviewSnapshot {
+    this._staffRegistry ??= createStaffNoteRegistry(this.painter.score, this._sourceNotes, this._staffRevision);
+    const app = this;
+    const revision = this._staffRevision;
+    return { revision, score: this.painter.score, sources: this._sourceNotes,
+      registry: this._staffRegistry,
+      engravingStyle: { ...(this._engravingPreview ?? this.engravingStyle) },
+      get current() { return revision === app._staffRevision && app.isStaffPreviewCurrent(); } };
+  }
+
+  getStaffSelectionState(): StaffSelectionState {
+    const notes = this._selectedNotes.map(selection => selection.visualNote);
+    return { revision: this._staffRevision, notes, primary: notes[notes.length - 1] ?? null, origin: this._staffSelectionOrigin };
+  }
+
+  getStaffPlaybackState(): StaffPlaybackState {
+    return { revision: this._staffRevision, chords: this._staffPlaybackChords,
+      pass: this._staffPlaybackPass, state: this._player?.state ?? "stopped" };
+  }
+
+  setStaffPreviewNavigation(nav: StaffPreviewNavigation | null): void {
+    this._staffNavigation = nav;
+    this.notifyWorkspaceChange();
+  }
+
+  getActiveScoreSurface(): "jianpu" | "staff" {
+    return this._staffNavigation?.activeSurface ?? "jianpu";
+  }
+
+  /** Page export follows the active score, not just the currently mounted DOM. */
+  async getPageExportSource(): Promise<{
+    surface: "jianpu" | "staff";
+    currentPage: number;
+    pages: Array<{ page: number; svg: SVGSVGElement; widthPt?: number; heightPt?: number }>;
+  }> {
+    if ((this.debounceTimer !== undefined || this.previewDirty) && !this.reload(this.getText())) {
+      throw new Error("当前文本尚不能排版，请修正后再导出。");
+    }
+    if (this._staffNavigation?.activeSurface === "staff") {
+      const source = await this._staffNavigation.getExportPages();
+      return { surface: "staff", currentPage: source.currentPage,
+        pages: source.pages.map(({ page, svg }) => ({ page, svg,
+          widthPt: svg.viewBox.baseVal.width * 72 / 96,
+          heightPt: svg.viewBox.baseVal.height * 72 / 96 })) };
+    }
+    return { surface: "jianpu", currentPage: this.pageIndex,
+      pages: this.pageEls.flatMap((wrap, page) => {
+        const svg = wrap.querySelector<SVGSVGElement>("svg");
+        return svg ? [{ page, svg: svg.cloneNode(true) as SVGSVGElement }] : [];
+      }) };
+  }
+
+  selectStaffPreviewNote(ref: StaffNoteRef, options: { additive?: boolean } = {}): boolean {
+    if (!this.isStaffPreviewCurrent() || !this.getStaffPreviewAvailability().supported || ref.revision !== this._staffRevision) return false;
+    const target = this.getStaffPreviewSnapshot().registry.resolve(ref);
+    if (!target?.source) return false;
+    const rendered = this.painter.noteGroupEls(target.note.chord, target.note)[0]
+      ?? this.painter.noteGroupEls(target.source.chord, target.source.note)[0];
+    if (!rendered) return false;
+    this._staffSelectionOrigin = "staff";
+    this._staffReadonlySelection = true;
+    try {
+      const existing = this._selectedNotes.findIndex(selection => selection.visualNote === target.note);
+      if (options.additive && existing >= 0) this.removeScoreSelection(existing);
+      else {
+        if (!options.additive) this.clearSelectedItems();
+        this.addScoreSelection(target.source, rendered.verse, rendered.element, target.note);
+      }
+    } finally { this._staffReadonlySelection = false; }
+    this._staffPlaybackStart = this._selectedNotes[this._selectedNotes.length - 1]?.visualNote ?? null;
+    this._pendingSelectionAnchors = null;
+    this.syncCodeSelections(false);
+    if (!this.scorePane.hidden && this.scorePane.getClientRects().length > 0) {
+      this.pageIndex = rendered.page;
+      rendered.element.scrollIntoView({ block: "nearest", inline: "nearest" });
+    }
+    this.setStatus(this.selectionStatus());
+    return true;
+  }
+
+  clearStaffSelection(): void {
+    this._staffSelectionOrigin = "staff";
+    this._staffPlaybackStart = null;
+    this._staffReadonlySelection = true;
+    try { this.deselect(); } finally { this._staffReadonlySelection = false; }
+  }
+
+  setJianpuPlaybackFollow(enabled: boolean): void {
+    this.scorePane.dataset.staffFollow = enabled ? "following" : "paused";
+  }
+
+  resumeJianpuPlaybackFollow(): void { this.setJianpuPlaybackFollow(true); }
+
+  private staffInteraction(origin: "score" | "text"): void {
+    this._staffSelectionOrigin = origin;
+    this._staffPlaybackStart = null;
+  }
+
+  private staffStale(): void {
+    this._staffCurrent = false;
+    this._staffPlaybackStart = null;
+    if (this._staffNavigation?.staffVisible) document.dispatchEvent(new CustomEvent("staff:stale"));
+  }
+
+  private staffModelChanged(): void {
+    this._staffRevision++;
+    this._staffRegistry = null;
+    this._staffPlaybackStart = null;
+    if (!this._staffNavigation?.staffVisible) return;
+    document.dispatchEvent(new CustomEvent("staff:model-change", { detail: { revision: this._staffRevision } }));
+    this.notifyStaffSelection();
+  }
+
+  private notifyStaffSelection(): void {
+    if (!this._staffNavigation?.staffVisible) return;
+    document.dispatchEvent(new CustomEvent("staff:selection-change", { detail: this.getStaffSelectionState() }));
+  }
+
+  private notifyStaffPlayback(state = this._player?.state ?? "stopped"): void {
+    if (!this._staffNavigation?.staffVisible) return;
+    document.dispatchEvent(new CustomEvent("staff:playback-change", { detail: { ...this.getStaffPlaybackState(), state } }));
+  }
+
   // ---------------- paging ----------------
   goToPage(i: number): void {
+    if (this._staffNavigation?.activeSurface === "staff") { this._staffNavigation.goToPage(i); return; }
+    this.setJianpuPlaybackFollow(false);
     if (this.pageEls.length === 0) return;
     const np = Math.max(0, Math.min(i, this.pageEls.length - 1));
     this.pageIndex = np;
@@ -5624,8 +5795,11 @@ export class App {
   }
 
   private onPlayChord(chords: import("../score/score").Chord[] | null, pass: number): void {
+    this._staffPlaybackChords = chords;
+    this._staffPlaybackPass = pass;
+    this.notifyStaffPlayback();
     const page = this.painter.highlightChords(chords, pass);
-    if (chords && chords.length > 0 && page !== null) {
+    if (chords && chords.length > 0 && page !== null && this.scorePane.dataset.staffFollow !== "paused" && !this.scorePane.hidden && this.scorePane.getClientRects().length > 0) {
       if (page !== this.pageIndex) this.pageIndex = page;
       // keep the sounding note visible (no-op when already in view)
       this.painter.chordGroupEl(chords[0], pass)?.scrollIntoView({ block: "nearest", inline: "nearest" });
@@ -5633,6 +5807,9 @@ export class App {
   }
 
   private onPlayState(state: PlayState): void {
+    if (state === "stopped") { this._staffPlaybackChords = null; this.painter.highlightChords(null, 0); }
+    if (state === "playing") this.resumeJianpuPlaybackFollow();
+    this.notifyStaffPlayback(state);
     const busy = state === "playing" || state === "loading";
     if (this._playBtnEl) {
       this._playBtnEl.disabled = false;
@@ -5752,10 +5929,12 @@ export class App {
     if (this.mode !== "jp") return; // playback is jianpu-mode only
     const selected = this._selectedNotes[this._selectedNotes.length - 1];
     const input = this._input.enabled ? this.inputFocus() : null;
-    const start = input
+    const start = this._staffPlaybackStart && this.isStaffPreviewCurrent()
+      ? { chord: this._staffPlaybackStart.chord, pass: selected?.verse ?? 0 }
+      : input
       ? { chord: input.chord, pass: 0 }
       : selected
-        ? { chord: selected.source.chord, pass: selected.verse }
+        ? { chord: selected.visualNote.chord, pass: selected.verse }
         : undefined;
     await this.player().play(
       this.painter.score,
@@ -6390,6 +6569,8 @@ export class App {
 
   /** 识别模式布局钩子：打 body.recognize 类 + 显示/隐藏视图下拉。 */
   private _setRecognizeLayout(on: boolean): void {
+    if (on) this.staffStale();
+    this.notifyWorkspaceChange();
     document.getElementById("body")?.classList.toggle("recognize", on);
     if (this._recogViewSelectEl) this._recogViewSelectEl.hidden = !on;
     if (!on) this._hideRecogPopup();
@@ -6593,6 +6774,8 @@ export class App {
 
   /** Mixed mode: editor read-only + hide the code pane entirely. */
   private _setMixedLayout(on: boolean): void {
+    if (on) this.staffStale();
+    this.notifyWorkspaceChange();
     this.view.dispatch({
       effects: this._readOnlyCompartment.reconfigure(EditorState.readOnly.of(on)),
     });

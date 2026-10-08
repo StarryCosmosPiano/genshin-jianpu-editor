@@ -39,6 +39,15 @@ versions are recorded in `package-lock.json` and `src-tauri/Cargo.lock`.
 Bravura 字体和元数据不属于项目 MIT 许可证的覆盖范围。
 The Bravura font and metadata are not covered by the project's MIT license.
 
+## VexFlow
+
+- 来源 / Source: <https://github.com/vexflow/vexflow>
+- 版本 / Version: 5.0.0
+- 许可证 / License: MIT
+- 版权 / Copyright: 2023-present VexFlow contributors; 2010-2022 Mohit Muthanna Cheppudira
+- 用途 / Usage: 五线谱只读预览的 SVG 排版与绘制；按需加载、本地分发。
+- 随应用附带完整许可 / Bundled license: `public/redist/vexflow-LICENSE.txt`
+
 ## PaddleOCR models
 
 - 来源 / Source: <https://github.com/PaddlePaddle/PaddleOCR>

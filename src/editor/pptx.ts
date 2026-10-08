@@ -15,6 +15,7 @@ import {
   type PathSeg,
 } from "../layout/layout";
 import type { JinpuPainter } from "../layout/painter";
+import { normalizeWatermarkOptions, watermarkFontSize, watermarkPositions, type WatermarkOptions } from "./watermark";
 
 const EMU = (v: number) => Math.round(v * 12700); // 1 pt = 12700 EMU
 
@@ -32,6 +33,7 @@ interface TextShape {
   kind: "text";
   x: number; y: number; w: number; h: number;
   text: string; size: number; colorHex: string; bold: boolean; family: string; cjk: boolean;
+  opacity?: number; rotationDeg?: number; center?: boolean;
 }
 interface GeomShape {
   kind: "geom";
@@ -166,11 +168,15 @@ function textXml(s: TextShape, id: number): string {
   const sz = Math.round(s.size * 100);
   const ea = s.cjk ? `<a:ea typeface="${xml(s.family)}"/>` : "";
   const b = s.bold ? ` b="1"` : "";
+  const rotation = s.rotationDeg === undefined ? "" : ` rot="${Math.round(s.rotationDeg * 60000)}"`;
+  const alpha = s.opacity === undefined ? "" : `<a:alpha val="${Math.round(s.opacity * 100000)}"/>`;
+  const alignment = s.center ? "ctr" : "l";
+  const anchor = s.center ? "ctr" : "b";
   return `<p:sp><p:nvSpPr><p:cNvPr id="${id}" name="t${id}"/><p:cNvSpPr txBox="1"/><p:nvPr/></p:nvSpPr>` +
-    `<p:spPr><a:xfrm><a:off x="${EMU(s.x)}" y="${EMU(s.y)}"/><a:ext cx="${EMU(s.w)}" cy="${EMU(s.h)}"/></a:xfrm>` +
+    `<p:spPr><a:xfrm${rotation}><a:off x="${EMU(s.x)}" y="${EMU(s.y)}"/><a:ext cx="${EMU(s.w)}" cy="${EMU(s.h)}"/></a:xfrm>` +
     `<a:prstGeom prst="rect"><a:avLst/></a:prstGeom><a:noFill/></p:spPr>` +
-    `<p:txBody><a:bodyPr wrap="none" lIns="0" tIns="0" rIns="0" bIns="0" anchor="b"><a:spAutoFit/></a:bodyPr><a:lstStyle/>` +
-    `<a:p><a:pPr algn="l"/><a:r><a:rPr lang="zh-CN" sz="${sz}"${b}><a:solidFill><a:srgbClr val="${s.colorHex}"/></a:solidFill>` +
+    `<p:txBody><a:bodyPr wrap="none" lIns="0" tIns="0" rIns="0" bIns="0" anchor="${anchor}"><a:spAutoFit/></a:bodyPr><a:lstStyle/>` +
+    `<a:p><a:pPr algn="${alignment}"/><a:r><a:rPr lang="zh-CN" sz="${sz}"${b}><a:solidFill><a:srgbClr val="${s.colorHex}">${alpha}</a:srgbClr></a:solidFill>` +
     `<a:latin typeface="${xml(s.family)}"/>${ea}</a:rPr><a:t>${xml(s.text)}</a:t></a:r></a:p></p:txBody></p:sp>`;
 }
 
@@ -237,10 +243,26 @@ function buildDeck(slides: string[], wEmu: number, hEmu: number): Zippable {
   return z;
 }
 
-export async function buildPptx(painter: JinpuPainter): Promise<Uint8Array> {
+export async function buildPptx(painter: JinpuPainter, watermark?: WatermarkOptions): Promise<Uint8Array> {
   const font = await loadBravura();
   const slides = painter.layout.pages.map((pg) => {
     const shapes: Shape[] = [];
+    const opts = watermark && normalizeWatermarkOptions(watermark);
+    const value = opts?.text.trim() ?? "";
+    if (opts?.enabled && value && opts.opacity > 0) {
+      const size = watermarkFontSize(value, painter.pageWidth, painter.pageHeight);
+      const width = Math.min(painter.pageWidth * 0.59, [...value].length * size);
+      const height = size * 1.3;
+      for (const [nx, ny] of watermarkPositions(opts.density)) {
+        shapes.push({
+          kind: "text", x: painter.pageWidth * nx - width / 2,
+          y: painter.pageHeight * ny - height / 2, w: width, h: height,
+          text: value, size, colorHex: "29384D", bold: true,
+          family: "Microsoft YaHei", cjk: hasCJK(value),
+          opacity: opts.opacity, rotationDeg: -32, center: true,
+        });
+      }
+    }
     collectShapes(pg, font, shapes);
     return slideXml(shapes);
   });

@@ -463,7 +463,7 @@ export class Lyric extends TextFrame {
 }
 
 export abstract class SlurTieBase extends Group {
-  static calcSlurPoints(pl: Point, pr: Point): [Point, Point, number] {
+  static calcSlurPoints(pl: Point, pr: Point, musicScale = 1): [Point, Point, number] {
     const xr = pr.x, xl = pl.x, yr = pr.y, yl = pl.y;
     const dx = xr - xl, dy = yr - yl;
     const square = dx * dx + dy * dy;
@@ -471,14 +471,17 @@ export abstract class SlurTieBase extends Group {
     const theta = Math.atan2(dy, dx);
     const cos = Math.cos(-theta);
     const sin = Math.sin(-theta);
-    const xlen = Math.min(dist * 0.04 + 10, dist * 0.25);
-    const naturalSag = Math.log10(Math.max(dist, 1)) * 17 - 16;
+    // Evaluate curve shape in music units, then return page coordinates.
+    // Minimum bows and short system-edge fragments follow the glyph scale.
+    const musicDist = dist / musicScale;
+    const xlen = Math.min(musicDist * 0.04 + 10, musicDist * 0.25) * musicScale;
+    const naturalSag = Math.log10(Math.max(musicDist, 1)) * 17 - 16;
     // The logarithmic curve approaches (and for very short spans crosses)
     // zero. That made a short tie, including a system-edge fragment, look
     // like a straight tapered rule. Preserve a visible upward bow while
     // keeping the old geometry for normal and long spans.
-    const minimumSag = Math.min(6, Math.max(4, dist * 0.16));
-    const h = -Math.max(minimumSag, naturalSag);
+    const minimumSag = Math.min(6, Math.max(4, musicDist * 0.16));
+    const h = -Math.max(minimumSag, naturalSag) * musicScale;
     let p1 = new Point(xlen, h).rotate(cos, sin);
     let p2 = new Point(dist - xlen, h).rotate(cos, sin);
     p1 = p1.offset(xl, yl);
@@ -486,8 +489,8 @@ export abstract class SlurTieBase extends Group {
     return [p1, p2, cos];
   }
 
-  init(pl: Point, pr: Point, thickness: number, clr: number): void {
-    let [pt0, pt1, cos] = SlurTieBase.calcSlurPoints(pl, pr);
+  init(pl: Point, pr: Point, thickness: number, clr: number, musicScale = 1): void {
+    let [pt0, pt1, cos] = SlurTieBase.calcSlurPoints(pl, pr, musicScale);
     const lw0 = thickness / cos;
 
     // (the "line" object is computed but not added in the original; skipped)
@@ -495,7 +498,7 @@ export abstract class SlurTieBase extends Group {
     const obj = new GraphicPath();
     obj.fill = true;
     obj.stroke = true;
-    obj.strokeWidth = 1.0;
+    obj.strokeWidth = musicScale;
     obj.strokeColor = clr;
     obj.fillColor = clr;
     obj.moveTo(pl);
@@ -643,7 +646,7 @@ export class TimeSig extends Entry {
     const w2 = tf2.measureText();
     this.width = Math.max(w1, w2);
     const ln = new GraphicLine();
-    ln.strokeWidth = 1.5;
+    ln.strokeWidth = opt.musicLength(1.5);
     ln.strokeColor = opt.color;
     const y = cy - ln.strokeWidth / 2;
     ln.p0 = new Point(0, y);
@@ -960,7 +963,7 @@ export class NoteEntry extends Entry {
           : new SmuflText(options);
         tf.color = options.color;
         if (ornament.kind === "trill") {
-          tf.font = options.lrcFont.scaled(0.5).withBold();
+          tf.font = options.lrcFont.scaled(0.5 * options.engravingStyle.notationScale).withBold();
           tf.text = "Tr";
         } else {
           tf.font = options.smuflFont.scaled(0.48);
@@ -1010,8 +1013,8 @@ export class NoteEntry extends Entry {
       bottom = center + options.numberSize * 0.36;
     }
 
-    const amplitude = Math.max(1.5, options.numberSize * 0.055);
-    const halfWave = Math.max(3, options.numberSize * 0.12);
+    const amplitude = Math.max(options.musicLength(1.5), options.numberSize * 0.055);
+    const halfWave = Math.max(options.musicLength(3), options.numberSize * 0.12);
     const gap = options.numberSize * 0.12;
     const centerX = existingLeft - gap - amplitude;
     const path = new GraphicPath();
@@ -1022,7 +1025,7 @@ export class NoteEntry extends Entry {
     path.stroke = true;
     path.fill = false;
     path.strokeColor = options.color;
-    path.strokeWidth = Math.max(1, options.numberSize * 0.035);
+    path.strokeWidth = Math.max(options.musicLength(1), options.numberSize * 0.035);
     path.moveTo(centerX, top);
     let y = top;
     let direction = 1;
@@ -1052,7 +1055,7 @@ export class NoteEntry extends Entry {
     group.classes.add("jianpu-grace-group");
     const font = options.numberFont.scaled(0.56);
     const gap = options.numberSize * 0.08;
-    const diameter = Math.max(0.5, options.octaveDotDiameter() * 0.62);
+    const diameter = Math.max(options.musicLength(0.5), options.octaveDotDiameter() * 0.62);
     const mainNumber = ent.number;
     if (!mainNumber) return;
     const mainPosition = mainNumber.pos(ent.group);
@@ -1063,11 +1066,11 @@ export class NoteEntry extends Entry {
     // stack, plus the two grace beams, above the main-note top and move the
     // grace group upward.  This keeps the lower baseline invariant while
     // allowing the ornament to grow only into the free space above it.
-    const preliminaryBeamGap = Math.max(1.4, options.jpBeamDist * 0.52);
+    const preliminaryBeamGap = Math.max(options.musicLength(1.4), options.jpBeamDist * 0.52);
     const lowerDotDepths = ch.graceNotes.map((note) => {
       const octave = Math.abs(NoteEntry.noteOctave(note));
       if (NoteEntry.noteOctave(note) >= 0 || octave === 0) return 0;
-      const dotGap = Math.max(0.4, options.octaveDotGap() * 0.62);
+      const dotGap = Math.max(options.musicLength(0.4), options.octaveDotGap() * 0.62);
       return dotGap + diameter + (octave - 1) * (diameter + dotGap);
     });
     const lowerDotDepth = Math.max(0, ...lowerDotDepths);
@@ -1119,7 +1122,7 @@ export class NoteEntry extends Entry {
         dot.owner = number;
         dot.update();
         dot.x = number.x + number.cx - dot.width / 2;
-        const dotGap = Math.max(0.4, options.octaveDotGap() * 0.62);
+        const dotGap = Math.max(options.musicLength(0.4), options.octaveDotGap() * 0.62);
         if (displayOctave > 0) {
           dot.y = number.y + numberBound.top -
             dotGap - diameter - dotIndex * (diameter + dotGap);
@@ -1151,7 +1154,7 @@ export class NoteEntry extends Entry {
       beam.selectable = true;
       beam.classes.add("jianpu-grace-beam");
       beam.strokeColor = options.color;
-      beam.strokeWidth = Math.max(1, options.numberSize * 0.032);
+      beam.strokeWidth = Math.max(options.musicLength(1), options.numberSize * 0.032);
       beam.p0 = new Point(firstBeamX, firstBeamY + level * beamGap);
       beam.p1 = new Point(lastBeamX, firstBeamY + level * beamGap);
       group.add(beam);
@@ -1176,7 +1179,7 @@ export class NoteEntry extends Entry {
         lastNumberPosition.x + lastNumber.width * 0.58,
       );
       const startY = lowerBeamPosition.y + lowerBeam.height +
-        Math.max(0.45, options.numberSize * 0.025);
+        Math.max(options.musicLength(0.45), options.numberSize * 0.025);
       const endX = mainPosition.x + mainNumber.bound.left - options.numberSize * 0.035;
       if (endX > startX + options.numberSize * 0.05) {
         const endY = mainPosition.y + (mainBound.top + mainBound.bottom) / 2;
@@ -1194,7 +1197,7 @@ export class NoteEntry extends Entry {
         link.stroke = true;
         link.fill = false;
         link.strokeColor = options.color;
-        link.strokeWidth = Math.max(1, options.numberSize * 0.032);
+        link.strokeWidth = Math.max(options.musicLength(1), options.numberSize * 0.032);
         link.moveTo(startX, startY);
         // Curved L: descend first, then sweep right.  Both legs bow slightly
         // so the link reads as one continuous musical gesture rather than two
@@ -1291,13 +1294,19 @@ export class Barline extends Entry {
   constructor(final: boolean, opt: LayoutOptions) {
     super();
     this.group.data = this;
-    const top = (-opt.numberSize * 23) / 28;
-    const bot = (opt.numberSize * 5) / 28;
+    // Measure the same digit font used for the notes. The stroke extends one
+    // half digit height beyond both ends of its actual SVG glyph bounds.
+    const digits = "01234567".split("").map((digit) => opt.numberBound(digit));
+    const digitTop = Math.min(...digits.map((digit) => digit.top));
+    const digitBottom = Math.max(...digits.map((digit) => digit.bottom));
+    const digitHeight = Math.max(...digits.map((digit) => digit.height));
+    const top = digitTop - digitHeight / 2;
+    const bot = digitBottom + digitHeight / 2;
     const style = opt.engravingStyle;
-    const heavyWidth = style.finalBarlineWidth;
+    const heavyWidth = opt.musicLength(style.finalBarlineWidth);
     const res = this.group;
-    const widths = final ? [heavyWidth, heavyWidth] : [style.barlineWidth];
-    const dist = final ? style.finalBarlineGap : heavyWidth;
+    const widths = final ? [heavyWidth, heavyWidth] : [opt.musicLength(style.barlineWidth)];
+    const dist = final ? opt.musicLength(style.finalBarlineGap) : heavyWidth;
     let xpos = 0;
     for (const w of widths) {
       const l = new GraphicLine();
@@ -1345,7 +1354,7 @@ export class BeamLine extends GraphicLine {
     this.p1 = this.p1.offset(r.numberPos, 0);
     this.p0 = new Point(this.p0.x, opt.jpBeamDist * lev);
     this.p1 = new Point(this.p1.x, opt.jpBeamDist * lev);
-    this.strokeWidth = 1.25;
+    this.strokeWidth = opt.musicLength(1.25);
     this.strokeColor = opt.color;
     this.x = this.p0.x;
     this.p1 = this.p1.offset(-this.p0.x, 0);
@@ -1559,7 +1568,7 @@ function addSystemMeasureNumber(
   label.classes.add("measure-number");
   label.affectsLayout = false;
   label.text = `(${number})`;
-  label.font = opt.numberFont.scaled(0.48);
+  label.font = opt.numberFont.makeWithSize(opt.publicationUnit * 0.48);
   label.color = opt.color;
   label.update();
   label.x = x;
@@ -1624,7 +1633,7 @@ function makeTempoMarker(mark: S.TempoMark, opt: LayoutOptions): Group {
     // The publication header uses a full-height metronome note.  Keep later
     // tempo changes at the same visible stem height instead of shrinking the
     // SMuFL glyph together with the smaller BPM text.
-    note.font = opt.smuflFont.makeWithSize(opt.numberSize * 0.88);
+    note.font = opt.smuflFont.makeWithSize(opt.publicationUnit * 0.88);
     note.color = opt.color;
     note.update();
     group.add(note);
@@ -1726,7 +1735,7 @@ function addCrossPartArpeggios(
     const bottom = Math.max(...selected.map(({ box, bound }) => box.y + bound.bottom));
     const left = Math.min(...selected.map(({ entry, box, bound }) =>
       box.x + (entry.crossArpeggioVisualLeft ?? bound.left)));
-    const amplitude = Math.max(1.5, opt.numberSize * 0.055);
+    const amplitude = Math.max(opt.musicLength(1.5), opt.numberSize * 0.055);
     const centerX = left - opt.numberSize * 0.16 - amplitude;
     const path = new GraphicPath();
     path.classes.add("jianpu-cross-part-arpeggio");
@@ -1735,9 +1744,9 @@ function addCrossPartArpeggios(
     path.stroke = true;
     path.fill = false;
     path.strokeColor = opt.color;
-    path.strokeWidth = Math.max(1, opt.numberSize * 0.035);
+    path.strokeWidth = Math.max(opt.musicLength(1), opt.numberSize * 0.035);
     path.moveTo(centerX, top);
-    const step = Math.max(3, opt.numberSize * 0.12);
+    const step = Math.max(opt.musicLength(3), opt.numberSize * 0.12);
     let y = top;
     let direction = mark.direction === "down" ? -1 : 1;
     while (y < bottom - 1e-6) {
@@ -1766,7 +1775,7 @@ function reserveCrossPartArpeggioSpace(
       && entry.syncTick.equals(mark.offset)
       && (mark.parts.length === 0 || mark.parts.includes(entry.sourcePartIndex)));
     if (selected.length < 2) continue;
-    const amplitude = Math.max(1.5, opt.numberSize * 0.055);
+    const amplitude = Math.max(opt.musicLength(1.5), opt.numberSize * 0.055);
     const reserve = amplitude * 2 + opt.numberSize * 0.24;
     for (const entry of selected) {
       entry.group.update();
@@ -2117,7 +2126,7 @@ export class Line {
     return grps;
   }
 
-  private addSlurTie(a: S.Note, b: S.Note, ypos: number, thickness: number, clr: number): void {
+  private addSlurTie(a: S.Note, b: S.Note, ypos: number, thickness: number, clr: number, musicScale: number): void {
     const ena = this.chordEntry.get(a.chord);
     const enb = this.chordEntry.get(b.chord);
     const grp = new Tie();
@@ -2128,7 +2137,7 @@ export class Line {
     if (a.tiePrev !== null || a.tupletEnd) pl = pl.offset(dx, 0);
     if (b.tieNext !== null) pr = pr.offset(-dx, 0);
     pr = pr.offset(enb!.group.x - ena!.group.x, 0);
-    grp.init(pl, pr, thickness, clr);
+    grp.init(pl, pr, thickness, clr, musicScale);
     grp.x += ena!.group.x;
     grp.normalizeX();
     grp.normalizeY();
@@ -2141,17 +2150,18 @@ export class Line {
     thickness: number,
     clr: number,
     side: "incoming" | "outgoing",
+    musicScale: number,
   ): void {
     if (pr.x <= pl.x + 1e-6) return;
     const grp = new Tie();
     grp.classes.add("tie-span");
     grp.classes.add(`tie-system-${side}`);
-    grp.init(pl, pr, thickness, clr);
+    grp.init(pl, pr, thickness, clr, musicScale);
     this.group.add(grp);
   }
 
   private addTie(opt: LayoutOptions): void {
-    const thickness = opt.slurTieThickness;
+    const thickness = opt.musicLength(opt.slurTieThickness);
     const noteEntries = this.entries.filter((entry): entry is NoteEntry =>
       entry instanceof NoteEntry && this.chordEntry.get(entry.chord) === entry);
     if (noteEntries.length === 0) return;
@@ -2187,7 +2197,7 @@ export class Line {
       const endEntry = endCh ? this.chordEntry.get(endCh) : undefined;
       if (endEntry) {
         const ypos = Math.min(this.tiedTop(e, opt, true), this.tiedTop(endEntry, opt, false));
-        this.addSlurTie(nt, nt.tieNext!, ypos, thickness, opt.color);
+        this.addSlurTie(nt, nt.tieNext!, ypos, thickness, opt.color, opt.musicLength(1));
       } else if (nt.tieNext) {
         const dx = e.number!.font.size / 14;
         const startX = e.group.x + e.cx + (nt.tiePrev !== null ? dx : 0);
@@ -2198,6 +2208,7 @@ export class Line {
           thickness,
           opt.color,
           "outgoing",
+          opt.musicLength(1),
         );
       }
     }
@@ -2220,6 +2231,7 @@ export class Line {
         thickness,
         opt.color,
         "incoming",
+        opt.musicLength(1),
       );
     }
   }
@@ -2246,7 +2258,7 @@ export class Line {
     return res;
   }
   private addSlur(opt: LayoutOptions): void {
-    const thickness = opt.slurTieThickness;
+    const thickness = opt.musicLength(opt.slurTieThickness);
     const noteEntries = this.entries.filter((entry): entry is NoteEntry => entry instanceof NoteEntry);
     for (const e of this.entries) {
       if (!(e instanceof NoteEntry)) continue;
@@ -2265,7 +2277,7 @@ export class Line {
       const ypos = Math.min(...span.map((entry, index) =>
         this.slurTop(entry, opt, index === 0)));
       const nb = endCh!.notes[0];
-      this.addSlurTie(nt, nb, ypos, thickness, opt.color);
+      this.addSlurTie(nt, nb, ypos, thickness, opt.color, opt.musicLength(1));
     }
   }
 
@@ -2574,7 +2586,7 @@ export class Line {
     }
     if (byMeasure.size === 0) return;
 
-    const strokeWidth = Math.max(0.8, opt.numberSize * 0.038);
+    const strokeWidth = Math.max(opt.musicLength(0.8), opt.numberSize * 0.038);
     for (const [measureIndex, entries] of byMeasure) {
       const geometry = buildRhythmGuideGrid(entries, style);
       if (!geometry || geometry.gridAnchors.length === 0) continue;
@@ -2721,7 +2733,7 @@ export class Line {
       tupGrp.y = ypos;
       const path = new GraphicPath();
       path.classes.add("tuplet-bracket");
-      path.strokeWidth = 1;
+      path.strokeWidth = opt.musicLength(1);
       path.fill = false;
       path.stroke = true;
       path.strokeColor = opt.color;
@@ -2781,18 +2793,33 @@ export class Line {
   }
 
   updateLyricY(opt: LayoutOptions): void {
-    let dy = opt.numberSize * 0.4;
+    const lyricEntries = this.entries.filter((e): e is NoteEntry =>
+      e instanceof NoteEntry && e.lrc !== null);
+    if (lyricEntries.length === 0) return;
+
+    // Lyrics keep their independent text size. The historical offset was
+    // measured only in number-size units, so a smaller music font let the
+    // much taller CJK glyphs rise into the note band. Place the actual lyric
+    // top below the bottom of this row's music, then let Group.update() carry
+    // that occupied height into paired-row spacing and pagination.
+    let musicBottom = 0;
     for (const e of this.entries) {
-      if (e instanceof NoteEntry) {
-        const ey = e.entryBottom(opt);
-        dy = Math.max(dy, ey);
+      if (!(e instanceof NoteEntry || e instanceof Barline)) continue;
+      for (const child of e.group.children) {
+        if (e instanceof NoteEntry && child === e.lrc) continue;
+        const bound = child instanceof Group ? child.childrenBound : child.bound;
+        musicBottom = Math.max(musicBottom, e.group.y + child.y + bound.bottom);
       }
     }
-    for (const e of this.entries) {
-      if (e instanceof NoteEntry) {
-        if (e.lrc === null) continue;
-        e.lrc.y += dy;
-      }
+    for (const beam of this.beams) {
+      musicBottom = Math.max(musicBottom,
+        beam.y + Math.max(beam.p0.y, beam.p1.y) + beam.strokeWidth / 2);
+    }
+    const lyricTop = Math.min(...lyricEntries.map((e) => e.lrc!.bound.top));
+    const gap = Math.max(opt.numberSize * 0.2, opt.lrcFont.size * 0.08);
+    const lyricBaseline = musicBottom + gap - lyricTop;
+    for (const e of lyricEntries) {
+      e.lrc!.y = lyricBaseline - e.group.y;
     }
   }
 
@@ -2997,12 +3024,25 @@ export class LayoutOptions {
 
   applyEngravingStyle(style: Partial<EngravingStyle>): void {
     this.engravingStyle = normalizeEngravingStyle(style);
+    this.lrcFont = new Font(this.lrcFont.family, this.fontSize * this.engravingStyle.contentScale);
     this.numberFont = new Font(
       this.lrcFont.family,
-      this.fontSize * this.engravingStyle.numberScale,
+      this.fontSize * this.engravingStyle.numberScale * this.musicLength(1),
       this.engravingStyle.numberBold,
     );
+    this.smuflFont = new Font("Bravura", this.fontSize * this.musicLength(1));
     this.jpBeamDist = this.numberSize / 8;
+    this.maxLineDist = this.fontSize * this.engravingStyle.contentScale * 0.75;
+  }
+
+  /** Former music size, retained for all publication-header typography. */
+  get publicationUnit(): number {
+    return this.fontSize * this.engravingStyle.contentScale * this.engravingStyle.numberScale;
+  }
+
+  /** Convert a fixed music-space length at 100% into page units once. */
+  musicLength(value: number): number {
+    return value * this.engravingStyle.notationScale * this.engravingStyle.contentScale;
   }
 
   numberBound(ch: string): Rect {
@@ -3010,11 +3050,11 @@ export class LayoutOptions {
   }
 
   octaveDotDiameter(): number {
-    return Math.max(0.5, this.numberSize * 0.16 * this.engravingStyle.octaveDotScale);
+    return Math.max(this.musicLength(0.5), this.numberSize * 0.16 * this.engravingStyle.octaveDotScale);
   }
 
   octaveDotGap(): number {
-    return Math.max(0.35, this.numberSize * 0.055 * this.engravingStyle.octaveDotDistance);
+    return Math.max(this.musicLength(0.35), this.numberSize * 0.055 * this.engravingStyle.octaveDotDistance);
   }
 
   /** Fixed blank space between notation systems; it also drives pagination. */
@@ -3636,12 +3676,12 @@ export class Layout {
     const braceWidth = Math.max(numberSize * 0.08, numberSize * 1.2 * style.braceWidthScale);
     const instrumentWidth = instrumentFont.measureText(instrumentName);
     const systemLeftX = continuationBraceLeft === null
-      ? Math.max(68, 1 + instrumentWidth + numberSize * 0.25 + braceWidth + numberSize * 0.12)
-      : Math.max(1, continuationBraceLeft) + braceWidth + numberSize * 0.12;
+      ? Math.max(68 * style.contentScale, style.contentScale + instrumentWidth + numberSize * 0.25 + braceWidth + numberSize * 0.12)
+      : Math.max(style.contentScale, continuationBraceLeft) + braceWidth + numberSize * 0.12;
     const braceLeft = continuationBraceLeft === null
       ? systemLeftX - numberSize * 0.12 - braceWidth
-      : Math.max(1, continuationBraceLeft);
-    const instrumentX = Math.max(1, braceLeft - numberSize * 0.22 - instrumentWidth);
+      : Math.max(style.contentScale, continuationBraceLeft);
+    const instrumentX = Math.max(style.contentScale, braceLeft - numberSize * 0.22 - instrumentWidth);
     return {
       systemLeftX,
       musicStart: systemLeftX + numberSize * 0.62,
@@ -3656,7 +3696,7 @@ export class Layout {
     const style = this.options.engravingStyle;
     const numberSize = this.options.numberSize;
     const instrumentFont = this.options.lrcFont.scaled(0.56 / 1.5);
-    const bracketLeft = 1;
+    const bracketLeft = style.contentScale;
     const labelX = groups.length >= 2 ? bracketLeft + numberSize * 0.42 : bracketLeft;
     const labelWidth = Math.max(0, ...groups.map((group) => instrumentFont.measureText(group.name)));
     const braceWidth = Math.max(numberSize * 0.08, numberSize * 1.2 * style.braceWidthScale);
@@ -3807,7 +3847,7 @@ export class Layout {
     braceGroup.classes.add("piano-brace");
     const brace = new GraphicPath();
     brace.classes.add("piano-brace-path");
-    brace.segs = staffBraceSegments(braceWidth, y1 - y0, style.braceStrokeWidth);
+    brace.segs = staffBraceSegments(braceWidth, y1 - y0, this.options.musicLength(style.braceStrokeWidth));
     brace.fill = true;
     brace.fillColor = this.options.color;
     brace.x = braceLeft;
@@ -3820,7 +3860,7 @@ export class Layout {
     const systemLeft = new GraphicLine();
     systemLeft.classes.add("piano-system-left");
     systemLeft.strokeColor = this.options.color;
-    systemLeft.strokeWidth = style.pianoLeftLineWidth;
+    systemLeft.strokeWidth = this.options.musicLength(style.pianoLeftLineWidth);
     systemLeft.p0 = new Point(systemLeftX, y0);
     systemLeft.p1 = new Point(systemLeftX, y1);
     pair.add(systemLeft);
@@ -4028,7 +4068,7 @@ export class Layout {
         braceGroup.classes.add("ensemble-instrument-brace");
         const brace = new GraphicPath();
         brace.classes.add("ensemble-instrument-brace-path");
-        brace.segs = staffBraceSegments(geometry.braceWidth, bottom - top, style.braceStrokeWidth);
+        brace.segs = staffBraceSegments(geometry.braceWidth, bottom - top, this.options.musicLength(style.braceStrokeWidth));
         brace.fill = true;
         brace.fillColor = this.options.color;
         brace.x = geometry.braceLeft;
@@ -4040,7 +4080,7 @@ export class Layout {
       const groupLine = new GraphicLine();
       groupLine.classes.add("ensemble-group-line");
       groupLine.strokeColor = this.options.color;
-      groupLine.strokeWidth = style.pianoLeftLineWidth;
+      groupLine.strokeWidth = this.options.musicLength(style.pianoLeftLineWidth);
       groupLine.p0 = new Point(geometry.systemLeftX, top);
       groupLine.p1 = new Point(geometry.systemLeftX, bottom);
       system.add(groupLine);
@@ -4080,8 +4120,8 @@ export class Layout {
     // groups.  One instrument (even with several internal voices) keeps its
     // own brace but must not receive a redundant outer square bracket.
     if (groups.length >= 2) {
-      const bracketWidth = Math.max(1.2, this.options.engravingStyle.pianoLeftLineWidth);
-      const hook = Math.max(5, this.options.numberSize * 0.24);
+      const bracketWidth = this.options.musicLength(Math.max(1.2, style.pianoLeftLineWidth));
+      const hook = Math.max(this.options.musicLength(5), this.options.numberSize * 0.24);
       // GraphicLine coordinates run along the stroke centre.  Start the hooks at
       // the vertical stroke's outer-left edge so their visible left edges align
       // and the square 90-degree joint has no half-stroke-width step.
@@ -4136,25 +4176,27 @@ export class Layout {
     const hasTitleText = Boolean(scr.title.trim() || scr.subtitle.trim());
     const hasTitleBlock = Boolean(scr.title.trim() || scr.subtitle.trim() || scr.composer.trim() || scr.arranger.trim() || scr.lyricist.trim());
     const style = this.options.engravingStyle;
-    const titleFontSize = Math.min(this.options.titleSize, this.options.numberSize * 1.25)
+    const textUnit = this.options.publicationUnit;
+    const titleFontSize = Math.min(this.options.titleSize * style.contentScale, textUnit * 1.25)
       * style.publicationTitleScale;
     const titleShift = hasTitleText ? titleFontSize : 0;
-    const baseReserve = this.options.numberSize * (hasTitleBlock ? 3.85 : 2.35)
+    const baseReserve = textUnit * (hasTitleBlock ? 3.85 : 2.35)
       + titleShift
-      + this.options.numberSize * 0.35;
+      + textUnit * 0.35;
     // Keep metadata vertical movement and the requested metadata→first-system
     // gap independent. Defaults reproduce the historical 0.88-number gap.
     return Math.max(
-      this.options.numberSize * 0.5,
+      textUnit * 0.5,
       baseReserve
-        + this.options.numberSize * style.publicationMetaYOffset
-        + this.options.numberSize * (style.publicationFirstSystemGap - 0.88),
+        + textUnit * style.publicationMetaYOffset
+        + textUnit * (style.publicationFirstSystemGap - 0.88),
     );
   }
 
   private addPublicationHeader(page: Group, scr: S.Score, width: number, reserve: number): void {
     const opt = this.options;
     const style = opt.engravingStyle;
+    const textUnit = opt.publicationUnit;
     // paginatePiano normalizes each page group and stores the first system's
     // absolute y in page.y. Move that offset back into the music children so
     // header items and systems share one page-local coordinate system.
@@ -4185,23 +4227,23 @@ export class Layout {
     };
 
     const titleFont = opt.lrcFont.makeWithSize(
-      Math.min(opt.titleSize, opt.numberSize * 1.25) * style.publicationTitleScale,
+      Math.min(opt.titleSize * style.contentScale, textUnit * 1.25) * style.publicationTitleScale,
     );
     const subtitleFont = opt.lrcFont.makeWithSize(
-      opt.numberSize * 0.62 * style.publicationSubtitleScale,
+      textUnit * 0.62 * style.publicationSubtitleScale,
     );
     const metaFont = opt.lrcFont.makeWithSize(
-      opt.numberSize * 0.87 * style.publicationMetaScale,
+      textUnit * 0.87 * style.publicationMetaScale,
     );
     const creditFont = opt.lrcFont.makeWithSize(
-      opt.numberSize * 0.52 * style.publicationCreditScale,
+      textUnit * 0.52 * style.publicationCreditScale,
     );
     // Use the title font's own ascent, not the number size, to keep larger
     // publication titles fully inside the page instead of clipping their top.
     const titleY = titleFont.size * 2.2
-      + opt.numberSize * (0.35 + style.publicationTitleYOffset);
+      + textUnit * (0.35 + style.publicationTitleYOffset);
     const subtitleY = titleY
-      + opt.numberSize * (0.9 + style.publicationSubtitleYOffset);
+      + textUnit * (0.9 + style.publicationSubtitleYOffset);
     addText(
       scr.title,
       titleFont,
@@ -4221,7 +4263,7 @@ export class Layout {
 
     const first = scr.parts[0]?.measures[0];
     const metaY = opt.marginTop + reserve
-      - opt.numberSize * style.publicationFirstSystemGap;
+      - textUnit * style.publicationFirstSystemGap;
     if (first) {
       const rawKey = first.key.name;
       const displayKey = rawKey.startsWith("#") ? `${rawKey.slice(1)}♯` : rawKey.startsWith("b") ? `${rawKey.slice(1)}♭` : rawKey;
@@ -4249,7 +4291,7 @@ export class Layout {
       ? explicitCredits
       : scr.credit.filter((x) => x.type !== "title").flatMap((x) => x.text.split("\n").map((s) => s.trim()).filter(Boolean));
     const creditGap = creditFont.size * 1.18;
-    const creditBottom = metaY + opt.numberSize * style.publicationCreditYOffset;
+    const creditBottom = metaY + textUnit * style.publicationCreditYOffset;
     credits.forEach((text, index) => {
       const y = creditBottom - (credits.length - 1 - index) * creditGap;
       addText(

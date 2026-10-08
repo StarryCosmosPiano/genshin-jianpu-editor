@@ -2612,12 +2612,19 @@ const exactReloadTuplets = new Set(exactReportedReload.score.parts.flatMap((part
       ? entry.notes.flatMap((note) => note.tuplet ? [note.tuplet] : [])
       : []))));
 const exactLongTuplet = [...exactReloadTuplets].find((tuplet) => tuplet.partIndex === 1);
+const exactV1PostRest = exactReportedReload.score.parts[0].measures[0].entries.find(
+  (entry): entry is Chord => entry instanceof Chord && entry.rest
+    && entry.position.compareTo(new Fraction(1, 2)) <= 0
+    && entry.position.plus(entry.duration ?? new Fraction(0)).compareTo(new Fraction(1, 2)) > 0,
+);
 check(exactReportedVSourceDuration?.equals(new Fraction(1, 2))
   && exactReportedV?.duration?.equals(new Fraction(1, 6))
   && exactReportedCreated?.changed
   && (exactReportedOutput.match(/\[/g) ?? []).length === 1
   && (exactBracketBody.match(/0/g) ?? []).length === 1
-  && exactReportedCompact.includes("[(VG).W.0]N.(GW).")
+  && (exactReportedCompact.includes("[(VG).W.0]N.(GW).")
+    || exactReportedCompact.includes("[(VG).W.0](0N).(GW)."))
+  && exactV1PostRest?.rest
   && exactReloadTuplets.size === 2
   && exactLongTuplet?.actualEnd?.equals(new Fraction(1, 2))
   && exactLongTuplet.memberChords().length === 3

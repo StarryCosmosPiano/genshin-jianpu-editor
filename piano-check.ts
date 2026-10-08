@@ -915,12 +915,13 @@ const metaFrame = renderedText.find((item) => item.text.startsWith("1=") && item
 const creditFrame = renderedText.find((item) => item.text === "jpeditor piano");
 const pageNumberFrame = renderedText.find((item) => /^\d+\/\d+$/.test(item.text));
 check(instrumentFrame && Math.abs(instrumentFrame.font.size - layout.options.lrcFont.size * 0.56 / 1.5) < 0.01, "instrument font was not reduced by 1.5x");
-const publicationTitleSize = Math.min(layout.options.titleSize, layout.options.numberSize * 1.25);
-check(titleFrame && Math.abs(titleFrame.y - (publicationTitleSize * 2.2 + layout.options.numberSize * 0.35)) < 0.01,
+const publicationUnit = layout.options.publicationUnit;
+const publicationTitleSize = Math.min(layout.options.titleSize, publicationUnit * 1.25);
+check(titleFrame && Math.abs(titleFrame.y - (publicationTitleSize * 2.2 + publicationUnit * 0.35)) < 0.01,
   "publication title was not moved down by one title size plus the global offset");
-check(metaFrame && Math.abs(metaFrame.font.size - layout.options.numberSize * 0.87) < 0.01,
+check(metaFrame && Math.abs(metaFrame.font.size - publicationUnit * 0.87) < 0.01,
   "key/meter/tempo metadata was not reduced by the requested 1.2x");
-check(creditFrame && Math.abs(creditFrame.font.size - layout.options.numberSize * 0.52) < 0.01, "credits changed size with the enlarged metadata");
+check(creditFrame && Math.abs(creditFrame.font.size - publicationUnit * 0.52) < 0.01, "credits changed size with the enlarged metadata");
 check(pageNumberFrame && Math.abs(pageNumberFrame.font.size - layout.options.lrcFont.size * 0.8 / 3) < 0.01, "page number was not reduced to one third");
 
 const headerControlLayout = new layoutMod.Layout(28);
@@ -963,13 +964,13 @@ check(Math.abs(controlledMeta.x - controlledContentWidth * 0.18) < 0.01,
 check(Math.abs(controlledCredit.x + controlledCredit.width - controlledContentWidth * 0.72) < 0.01,
   "credit horizontal-position control was not applied to production layout");
 check(Math.abs(controlledTitle.font.size - publicationTitleSize * 1.4) < 0.01
-  && Math.abs(controlledMeta.font.size - headerControlLayout.options.numberSize * 0.87 * 1.3) < 0.01
-  && Math.abs(controlledCredit.font.size - headerControlLayout.options.numberSize * 0.52 * 0.8) < 0.01,
+  && Math.abs(controlledMeta.font.size - headerControlLayout.options.publicationUnit * 0.87 * 1.3) < 0.01
+  && Math.abs(controlledCredit.font.size - headerControlLayout.options.publicationUnit * 0.52 * 0.8) < 0.01,
 "publication header font-size controls were not applied to production layout");
-check(controlledTitle.y > titleFrame.y + headerControlLayout.options.numberSize,
+check(controlledTitle.y > titleFrame.y + headerControlLayout.options.publicationUnit,
   "title vertical-position control was not applied to production layout");
 check(Math.abs(controlledFirstSystem.y - controlledMeta.y
-  - headerControlLayout.options.numberSize * 2.3) < 0.01,
+  - headerControlLayout.options.publicationUnit * 2.3) < 0.01,
 "first-system distance from key/meter/tempo metadata does not match the selected control");
 
 const bracePathOf = (system: InstanceType<typeof layoutMod.Group>): InstanceType<typeof layoutMod.GraphicPath> | null => {
@@ -1076,8 +1077,33 @@ KeyAndMeters = {1=C,4/4}
 check(uniformFile, "uniform four-measure piano fixture did not parse");
 const uniformScore = fromJpw(uniformFile);
 check(uniformScore?.piano, "uniform fixture did not enter piano mode");
+const denseLayout = new layoutMod.Layout(28);
+denseLayout.options.smuflMeta = smuflMeta;
+check(Math.abs(denseLayout.options.engravingStyle.notationScale - Math.SQRT1_2) < 1e-10
+  && denseLayout.options.engravingStyle.measuresPerSystem === 6,
+"A4 notation density defaults changed");
+check(Math.abs(denseLayout.options.numberSize
+  - denseLayout.options.publicationUnit * Math.SQRT1_2) < 1e-10,
+"music glyph size is not independent of publication text size");
+const denseBarline = new layoutMod.Barline(false, denseLayout.options);
+const denseStroke = denseBarline.group.children[0] as InstanceType<typeof layoutMod.GraphicLine>;
+const numeralBounds = "01234567".split("").map((digit) => denseLayout.options.numberBound(digit));
+const numeralHeight = Math.max(...numeralBounds.map((bound) => bound.height));
+check(Math.abs(denseBarline.group.y + denseStroke.y
+    - (Math.min(...numeralBounds.map((bound) => bound.top)) - numeralHeight / 2)) < 0.01
+  && Math.abs(denseBarline.group.y + denseStroke.y + denseStroke.height
+    - (Math.max(...numeralBounds.map((bound) => bound.bottom)) + numeralHeight / 2)) < 0.01,
+"measure barline must extend one half glyph height above and below the digit band");
+denseLayout.fromScore(uniformScore, null, 960, 540);
+const denseSystems = denseLayout.pages.flatMap((page) => page.children)
+  .filter((item): item is InstanceType<typeof layoutMod.Group> =>
+    item instanceof layoutMod.Group && item.classes.has("piano-system"));
+check(denseSystems[0] && denseSystems[0].children.filter((item) => item instanceof layoutMod.Group)
+  .flatMap((row) => row.children).filter((item) => item.data instanceof layoutMod.Barline).length === 12,
+"A4 density did not fit six aligned measures in the first piano system");
 const uniformLayout = new layoutMod.Layout(28);
 uniformLayout.options.smuflMeta = smuflMeta;
+uniformLayout.options.applyEngravingStyle({ measuresPerSystem: 4 });
 uniformLayout.fromScore(uniformScore, null, 960, 540);
 const uniformSystems: InstanceType<typeof layoutMod.Group>[] = [];
 const collectUniformSystems = (item: InstanceType<typeof layoutMod.PageItem>): void => {
@@ -1109,6 +1135,7 @@ for (const system of uniformSystems) {
 const customLayout = new layoutMod.Layout(28);
 customLayout.options.smuflMeta = smuflMeta;
 customLayout.options.applyEngravingStyle({
+  notationScale: 1,
   numberScale: 1.2,
   numberBold: true,
   chordRowGap: 1.05,
@@ -1530,7 +1557,7 @@ check(importedEnsembleMusicXml.ensemble
 "multi-part MusicXML import did not preserve every instrument and voice");
 const ensembleLayout = new layoutMod.Layout(28);
 ensembleLayout.options.smuflMeta = smuflMeta;
-ensembleLayout.options.applyEngravingStyle({ connectBarlines: true });
+ensembleLayout.options.applyEngravingStyle({ connectBarlines: true, measuresPerSystem: 4 });
 ensembleLayout.fromScore(ensembleScore, null, 595, 842);
 const ensembleSystems = ensembleLayout.pages.flatMap((page) =>
   page.children.filter((item) => item.classes.has("ensemble-system")));

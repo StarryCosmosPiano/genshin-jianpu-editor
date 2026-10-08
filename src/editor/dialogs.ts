@@ -474,7 +474,9 @@ function renderEngravingPreview(svg: SVGSVGElement, style: EngravingStyle, instr
     svg.innerHTML = actual.innerHTML;
     return;
   }
-  const numberSize = 27 * style.numberScale;
+  const textUnit = 27 * style.numberScale * style.contentScale;
+  const musicLength = (value: number) => value * style.notationScale * style.contentScale;
+  const numberSize = textUnit * style.notationScale;
   const chordGap = numberSize * style.chordRowGap;
   const dotSize = numberSize * style.octaveDotScale;
   const dotRadius = dotSize * 0.08;
@@ -485,7 +487,7 @@ function renderEngravingPreview(svg: SVGSVGElement, style: EngravingStyle, instr
     numberSize * 0.78 + dotGap + dotRadius * 2 + dotClearance,
   );
   const rightY = 68;
-  const leftY = rightY + 72 * (style.pianoHandGap / DEFAULT_ENGRAVING_STYLE.pianoHandGap);
+  const leftY = rightY + musicLength(72) * (style.pianoHandGap / DEFAULT_ENGRAVING_STYLE.pianoHandGap);
   const topChordBaseline = rightY - automaticChordGap * 2;
   // Match the real renderer: an upper octave dot is positioned above the
   // tight top of the owning digit, not merely above its text baseline.
@@ -507,22 +509,22 @@ function renderEngravingPreview(svg: SVGSVGElement, style: EngravingStyle, instr
     nextSystemBaselineRaw + numberSize * 0.25,
     horizontalPreviewRawY + numberSize * 0.65,
   );
-  const headerReserve = 44;
+  const headerReserve = 44 * style.contentScale;
   const height = bottom - top + 30 + headerReserve;
   const y = (value: number) => value - top + 12 + headerReserve;
   const lineTop = y(rightY - numberSize * 0.85);
   const lineBottom = y(leftY + numberSize * 0.22);
-  const braceWidth = 14 * style.braceWidthScale;
-  const instrumentFontSize = 15 / 1.5;
+  const braceWidth = musicLength(14) * style.braceWidthScale;
+  const instrumentFontSize = 15 / 1.5 * style.contentScale;
   const instrumentWidth = Math.min(96, Math.max(20, Array.from(instrumentName).length * instrumentFontSize));
   const lineX = Math.max(82, 8 + instrumentWidth + 8 + braceWidth + 3);
   const braceRight = lineX - 3;
   const braceLeft = braceRight - braceWidth;
-  const xChord = lineX + 63;
-  const xSecond = xChord + 94 * style.noteGapScale;
-  const xBar = xSecond + 78 * style.noteGapScale;
+  const xChord = lineX + musicLength(63);
+  const xSecond = xChord + musicLength(94) * style.noteGapScale;
+  const xBar = xSecond + musicLength(78) * style.noteGapScale;
   const finalX = 575;
-  const secondFinalX = finalX + style.finalBarlineWidth + style.finalBarlineGap;
+  const secondFinalX = finalX + musicLength(style.finalBarlineWidth + style.finalBarlineGap);
   const weight = style.numberBold ? "bold" : "normal";
   const highDotY = y(highDotRawY);
   const lowDotY = y(lowDotRawY);
@@ -532,8 +534,8 @@ function renderEngravingPreview(svg: SVGSVGElement, style: EngravingStyle, instr
   const rhythmMinorDivision = style.rhythmGuideMode === "auto" ? 16 : Math.max(4, style.rhythmGuideDivision);
   const rhythmMajorEvery = rhythmMinorDivision / 4;
   const rhythmStartX = xChord;
-  const rhythmEndX = xBar + 70 * style.noteGapScale;
-  const rhythmStroke = Math.max(0.8, numberSize * 0.038);
+  const rhythmEndX = xBar + musicLength(70) * style.noteGapScale;
+  const rhythmStroke = Math.max(musicLength(0.8), numberSize * 0.038);
   const rhythmMarkup = style.rhythmGuideEnabled ? `
     <g data-preview-rhythm-guide="true" data-preview-rhythm-mode="${style.rhythmGuideMode}" data-preview-rhythm-division="${rhythmMinorDivision}">
       <line x1="${rhythmStartX}" y1="${rhythmGuideY}" x2="${rhythmEndX}" y2="${rhythmGuideY}" stroke="currentColor" stroke-width="${rhythmStroke}"/>
@@ -552,8 +554,8 @@ function renderEngravingPreview(svg: SVGSVGElement, style: EngravingStyle, instr
       <text x="${braceLeft - 8}" y="${nextSystemY}" text-anchor="end" font-family="PingFang SC, Microsoft YaHei, sans-serif" font-size="10" fill="currentColor">下一谱行</text>
       ${text("1", xChord, nextSystemY)}
       ${text("2", xSecond, nextSystemY)}
-      <line x1="${xBar}" y1="${nextSystemY - numberSize * 0.82}" x2="${xBar}" y2="${nextSystemY + numberSize * 0.18}" stroke="currentColor" stroke-width="${style.barlineWidth}"/>
-      ${text("3", xBar + 70 * style.noteGapScale, nextSystemY)}
+      <line x1="${xBar}" y1="${nextSystemY - numberSize * 0.82}" x2="${xBar}" y2="${nextSystemY + numberSize * 0.18}" stroke="currentColor" stroke-width="${musicLength(style.barlineWidth)}"/>
+      ${text("3", xBar + musicLength(70) * style.noteGapScale, nextSystemY)}
     </g>`;
   const targetMeasureCount = Math.max(1, Math.round(style.measuresPerSystem));
   const shownMeasureCount = Math.min(12, targetMeasureCount);
@@ -579,7 +581,7 @@ function renderEngravingPreview(svg: SVGSVGElement, style: EngravingStyle, instr
       <line x1="${previewLeft}" y1="${horizontalPreviewY}" x2="${previewRight}" y2="${horizontalPreviewY}" stroke="currentColor" stroke-width="0.8" opacity="0.45"/>
       ${Array.from({ length: shownMeasureCount + 1 }, (_, index) => {
         const x = previewLeft + previewMeasureWidth * index;
-        return `<line x1="${x}" y1="${horizontalPreviewY - numberSize * 0.46}" x2="${x}" y2="${horizontalPreviewY + numberSize * 0.12}" stroke="currentColor" stroke-width="${index === shownMeasureCount ? style.finalBarlineWidth : style.barlineWidth}" opacity="0.75"/>`;
+        return `<line x1="${x}" y1="${horizontalPreviewY - numberSize * 0.46}" x2="${x}" y2="${horizontalPreviewY + numberSize * 0.12}" stroke="currentColor" stroke-width="${musicLength(index === shownMeasureCount ? style.finalBarlineWidth : style.barlineWidth)}" opacity="0.75"/>`;
       }).join("")}
       ${previewNoteXs.map((x, index) => text(String(index + 1), x, horizontalPreviewY - numberSize * 0.08, numberSize * 0.58)).join("")}
     </g>`;
@@ -587,10 +589,10 @@ function renderEngravingPreview(svg: SVGSVGElement, style: EngravingStyle, instr
 
   svg.setAttribute("viewBox", `0 0 620 ${height}`);
   svg.innerHTML = `
-    <text data-preview-meta="true" x="8" y="30" font-family="PingFang SC, Microsoft YaHei, sans-serif" font-size="${numberSize * 0.87}" fill="currentColor">1=C  4/4  ♩=90</text>
+    <text data-preview-meta="true" x="8" y="30" font-family="PingFang SC, Microsoft YaHei, sans-serif" font-size="${textUnit * 0.87}" fill="currentColor">1=C  4/4  ♩=90</text>
     <text x="${braceLeft - 8}" y="${(lineTop + lineBottom) / 2 + instrumentFontSize * 0.35}" text-anchor="end" font-family="PingFang SC, Microsoft YaHei, Microsoft YaHei UI, Noto Sans CJK SC, Yu Gothic UI, Meiryo, Malgun Gothic, sans-serif" font-size="${instrumentFontSize}" fill="currentColor">${escapedInstrument}</text>
-    <path data-preview-brace="true" d="${staffBracePathD(braceWidth, lineBottom - lineTop, style.braceStrokeWidth)}" transform="translate(${braceLeft} ${lineTop})" fill="currentColor"/>
-    <line x1="${lineX}" y1="${lineTop}" x2="${lineX}" y2="${lineBottom}" stroke="currentColor" stroke-width="${style.pianoLeftLineWidth}"/>
+    <path data-preview-brace="true" d="${staffBracePathD(braceWidth, lineBottom - lineTop, musicLength(style.braceStrokeWidth))}" transform="translate(${braceLeft} ${lineTop})" fill="currentColor"/>
+    <line x1="${lineX}" y1="${lineTop}" x2="${lineX}" y2="${lineBottom}" stroke="currentColor" stroke-width="${musicLength(style.pianoLeftLineWidth)}"/>
     ${text("5", xChord, y(topChordBaseline), numberSize, 'data-preview-number="high-owner"')}
     ${text("3", xChord, y(rightY - automaticChordGap))}
     ${text("1", xChord, y(rightY))}
@@ -602,11 +604,11 @@ function renderEngravingPreview(svg: SVGSVGElement, style: EngravingStyle, instr
     ${rhythmMarkup}
     ${nextSystemMarkup}
     ${horizontalLayoutMarkup}
-    <line x1="${xBar}" y1="${lineTop}" x2="${xBar}" y2="${lineBottom}" stroke="currentColor" stroke-width="${style.barlineWidth * style.pianoConnectorScale}"/>
-    ${text("6", xBar + 70 * style.noteGapScale, y(rightY))}
-    ${text("3", xBar + 70 * style.noteGapScale, y(leftY))}
-    <line x1="${finalX}" y1="${lineTop}" x2="${finalX}" y2="${lineBottom}" stroke="currentColor" stroke-width="${style.finalBarlineWidth * style.pianoConnectorScale}"/>
-    <line x1="${secondFinalX}" y1="${lineTop}" x2="${secondFinalX}" y2="${lineBottom}" stroke="currentColor" stroke-width="${style.finalBarlineWidth * style.pianoConnectorScale}"/>
+    <line x1="${xBar}" y1="${lineTop}" x2="${xBar}" y2="${lineBottom}" stroke="currentColor" stroke-width="${musicLength(style.barlineWidth) * style.pianoConnectorScale}"/>
+    ${text("6", xBar + musicLength(70) * style.noteGapScale, y(rightY))}
+    ${text("3", xBar + musicLength(70) * style.noteGapScale, y(leftY))}
+    <line x1="${finalX}" y1="${lineTop}" x2="${finalX}" y2="${lineBottom}" stroke="currentColor" stroke-width="${musicLength(style.finalBarlineWidth) * style.pianoConnectorScale}"/>
+    <line x1="${secondFinalX}" y1="${lineTop}" x2="${secondFinalX}" y2="${lineBottom}" stroke="currentColor" stroke-width="${musicLength(style.finalBarlineWidth) * style.pianoConnectorScale}"/>
   `;
 }
 
@@ -678,6 +680,7 @@ export function showEngravingStyleDialog(app: App): void {
     const output = document.createElement("output");
     output.textContent = format(original[key]);
     input.setAttribute("aria-label", labelText);
+    input.setAttribute("aria-valuetext", output.textContent);
     numericInputs.set(key, input);
     outputs.set(key, output);
     formatters.set(key, format);
@@ -805,6 +808,17 @@ export function showEngravingStyleDialog(app: App): void {
   addStyleRange(numberSection, "数字横向间距", "noteGapScale", (v) => `${v.toFixed(2)}×`);
 
   const pageSection = section("页面与谱行");
+  addStyleRange(paperSection, "整体内容缩放", "contentScale", (v) => `${(v * 100).toFixed(0)}%`);
+  const contentScaleRow = paperSection.lastElementChild!;
+  const contentSizeHint = document.createElement("div");
+  contentSizeHint.className = "modal-hint";
+  contentSizeHint.textContent = "纸张尺寸不变，标题、文字和乐谱一起缩放并重新排版；打印和导出使用相同比例。100% 为原大小。";
+  pageSizeHint.after(contentScaleRow, contentSizeHint);
+  addStyleRange(pageSection, "乐谱本体大小", "notationScale", (v) => `${(v * 100).toFixed(1)}%`);
+  const notationSizeHint = document.createElement("div");
+  notationSizeHint.className = "modal-hint";
+  notationSizeHint.textContent = "默认 70.7%，让 A4 排入更紧凑的乐谱；标题、速度、转调、乐器名和歌词保持独立字号。";
+  pageSection.append(notationSizeHint);
   addStyleRange(pageSection, "谱行上下间距", "systemGapScale", (v) => `${v.toFixed(2)}×`);
   addStyleRange(pageSection, "每行目标小节数", "measuresPerSystem", (v) => `${Math.round(v)} 小节`);
   const rhythmicSpacingEnabled = document.createElement("input");
@@ -972,6 +986,7 @@ export function showEngravingStyleDialog(app: App): void {
   const updateOutputs = (style: EngravingStyle): void => {
     for (const [key, output] of outputs) {
       output.textContent = formatters.get(key)!(style[key]);
+      numericInputs.get(key)?.setAttribute("aria-valuetext", output.textContent);
     }
   };
 

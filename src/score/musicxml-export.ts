@@ -148,7 +148,7 @@ function derivedPitch(note: Note, fifths: number): SpelledPitch {
   return best ?? { step: "C", alter: 0, octave: Math.floor(note.pitch / 12) - 1 };
 }
 
-function spellPitch(note: Note, fifths: number): SpelledPitch {
+export function spellPitch(note: Note, fifths: number): SpelledPitch {
   return storedPitch(note) ?? preferredStepPitch(note) ?? derivedPitch(note, fifths);
 }
 
@@ -257,7 +257,7 @@ function chordXml(chord: Chord, voice: number, fifths: number): string {
     .join("");
 }
 
-function clefForPart(part: Part): { sign: "G" | "F"; line: 2 | 4 } {
+export function clefForPart(part: Part): { sign: "G" | "F"; line: 2 | 4 } {
   if (part.hand === "left") return { sign: "F", line: 4 };
   if (part.hand === "right") return { sign: "G", line: 2 };
   const pitches = part.measures.flatMap((measure) =>

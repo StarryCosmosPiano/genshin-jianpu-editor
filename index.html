@@ -225,6 +225,11 @@
         <span class="sep" aria-hidden="true"></span>
         <button id="btn-score-settings" type="button" aria-label="乐谱设置" data-inspector-trigger="score" aria-controls="inspector-pane" aria-expanded="false" title="当前乐谱设置"><span aria-hidden="true">♭</span><span>乐谱</span></button>
         <button id="btn-layout-style" type="button" aria-label="排版设置" data-inspector-trigger="layout" aria-controls="inspector-pane" aria-expanded="false" title="简谱排版设置"><span aria-hidden="true">▤</span><span>排版</span></button>
+        <div id="staff-view-toolbar">
+          <label for="staff-view-select">视图</label>
+          <select id="staff-view-select" aria-label="乐谱视图"><option value="jianpu">简谱</option><option value="compare">对照</option><option value="staff">五线谱</option></select>
+          <span id="staff-view-reason" role="status"></span>
+        </div>
       </div>
 
       <div id="body" data-code-pane-side="left">
@@ -237,7 +242,13 @@
           <div id="code-pane"></div>
         </section>
         <button id="code-pane-toggle" type="button" aria-label="展开文本编辑器" aria-expanded="false" title="展开文本编辑器">▶</button>
-        <main id="score-pane" tabindex="0" aria-label="乐谱预览"></main>
+        <section id="score-surfaces" data-staff-view="jianpu" aria-label="乐谱视图">
+          <div id="score-surfaces-content">
+            <main id="score-pane" tabindex="0" aria-label="简谱预览"></main>
+            <div id="staff-divider" role="separator" aria-label="调整对照宽度" aria-orientation="vertical" tabindex="0" hidden></div>
+            <section id="staff-pane" tabindex="0" aria-label="五线谱预览，只读" hidden><div id="staff-preview-status" role="status"></div><div id="staff-pages"></div></section>
+          </div>
+        </section>
         <aside id="inspector-pane" hidden></aside>
       </div>
 
@@ -258,6 +269,8 @@
         <span id="status" role="status" aria-live="polite"></span>
         <span id="workspace-position" aria-live="polite"></span>
         <div id="page-controls" role="group" aria-label="页面与缩放">
+          <span id="active-score-surface">简谱</span>
+          <button id="staff-resume-follow" type="button" hidden>恢复跟随</button>
           <button id="btn-prev" type="button" title="上一页">‹</button>
           <span id="workspace-page-count">1 / 1</span>
           <button id="btn-next" type="button" title="下一页">›</button>

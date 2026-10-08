@@ -21,14 +21,13 @@ An open-source jianpu editor, MIDI converter, and score typesetter for Genshin m
 
 ## 中文
 
-### 最新更新 · v0.4.0
+### 最新更新 · v0.5.0
 
-本版加入完整的谱面打谱流程、可自定义快捷键、浅色/深色主题与悬浮设置窗口，
-完善三连音、多声部、延音及格式往返，并优化长谱的解析、排版与页面复用。
+本版新增与简谱同步的五线谱只读预览、并排对照与播放跟随，支持导出水印、音乐密度和
+25%–200% 整体内容缩放，并修复三连音与并行声部在保存重载中的时值、延音和诊断问题。
 
-v0.4.0 已追加重叠三连音、波音文本、括号保留和精准点选修复，并修复排版分类收起后的视野保持与滚轮滚动，自动同步旧浏览器中的花括号默认布局；桌面版请重新下载安装包，在线版刷新即可。
-
-完整变更、兼容说明和验证结果见 [v0.4.0 更新说明](docs/releases/v0.4.0.md)。
+完整变更、兼容说明和验证结果见 [v0.5.0 更新说明](docs/releases/v0.5.0.md)；
+此前版本见 [v0.4.0 更新说明](docs/releases/v0.4.0.md)。
 
 ### 项目简介
 
@@ -147,11 +146,11 @@ JP-Word 解析、SVG 排版、MusicXML / ABC / OMR 等基础能力。
 
 ## English
 
-### Latest update · v0.4.0
+### Latest update · v0.5.0
 
-This release adds score-based note entry, customizable shortcuts, light/dark themes,
-and floating settings windows. It improves tuplets, multiple voices, ties, format
-round trips, and long-score performance. See the [full release notes](docs/releases/v0.4.0.md).
+This release adds a synchronized read-only staff preview, side-by-side comparison,
+export watermarks, notation density, and 25%–200% content scaling. It also improves
+triplet round trips and parallel voice timing. See the [full release notes](docs/releases/v0.5.0.md).
 
 ### About
 

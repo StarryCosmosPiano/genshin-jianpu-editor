@@ -3148,6 +3148,10 @@ function parseGroup(
   let pendingGrace: TimedAtom[] = [];
   let lastPitchEnd = -1;
   let parallelTupletSilence: { voiceIndex: number; from: number } | null = null;
+  let hasOwnedParallelTuplet = false;
+  const clearParallelTupletSilence = (voice: number | null): void => {
+    if (parallelTupletSilence?.voiceIndex === voice) parallelTupletSilence = null;
+  };
   const lastEventByVoice = new Map<number, TimedEvent>();
   let durationContinuationVoice: number | null = null;
   let active: {
@@ -3289,6 +3293,17 @@ function parseGroup(
     const division = mappings[char];
     if (division) {
       lastPitchEnd = -1;
+      const amount = 4 / division;
+      if (!active && durationContinuationVoice === null
+        && (hasOwnedParallelTuplet || (previousEvent?.tripletScope === "voice"
+          && previousEvent.end <= absoluteStart + cursor + 1e-8))) {
+        // After an owned parallel bracket, bare duration glyphs advance the
+        // shared ruler through the bracket and any following gap. They must
+        // not become a duration prefix that backdates the next ordinary note.
+        cursor = Math.min(targetDuration, cursor + amount);
+        index++;
+        continue;
+      }
       // A duration mark immediately after `/` belongs to the preceding sound
       // when that sound reaches the group boundary.  Keep a separate faint
       // chord at the new rhythmic position so the notation exposes the grid.
@@ -3320,7 +3335,6 @@ function parseGroup(
         };
       }
       durationContinuationVoice = null;
-      const amount = 4 / division;
       const before = cursor;
       cursor = Math.min(targetDuration, cursor + amount);
       const current = active as {
@@ -3655,6 +3669,7 @@ function parseGroup(
         const metadataTimedContainer = scopedTuplets.length > 0
           && (explicitTimedContainerVoice(outerBody) === null || containerLimit > targetDuration + 1e-8);
         if (metadataTimedContainer) {
+          for (const annotation of scopedTuplets) clearParallelTupletSilence(annotation.part);
           // One visible bracket may contain independent tuplets and ordinary
           // material from several voices. Advance each TXT voice on its own
           // ruler; @jpeditor supplies the exact 3:2 member values only for the
@@ -3705,30 +3720,90 @@ function parseGroup(
 
             for (const voice of voices) {
               const component = components.get(voice)!;
-              const ordinaryIndex = ordinaryIndexes.get(voice) ?? 0;
-              const candidate = ordinaryByVoice.get(voice)?.[ordinaryIndex];
-              const pendingTuplet = ordinaryByVoice.size > 0
-                ? scopedTuplets.filter((item) => item.part === voice
+              let ordinaryIndex = ordinaryIndexes.get(voice) ?? 0;
+              const ordinaryList = ordinaryByVoice.get(voice) ?? [];
+              let candidate = ordinaryList[ordinaryIndex];
+              // Another printed voice can advance this voice beyond an omitted
+              // silent member. Restore that member before choosing the tuplet
+              // for the next visible pitch, or the pitch inherits stale time.
+              if (component.pitches.length > 0) {
+                for (const annotation of scopedTuplets.filter((item) => item.part === voice)) {
+                  let memberIndex = memberIndexes.get(annotation) ?? 0;
+                  let memberStart = annotation.offset - groupOffset + annotation.members!
+                    .slice(0, memberIndex).reduce((sum, value) => sum + value * 2 / 3, 0);
+                  while (memberIndex < annotation.members!.length
+                    && annotation.memberRests?.[memberIndex]
+                    && memberStart + annotation.members![memberIndex]! * 2 / 3
+                      <= (voiceCursors[voice] ?? cursor) + 1e-8) {
+                    const finish = memberStart + annotation.members![memberIndex]! * 2 / 3;
+                    const event: TimedEvent = {
+                      start: absoluteStart + memberStart, end: absoluteStart + finish,
+                      pitches: [], restVoiceIndexes: [voice], voiceIndex: voice,
+                      sourceGroupKey, sourceGroupEnd: absoluteStart + containerLimit,
+                      writtenDurations: [finish - memberStart], metadataVoice: true,
+                      tripletGroup: `${sourceGroupKey}:triplet:${index}:v${voice}:${annotation.offset}`,
+                      tripletIndex: memberIndex, tripletEnd: absoluteStart + finish,
+                      tripletScope: "voice",
+                      tripletCrossBeat: containerLimit > targetDuration + 1e-8,
+                    };
+                    if (!events.some((prior) => prior.voiceIndex === voice
+                      && prior.pitches.length === 0
+                      && Math.abs(prior.start - event.start) < 1e-8)) events.push(event);
+                    memberIndex++;
+                    memberIndexes.set(annotation, memberIndex);
+                    memberStart = finish;
+                  }
+                }
+              }
+              const pendingTuplet = scopedTuplets.filter((item) => item.part === voice
                   && (memberIndexes.get(item) ?? 0) < item.members!.length)
-                  .sort((left, right) => left.offset - right.offset)[0]
-                : undefined;
+                  .sort((left, right) => left.offset - right.offset)[0];
               const pendingStart = pendingTuplet
                 ? pendingTuplet.offset + pendingTuplet.members!
                   .slice(0, memberIndexes.get(pendingTuplet) ?? 0)
                   .reduce((sum, value) => sum + value * 2 / 3, 0)
                 : Infinity;
+              // A shared bracket may omit an ordinary zero before its next
+              // visible pitch. Do not let that queued rest block the pitched
+              // ordinary event or make it consume a later Tuplet member.
+              // Materialize the omitted rest at its persisted voice time.
+              if (component.pitches.length > 0) {
+                const nextOrdinaryPitch = ordinaryList.slice(ordinaryIndex + 1)
+                  .find((item) => !item.rest)?.offset ?? Infinity;
+                const nextPitchedStart = Math.min(pendingStart, nextOrdinaryPitch);
+                while (candidate?.rest
+                  && candidate.offset + candidate.duration <= nextPitchedStart + 1e-8) {
+                  const restStart = candidate.offset - groupOffset;
+                  const restEnd = restStart + candidate.duration;
+                  if (restEnd > restStart + 1e-9
+                    && !events.some((event) => event.voiceIndex === voice
+                      && event.restVoiceIndexes?.includes(voice)
+                      && Math.abs(event.start - (absoluteStart + restStart)) < 1e-8)) {
+                    events.push({
+                      start: absoluteStart + restStart, end: absoluteStart + restEnd,
+                      pitches: [], restVoiceIndexes: [voice], voiceIndex: voice,
+                      sourceGroupKey, sourceGroupEnd: absoluteStart + containerLimit,
+                      writtenDurations: [candidate.duration], metadataVoice: true,
+                    });
+                  }
+                  ordinaryIndex++;
+                  ordinaryIndexes.set(voice, ordinaryIndex);
+                  candidate = ordinaryList[ordinaryIndex];
+                }
+              }
               const ordinary = candidate && candidate.rest === (component.pitches.length === 0 && component.rest)
-                && (candidate.offset <= pendingStart + 1e-8
+                && ((candidate.offset <= pendingStart + 1e-8
                   || (pendingTuplet && candidate.offset >= pendingTuplet.end! - 1e-8
                     && pendingTuplet.memberRests?.slice(memberIndexes.get(pendingTuplet) ?? 0)
-                      .every((rest) => rest)))
+                      .every((rest) => rest)
+                    && (!candidate.rest || Math.abs(atom.nominalDuration
+                      - pendingTuplet.members![memberIndexes.get(pendingTuplet) ?? 0]!) > 1e-8))))
                 ? candidate : null;
-              const local = ordinary?.offset ?? groupOffset + (voiceCursors[voice] ?? aligned);
-              const annotation = ordinary ? null : ordinaryByVoice.size > 0
-                ? pendingTuplet ?? null
-                : scopedTuplets.find((candidate) => candidate.part === voice
-                  && candidate.offset <= local + 1 / 192
-                  && candidate.end! > local + 1 / 384) ?? null;
+              // Each annotated voice owns its next unconsumed member even
+              // when its first onset falls between the other voice's cells.
+              // A display cursor before that onset must not turn the member
+              // into an ordinary note or shift it to the bracket's start.
+              const annotation = ordinary ? null : pendingTuplet ?? null;
               const memberIndex = annotation ? memberIndexes.get(annotation) ?? 0 : -1;
               const printed = annotation?.members?.[memberIndex]
                 ?? (atom.explicitDuration ? atom.nominalDuration : minimumUnit);
@@ -3738,7 +3813,10 @@ function parseGroup(
                   ? annotation.offset - groupOffset
                     + annotation.members!.slice(0, memberIndex).reduce((sum, value) => sum + value * 2 / 3, 0)
                   : voiceCursors[voice] ?? aligned;
-              const finish = Math.min(containerLimit, start + duration);
+              // A voice's ordinary clock can extend beyond this printed
+              // bracket. The container only bounds the shared TXT ruler; the
+              // persisted ordinary timing owns its full note or rest span.
+              const finish = ordinary ? start + duration : Math.min(containerLimit, start + duration);
               if (finish <= start + 1e-9) continue;
               const event: TimedEvent = {
                 start: absoluteStart + start,
@@ -3749,11 +3827,13 @@ function parseGroup(
                 sourceGroupEnd: absoluteStart + containerLimit,
                 writtenDurations: [finish - start],
                 voiceIndex: voice,
+                metadataVoice: true,
               };
               if (annotation) {
                 event.tripletGroup = `${sourceGroupKey}:triplet:${index}:v${voice}:${annotation.offset}`;
                 event.tripletIndex = memberIndex;
                 event.tripletEnd = absoluteStart + finish;
+                event.tripletScope = "voice";
                 event.tripletCrossBeat = containerLimit > targetDuration + 1e-8;
                 memberIndexes.set(annotation, memberIndex + 1);
               }
@@ -3762,6 +3842,30 @@ function parseGroup(
               lastEventByVoice.set(voice, event);
               latestEvent = !latestEvent || event.start >= latestEvent.start ? event : latestEvent;
               voiceCursors[voice] = finish;
+            }
+          }
+          // A compact shared bracket can omit a parallel voice's ordinary 0
+          // entirely. Its persisted timing still owns silence past the other
+          // voice's last tuplet member, so restore unconsumed rests even when
+          // there was no printed atom to consume them in the loop above.
+          for (const [voice, list] of ordinaryByVoice) {
+            for (const ordinary of list.slice(ordinaryIndexes.get(voice) ?? 0)) {
+              if (!ordinary.rest) continue;
+              const start = absoluteStart + ordinary.offset - groupOffset;
+              const end = Math.min(absoluteStart + measureDuration - groupOffset,
+                start + ordinary.duration);
+              if (end <= start + 1e-9 || events.some((event) =>
+                event.voiceIndex === voice && event.pitches.length === 0
+                && Math.abs(event.start - start) < 1 / 192)) continue;
+              const event: TimedEvent = {
+                start, end, pitches: [], restVoiceIndexes: [voice],
+                sourceGroupKey, sourceGroupEnd: absoluteStart + containerLimit,
+                writtenDurations: [end - start], voiceIndex: voice, metadataVoice: true,
+              };
+              events.push(event);
+              lastEventByVoice.set(voice, event);
+              latestEvent = !latestEvent || event.start >= latestEvent.start ? event : latestEvent;
+              voiceCursors[voice] = Math.max(voiceCursors[voice] ?? 0, end - absoluteStart);
             }
           }
           // Compact overlapping-voice serialization omits interior visible
@@ -3792,9 +3896,11 @@ function parseGroup(
                 sourceGroupEnd: absoluteStart + containerLimit,
                 writtenDurations: [finish - start],
                 voiceIndex: voice,
+                metadataVoice: true,
                 tripletGroup: `${sourceGroupKey}:triplet:${index}:v${voice}:${annotation.offset}`,
                 tripletIndex: memberIndex,
                 tripletEnd: absoluteStart + finish,
+                tripletScope: "voice",
                 tripletCrossBeat: containerLimit > targetDuration + 1e-8,
               };
               events.push(event);
@@ -3836,6 +3942,7 @@ function parseGroup(
           ? explicitTimedContainerVoice(outerBody)
           : null;
         const parallelVoice = options.voiceCount > 1 ? explicitVoice : null;
+        clearParallelTupletSilence(parallelVoice);
         if (leadingTripletDuration > 1e-9) {
           const finish = Math.min(targetDuration, cursor + leadingTripletDuration * factor);
           const source = lastEvent ?? previousEvent;
@@ -3903,6 +4010,7 @@ function parseGroup(
             && annotation.part === parallelVoice
             && annotation.measure === measureIndex
             && Math.abs(annotation.offset - (groupOffset + cursor)) < 1 / 192);
+        if (cursorOwnedParallelTriplet) hasOwnedParallelTuplet = true;
         if (cursorOwnedParallelTriplet
           && lastAtom
           && lastAtom.pitches.length === 0
@@ -4255,6 +4363,7 @@ export function slashScoreDiagnostics(
         && annotation.offset < groupOffset + targetForGroup - 1 / 192
         && annotation.end > groupOffset + 1 / 192)
         .sort((left, right) => left.offset - right.offset || right.end! - left.end!);
+      let tupletCorrection = 0;
       if (metadataTuplets.length > 0) {
         const clusters: Array<{ start: number; end: number; sliced: boolean }> = [];
         for (const annotation of metadataTuplets) {
@@ -4300,6 +4409,29 @@ export function slashScoreDiagnostics(
             ? cluster.end - cluster.start
             : Math.min(cluster.end, groupOffset + targetForGroup) - Math.max(cluster.start, groupOffset);
           duration += actual - naive;
+          tupletCorrection += actual - naive;
+        }
+        // Separate printed triplet brackets contribute to one beat ruler.
+        // The scalar scanner caps parallel voices before these brackets are
+        // reconciled, so applying their differences afterward can invent a
+        // short beat. Use its uncapped syntax duration when every complete
+        // metadata cluster has exactly one printed bracket in this beat.
+        // Suffix duration glyphs remain part of that syntax duration.
+        const completeIndependentClusters = startingClusters.length >= 2
+          && startingClusters.length === clusters.length
+          && startingClusters.length === containers.length
+          && clusters.every((cluster) => !cluster.sliced
+            && cluster.start >= groupOffset - 1e-8
+            && cluster.end <= groupOffset + targetForGroup + 1e-8)
+          && metadataTuplets.every((annotation) =>
+            (annotation.ordinary ?? []).every((ordinary) =>
+              ordinary.offset + ordinary.duration <= groupOffset + targetForGroup + 1e-8));
+        if (completeIndependentClusters) {
+          duration = segmentMarkerDuration(
+            group, mappings, options.braceMode, options.noteDivision,
+            options.bracketMode ?? "triplet", options, undefined,
+            semanticMordentInGroup, options.voiceCount, false,
+          ) + tupletCorrection;
         }
       }
       if (isRestOnlyGroup(group, options) || group.length === 0) {
@@ -4491,7 +4623,7 @@ function splitTimedEventsByVoice(
     for (let index = cursor; index < events.length; index++) {
       if (consumed.has(index) || events[index].continuationOf) continue;
       const actual = [...events[index].pitches].sort((a, b) => a - b);
-      if (containsPitchMultiplicity(actual, expected)) {
+      if (actual.length === expected.length && containsPitchMultiplicity(actual, expected)) {
         matched = index;
         break;
       }
@@ -4499,6 +4631,7 @@ function splitTimedEventsByVoice(
     if (matched < 0) {
       matched = events.findIndex((event, index) =>
         !consumed.has(index) && !event.continuationOf
+        && event.pitches.length === expected.length
         && containsPitchMultiplicity(event.pitches, expected));
     }
     if (matched < 0) continue;
@@ -4859,11 +4992,19 @@ function addIndependentVoiceContinuations(
     const attacks = ordered.filter((event) => !event.continuationOf);
     attacks.forEach((attack, index) => {
       let nextStart = attacks[index + 1]?.start ?? scoreEnd;
-      let chain = (continuationsByVoice.get(voice)?.get(attack) ?? [])
+      const sourceChain = continuationsByVoice.get(voice)?.get(attack) ?? [];
+      // A shared duration ruler can refer back past a voice-local tuplet.
+      // A new attack in this voice ends the preceding sound: its printed
+      // continuation must not survive underneath that attack or later notes.
+      for (const continuation of sourceChain) {
+        if (continuation.start >= nextStart - 1e-8) removed.add(continuation);
+      }
+      let chain = sourceChain
         .filter((event) => event.start > attack.start + 1e-8
           && event.start < nextStart - 1e-8);
       const memberEnd = attack.tripletBeatRuler ? nextStart
-        : attack.tripletCrossBeat ? attack.tripletEnd : undefined;
+        : attack.tripletCrossBeat || attack.tripletScope === "voice"
+          ? attack.tripletEnd : undefined;
       if (memberEnd !== undefined && memberEnd < nextStart - 1e-8
         && !chain.some((event) => !event.syntheticContinuation
           && Math.abs(event.start - memberEnd) <= 1e-8)) {
@@ -4992,14 +5133,21 @@ function parsedMidiFromEvents(
     }
   } else {
     for (let voice = 0; voice < options.voiceCount; voice++) {
-      const attacks = new Map<number, { start: number; pitches: number[] }>();
+      const attacks = new Map<number, { start: number; end: number; pitches: number[] }>();
       for (const event of events) {
         if ((event.voiceIndex ?? options.voiceCount - 1) !== voice) continue;
         if (event.continuationOf) continue;
         const key = Math.round(event.start * 192);
-        const attack = attacks.get(key) ?? { start: event.start, pitches: [] };
+        const attack = attacks.get(key) ?? { start: event.start, end: event.end, pitches: [] };
+        attack.end = Math.max(attack.end, event.end);
         attack.pitches.push(...event.pitches);
         attacks.set(key, attack);
+      }
+      for (const event of events) {
+        if ((event.voiceIndex ?? options.voiceCount - 1) !== voice || !event.continuationOf) continue;
+        const root = continuationRoot(event);
+        const attack = attacks.get(Math.round(root.start * 192));
+        if (attack) attack.end = Math.max(attack.end, event.end);
       }
       const continuationStarts = [...new Set(events
         .filter((event) =>
@@ -5009,7 +5157,10 @@ function parsedMidiFromEvents(
         .sort((left, right) => left - right);
       const ordered = [...attacks.values()].sort((left, right) => left.start - right.start);
       ordered.forEach((attack, index) => {
-        const end = ordered[index + 1]?.start ?? endQuarter;
+        // Per-voice events already include their legitimate continuation
+        // chains. Respect that end, especially the silence after a closed
+        // tuplet, instead of stretching its last pitch to the next attack.
+        const end = Math.min(attack.end, ordered[index + 1]?.start ?? endQuarter);
         const boundaries = [
           attack.start,
           ...continuationStarts.filter((start) =>
@@ -5587,9 +5738,13 @@ function applySlashTuplets(
           detachSlashChord(entry);
           return false;
         }
-        if (entry.rest
-          && absolute > sustainEnd + 1e-8
+        if (absolute > sustainEnd + 1e-8
           && absolute < boundaryEnd - 1e-8) {
+          // The boundary attack was restored to its exact source duration.
+          // Remove every provisional piece inside that span, including tied
+          // pitched fragments left by the binary bridge, not just rests.
+          // Otherwise its former tail becomes a second attack underneath it.
+          detachSlashChord(entry);
           return false;
         }
         return absolute < groupStart - 1e-8 || absolute >= sustainEnd - 1e-8;
@@ -5719,10 +5874,12 @@ function applySlashTuplets(
  * as a gray continuation of the Tuplet's last pitch. */
 function applySlashExplicitRests(score: Score, events: readonly TimedEvent[]): void {
   const rests = events.filter((event) =>
-    !event.continuationOf
-    && !event.tripletGroup
+    !event.tripletGroup
     && event.pitches.length === 0
-    && event.end > event.start + 1e-8);
+    && event.end > event.start + 1e-8
+    && (!continuationRoot(event).tripletGroup
+      || event.start >= (continuationRoot(event).tripletEnd ?? event.start) - 1e-8));
+  // A rest split at a slash boundary is still silence in every segment.
   for (const event of rests) {
     const partIndex = clamp(event.voiceIndex ?? 0, 0, Math.max(0, score.parts.length - 1));
     const part = score.parts[partIndex];
@@ -6412,6 +6569,35 @@ export function parseSlashScore(text: string, baseOptions: SlashScoreOptions): S
       ignoredCharacters += result.ignored;
     });
   });
+  // Explicitly voiced brackets do not use the metadataTimedContainer branch.
+  // Restore ordinary silence following their final member from the same
+  // persisted timing used by merged brackets. Some shared rulers omit the 0
+  // while a different voice sounds across the boundary.
+  for (const annotation of options.annotations ?? []) {
+    if (annotation.type !== "triplet" || annotation.scope !== "voice"
+      || annotation.end === undefined) continue;
+    const measureStart = measureStarts[annotation.measure];
+    const meter = measureMeters[annotation.measure];
+    if (measureStart === undefined || !meter) continue;
+    const measureEnd = measureStart + meter.beats * 4 / meter.beatType;
+    for (const ordinary of annotation.ordinary ?? []) {
+      if (!ordinary.rest || ordinary.part !== annotation.part
+        || ordinary.offset < annotation.end - 1e-8) continue;
+      const start = measureStart + ordinary.offset;
+      const end = Math.min(measureEnd, start + ordinary.duration);
+      if (end <= start + 1e-8) continue;
+      const sameVoice = (event: TimedEvent): boolean => event.voiceIndex === ordinary.part
+        || (event.restVoiceIndexes ?? []).includes(ordinary.part);
+      if (events.some((event) => !event.continuationOf && sameVoice(event) && event.pitches.length > 0
+        && Math.abs(event.start - start) < 1 / 192)) continue;
+      const existing = events.find((event) => sameVoice(event) && event.pitches.length === 0
+        && Math.abs(event.start - start) < 1 / 192);
+      if (existing) { existing.end = Math.max(existing.end, end); continue; }
+      events.push({ start, end, pitches: [], voiceIndex: ordinary.part,
+        restVoiceIndexes: [ordinary.part], metadataVoice: true,
+        writtenDurations: [end - start] });
+    }
+  }
   const firstEvents = events.filter((event) => event.start < measureLength - 1e-8 && event.end > 1e-8);
   const pickupCandidate = pickupTargetQuarterNotes > 1e-8 && firstEvents.length > 0;
   if (clippedGroups > 0) warnings.push(`${clippedGroups} 个拍组超过所选拍号，已在拍组边界截齐`);
@@ -6426,9 +6612,42 @@ export function parseSlashScore(text: string, baseOptions: SlashScoreOptions): S
   if (strayMarkers > 0) warnings.push(`${strayMarkers} 个后面没有音高的声部标记已忽略`);
 
   if (!wholeMeasureGroups && lines.score.length === 1 && logicalMeasures.length > 1) warnings.push(`原文没有小节换行，已按 ${options.beats}/${options.beatType} 自动分成 ${logicalMeasures.length} 小节`);
+  const splitEvents = splitTimedEventsByVoice(options, events, sources);
+  // A parallel ordinary value can outlast a voice-local bracket. In an
+  // explicitly voiced bracket the visible shared ruler only supplies its
+  // first part; the annotation retains the original note's full endpoint.
+  for (const annotation of options.annotations ?? []) {
+    if (annotation.type !== "triplet" || annotation.end === undefined) continue;
+    const measureStart = measureStarts[annotation.measure];
+    const meter = measureMeters[annotation.measure];
+    if (measureStart === undefined || !meter) continue;
+    const measureEnd = measureStart + meter.beats * 4 / meter.beatType;
+    for (const ordinary of annotation.ordinary ?? []) {
+      if (ordinary.rest || ordinary.offset + ordinary.duration <= annotation.end + 1e-8) continue;
+      const start = measureStart + ordinary.offset;
+      const end = Math.min(measureEnd, start + ordinary.duration);
+      const attack = splitEvents.find((event) => event.voiceIndex === ordinary.part
+        && !event.continuationOf && event.pitches.length > 0
+        && Math.abs(event.start - start) < 1 / 192);
+      if (!attack) continue;
+      if (end > attack.end) attack.end = end;
+      // The shared ruler can print its following 0 at the bracket boundary
+      // even though this ordinary voice is still sounding. Keep only the
+      // part of that rest after its persisted note-off.
+      for (let index = splitEvents.length - 1; index >= 0; index--) {
+        const rest = splitEvents[index]!;
+        if (rest.voiceIndex !== ordinary.part || rest.pitches.length > 0
+          || rest.tripletGroup || rest.start < start - 1e-8
+          || rest.start >= end - 1e-8) continue;
+        if (rest.end <= end + 1e-8) { splitEvents.splice(index, 1); continue; }
+        rest.start = end;
+        rest.writtenDurations = [rest.end - end];
+      }
+    }
+  }
   const voicedEvents = addIndependentVoiceContinuations(
     splitVoicedWrittenDurations(
-      splitTimedEventsByVoice(options, events, sources),
+      splitEvents,
       options,
     ),
     options,
@@ -6531,8 +6750,11 @@ export function parseSlashScore(text: string, baseOptions: SlashScoreOptions): S
     imported.score.instrumentName = "";
   }
   restoreSlashDuplicatePitches(imported.score, voicedEvents);
-  applySlashContinuations(imported.score, voicedEvents);
   applySlashTuplets(imported.score, voicedEvents, options.annotations ?? []);
+  // Tuplet reconstruction removes pitches introduced by binary quantization
+  // at the following attack. Match and link ordinary continuations only after
+  // that cleanup, when the adjacent chords contain their actual pitches.
+  applySlashContinuations(imported.score, voicedEvents);
   // A written 0 remains authoritative even when the export preference hides
   // ordinary rests. Input drafts deliberately retain these cells; dropping
   // one after a tuplet loses the editable silence at its binary boundary.
@@ -7336,14 +7558,6 @@ function preserveScoreTuplets(
           && !event.parallelVoiceTuplet && event.specialToken !== undefined
           && event.specialToken !== "0" && event.start <= start + 1e-8
           && event.start + event.embeddedDuration > start + 1e-8)) continue;
-        const followsSameVoiceTupletRest = measure.entries.some((candidate) =>
-          candidate instanceof Chord
-          && candidate.rest
-          && candidate.position.plus(candidate.duration ?? new Fraction(0)).equals(entry.position)
-          && candidate.notes.some((note) => note.rest
-            && note.tuplet !== null
-            && note.tupletEnd
-            && clamp(note.tuplet.voiceIndex ?? partIndex + 1, 1, voiceCount) === partIndex + 1));
         const followsSameVoiceTupletBoundary = measure.entries.some((candidate) =>
           candidate instanceof Chord
           && candidate.position.plus(candidate.duration ?? new Fraction(0)).equals(entry.position)
@@ -7357,15 +7571,23 @@ function preserveScoreTuplets(
             return candidate.position.compareTo(entry.position) < 0
               && candidateEnd.compareTo(entry.position) > 0;
           }));
-        if (followsSameVoiceTupletRest
-          || (followsSameVoiceTupletBoundary && parallelSoundAcrossBoundary)) {
-          // Silence immediately following a final Tuplet zero can stay on the
-          // shared duration ruler. Writing another voiced `0` produced
-          // `[AN0].0.A.` instead of the stable compact `[AN0]..A.` spelling.
-          // The same applies when the final member is sounding but another
-          // voice crosses the Tuplet boundary: that other voice receives an
+        // A rest before a fresh attack later in this slash beat is a real
+        // separation in its own voice. Clearing its zero would turn the
+        // preceding ruler into a prefix of that later note on reload.
+        const groupEnd = (Math.floor((start + 1e-8) / beatDuration) + 1) * beatDuration;
+        const laterAttackInGroup = measure.entries.some((candidate) =>
+          candidate instanceof Chord && !candidate.rest
+          && !candidate.generatedTimingContinuation
+          && !candidate.transparentContinuation
+          && candidate.notes.some((note) => !note.rest && !note.tieEnd)
+          && candidate.position.toFloat() > start + 1e-8
+          && candidate.position.toFloat() < groupEnd - 1e-8);
+        if (followsSameVoiceTupletBoundary && parallelSoundAcrossBoundary
+          && !laterAttackInGroup) {
+          // When another voice crosses the Tuplet boundary, it receives an
           // explicit continuation prefix, so this lane is already known to
-          // stop at the bracket and needs no extra visible zero.
+          // stop at the bracket. Otherwise preserve the following rest:
+          // removing it makes a later filled final member sustain on reload.
           // Remove only this voice's explicit rest payload; retaining the
           // empty timing event still advances the common cursor and preserves
           // simultaneous notes/rests from all other voices.
@@ -7415,11 +7637,13 @@ function measureEvents(score: Score, measureIndex: number): OutputEvent[] {
     restVoiceIndexes: number[];
   }>();
   for (let partIndex = 0; partIndex < score.parts.length; partIndex++) {
+    const activeAttacks = new Map<number, { key: number; end: number }>();
     const part = score.parts[partIndex];
     const measure = part.measures[measureIndex];
     if (!measure) continue;
-    for (const entry of measure.entries) {
-      if (!(entry instanceof Chord)) continue;
+    const chords = measure.entries.filter((entry): entry is Chord => entry instanceof Chord)
+      .sort((left, right) => left.position.compareTo(right.position));
+    for (const entry of chords) {
       const rest = entry.rest || entry.notes.every((note) => note.rest);
       const sounding = entry.notes.filter((note) => !note.rest);
       // A transparent slash continuation or an explicit JPW tie-stop advances
@@ -7442,7 +7666,24 @@ function measureEvents(score: Score, measureIndex: number): OutputEvent[] {
         restVoiceIndexes: [],
       };
       if (entry.generatedTimingContinuation || continuation) {
-        item.continuationEnds.push(start + duration);
+        // Split tie segments are one sounding attack. Keep their final end on
+        // the original event so a later slash group sees active sound rather
+        // than converting its continuation into a rest or empty beat.
+        let attached = false;
+        for (const note of sounding) {
+          const active = activeAttacks.get(note.pitch);
+          const root = active && active.end >= start - 1 / 192
+            ? grouped.get(active.key) : undefined;
+          if (!root || !active) continue;
+          root.attackEnds.push(start + duration);
+          active.end = Math.max(active.end, start + duration);
+          attached = true;
+        }
+        if (!attached) {
+          item.continuationEnds.push(start + duration);
+          grouped.set(key, item);
+        }
+        continue;
       } else if (rest) {
         item.restEnds.push(start + duration);
         item.restVoiceIndexes.push(partIndex + 1);
@@ -7450,6 +7691,7 @@ function measureEvents(score: Score, measureIndex: number): OutputEvent[] {
         item.attackEnds.push(start + duration);
         item.chords.push(entry);
         item.voiceIndexes.push(partIndex + 1);
+        for (const note of sounding) activeAttacks.set(note.pitch, { key, end: start + duration });
       }
       grouped.set(key, item);
     }
@@ -8465,6 +8707,38 @@ export function scoreToSlashScore(
         groupDuration,
       );
     }
+    // A tie entering this measure has no attack event in measureEvents():
+    // the preceding measure owns its root. Keep its transparent continuation
+    // sounding when draft-rest preservation is enabled for this measure.
+    const continuationSpans = score.parts.flatMap((part) =>
+      (part.measures[measureIndex]?.entries ?? [])
+        .filter((entry): entry is Chord => entry instanceof Chord
+          && !entry.rest && entry.notes.some((note) => !note.rest)
+          && (entry.generatedTimingContinuation || entry.transparentContinuation
+            || entry.notes.filter((note) => !note.rest).every((note) => note.tieEnd)))
+        .map((entry) => ({
+          start: entry.position.toFloat(),
+          end: entry.position.plus(entry.duration ?? new Fraction(1, 192)).toFloat(),
+        })));
+    // A beat-sliced voice Tuplet can hide the shared source event for a
+    // parallel whole note. Keep its original sounding span when deciding
+    // whether an otherwise empty beat needs a draft rest.
+    const sourceSoundSpans = score.parts.flatMap((part, partIndex) =>
+      (part.measures[measureIndex]?.entries ?? [])
+        .filter((entry): entry is Chord => entry instanceof Chord
+          && !entry.rest && entry.notes.some((note) => !note.rest))
+        .map((entry) => ({
+          voice: clamp(partIndex + 1, 1, voiceCount),
+          start: entry.position.toFloat(),
+          end: entry.position.plus(entry.duration ?? new Fraction(1, 192)).toFloat(),
+        })));
+    const silentVoicesAt = (position: number): number[] => {
+      const sounding = new Set(sourceSoundSpans
+        .filter((span) => span.start <= position + 1e-8 && span.end > position + 1e-8)
+        .map((span) => span.voice));
+      return Array.from({ length: voiceCount }, (_unused, index) => index + 1)
+        .filter((voice) => !sounding.has(voice));
+    };
     const segments: string[] = [];
     for (let groupIndex = 0; groupIndex < groups; groupIndex++) {
       const start = groupIndex * groupDuration;
@@ -8496,7 +8770,13 @@ export function scoreToSlashScore(
           (event.restVoiceIndexes?.length ?? 0) > 0))
         || attacks.some((event) => event.specialToken !== undefined
           && event.specialToken !== "" && event.specialToken !== "0");
-      if (!hasNewSound) {
+      const soundingIntoGroup = activeBeforeGroup.some((event) =>
+        event.chords.some((chord) => chord.notes.some((note) => !note.rest)))
+        || continuationSpans.some((span) =>
+          span.start <= start + 1e-8 && span.end > start + 1e-8);
+      // A held note needs the normal continuation writer even when this beat
+      // contains no fresh attack. The rest-only shortcut would truncate it.
+      if (!hasNewSound && !soundingIntoGroup) {
         const coveredByContainer = activeBeforeGroup.some((event) =>
           event.embeddedDuration !== undefined && !event.parallelVoiceTuplet
           && event.start + event.embeddedDuration >= end - 1e-8);
@@ -8506,19 +8786,16 @@ export function scoreToSlashScore(
           segments.push(durationText(groupDuration) || symbol);
           continue;
         }
-        const soundingIntoGroup = activeBeforeGroup.some((event) => event.chords.length > 0);
-        if (preserveInputRests && !soundingIntoGroup) {
-          // Input-mode draft measures must survive a TXT round-trip as real
-          // silence. A whole-measure rest only begins in the first group, so
-          // checking `attacks` alone made later groups become bare duration
-          // glyphs; the next parse then treated those glyphs as sustain.
-          const restVoiceIndexes = [...new Set([
-            ...attacks.flatMap((event) => event.restVoiceIndexes ?? []),
-            ...activeBeforeGroup.flatMap((event) => event.restVoiceIndexes ?? []),
-          ])];
-          const voices = restVoiceIndexes.length > 0
-            ? restVoiceIndexes
-            : Array.from({ length: voiceCount }, (_unused, index) => index + 1);
+        if (preserveInputRests) {
+          // The visible event may have been hidden by a beat-sliced Tuplet.
+          // Derive each voice's actual silence from the source Score: a V1
+          // rest must not stop a V2 whole note, and a bare ruler must not
+          // extend V1's final pitched member through an empty following beat.
+          const voices = silentVoicesAt(start);
+          if (voices.length === 0) {
+            segments.push(durationText(groupDuration) || symbol);
+            continue;
+          }
           const restEvent: OutputEvent = {
             start,
             end,
@@ -8625,7 +8902,25 @@ export function scoreToSlashScore(
         appendMarkers(Math.max(0, eventEnd - eventStart - intrinsic));
         cursor = Math.max(cursor, eventEnd);
       });
-      if (cursor < end - 1e-8) appendMarkers(end - cursor);
+      if (cursor < end - 1e-8) {
+        const trailingSound = inGroup.some((event) => event.chords.length > 0
+          && Math.abs(event.end - cursor) < 1e-8);
+        const parallelTupletRuler = inGroup.some((event) =>
+          event.parallelVoiceTuplet && event.embeddedDuration !== undefined);
+        const silentVoices = silentVoicesAt(cursor);
+        if (trailingSound && !parallelTupletRuler && silentVoices.length > 0) {
+          // A short attack can leave real silence at the end of a slash group
+          // without a Chord rest in the Score. Bare ruler marks would extend
+          // that attack, so terminate it with an explicit zero first.
+          out += outputToken({ start: cursor, end, chords: [], voiceIndexes: [],
+            restVoiceIndexes: silentVoices, specialToken: "0" },
+          kind, fifthsAt(cursor), voiceCount, ordering, exportGroups) || "0";
+          continuationMarkerVoice = null;
+          appendMarkers(Math.max(0, end - cursor - noteUnit));
+        } else {
+          appendMarkers(end - cursor);
+        }
+      }
       segments.push(out || durationText(groupDuration) || symbol);
     }
     const previousMeasure = measureIndex > 0 ? score.parts[0]?.measures[measureIndex - 1] : undefined;
@@ -8793,6 +9088,14 @@ export function notationAnnotationsFromScore(score: Score): NotationAnnotationDa
             const end = chord.position.plus(chord.duration ?? new Fraction(0));
             return end.compareTo(latest) > 0 ? end : latest;
           }, first.position);
+        const beat = measure.time.beatType === 8 && measure.time.beats >= 6
+          && measure.time.beats % 3 === 0 ? 1.5 : 4 / measure.time.beatType;
+        const restCutoff = (Math.floor(actualEnd.toFloat() / beat + 1e-10) + 1) * beat;
+        const parallelCrossesEnd = score.parts.some((otherPart, otherIndex) =>
+          otherIndex !== partIndex && (otherPart.measures[measure.index]?.entries ?? []).some((candidate) =>
+            candidate instanceof Chord && !candidate.rest
+            && candidate.position.compareTo(actualEnd) < 0
+            && candidate.position.plus(candidate.duration ?? new Fraction(0)).compareTo(actualEnd) > 0));
         result.push({
           type: "triplet",
           part: tuplet.partIndex ?? partIndex,
@@ -8811,7 +9114,11 @@ export function notationAnnotationsFromScore(score: Score): NotationAnnotationDa
               if (!(entry instanceof Chord) || entry.generatedTimingContinuation
                 || entry.notes.some((note) => note.tuplet)
                 || entry.position.compareTo(first.position) < 0
-                || entry.position.compareTo(actualEnd) >= 0 || !entry.duration) return [];
+                || !entry.duration) return [];
+              const followingRest = parallelIndex === partIndex && parallelCrossesEnd
+                && entry.rest && entry.position.compareTo(actualEnd) >= 0
+                && entry.position.toFloat() < restCutoff - 1e-8;
+              if (entry.position.compareTo(actualEnd) >= 0 && !followingRest) return [];
               return [{ part: parallelIndex, offset: entry.position.toFloat(),
                 duration: entry.duration.toFloat(), rest: entry.rest }];
             })),

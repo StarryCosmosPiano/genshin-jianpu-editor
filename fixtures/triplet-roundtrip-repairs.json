@@ -1,0 +1,69 @@
+[
+  {
+    "id": "R123-S1",
+    "operation": {
+      "part": 2,
+      "measure": 1,
+      "offset": "0",
+      "changed": true,
+      "span": "1/2"
+    },
+    "beforeText": "数字谱\n// 每行一小节，/ 分隔拍组；未识别的其他文字作为注释保留。\n标题 = 数字谱\n1 = C\n4/4拍：\n速度 = 每分钟90四分音符(90 BPM)\n. = 16分音符\n花括号 = 琶音（括号内两个及以上音按滚奏和弦处理）\n方括号 = 三连音（括号内三个时值按 3:2 压缩）\n尖括号 = 倚音（装饰音不增加小节拍长）\n圆括号 = 和弦（括号内音符同时发声）\n\n(-1⁣6).⁣5.[⁣⁣-2⁣⁣0⁣⁣0].-1./.-4.-7../-7.(-5⁣4).⁣4../⁣1.(-7⁣2)..(-2⁣3)./\n(-5⁣2).-1..-2./⁣7.⁣6.⁣4../⁣1..⁣7.-4./⁣3..⁣5.(-3⁣7)./\n\n// @jpeditor {\"v\":2,\"vc\":2,\"k\":\"n\",\"kl\":false,\"kz\":false,\"kh\":false,\"n\":\"\",\"bpm\":90,\"bu\":\"quarter\",\"f\":0,\"m\":[4,4],\"s\":{\".\":16},\"ms\":false,\"sp\":null,\"nd\":null,\"er\":false,\"ri\":true,\"b\":\"a\",\"q\":\"t\",\"vb\":\"n\",\"x\":\"g\",\"p\":\"c\",\"o\":\"pitch-asc\",\"i\":\"钢琴\",\"an\":[{\"type\":\"triplet\",\"part\":1,\"voice\":2,\"measure\":0,\"offset\":0.5,\"scope\":\"voice\",\"end\":0.75,\"members\":[0.125,0.125,0.125],\"memberRests\":[false,true,true],\"restoreUnit\":0.25}]}\n"
+  },
+  {
+    "id": "R528-S1",
+    "operation": {
+      "part": 2,
+      "measure": 2,
+      "offset": "11/4",
+      "changed": true,
+      "span": "1/4"
+    },
+    "beforeText": "键盘谱\n// 每行一小节，/ 分隔拍组；未识别的其他文字作为注释保留。\n标题 = 键盘谱\n1 = C\n4/4拍：\n速度 = 每分钟90四分音符(90 BPM)\n. = 16分音符\n花括号 = 琶音（括号内两个及以上音按滚奏和弦处理）\n方括号 = 三连音（括号内三个时值按 3:2 压缩）\n尖括号 = 倚音（装饰音不增加小节拍长）\n圆括号 = 和弦（括号内音符同时发声）\n\n(X⁣H)..(B⁣G)../(X⁣H)..(C⁣G)../⁣F..V../M..../\n(V⁣G).⁣A.../V.(V⁣F).⁣S../.[⁣⁣N.⁣⁣X.⁣A⁣⁣C.]V./(Z⁣F)..(B⁣S)../\n\n// @jpeditor {\"v\":2,\"vc\":2,\"k\":\"k\",\"kl\":false,\"kz\":false,\"kh\":false,\"n\":\"\",\"bpm\":90,\"bu\":\"quarter\",\"f\":0,\"m\":[4,4],\"s\":{\".\":16},\"ms\":false,\"sp\":null,\"nd\":null,\"er\":false,\"ri\":false,\"b\":\"a\",\"q\":\"t\",\"vb\":\"n\",\"x\":\"g\",\"p\":\"c\",\"o\":\"pitch-asc\",\"i\":\"钢琴\",\"an\":[{\"type\":\"triplet\",\"part\":1,\"voice\":2,\"measure\":1,\"offset\":2.25,\"scope\":\"voice\",\"end\":2.75,\"members\":[0.25,0.25,0.25],\"memberRests\":[false,false,false],\"restoreUnit\":0.5,\"ordinary\":[{\"part\":0,\"offset\":2.5,\"duration\":0.5,\"rest\":false}]}]}\n"
+  },
+  {
+    "id": "R1094-S1",
+    "operation": {
+      "part": 2,
+      "measure": 1,
+      "offset": "15/4",
+      "changed": true,
+      "span": "1/4"
+    },
+    "beforeText": "键盘谱\n// 每行一小节，/ 分隔拍组；未识别的其他文字作为注释保留。\n标题 = 键盘谱\n1 = C\n4/4拍：\n速度 = 每分钟90四分音符(90 BPM)\n. = 16分音符\n花括号 = 琶音（括号内两个及以上音按滚奏和弦处理）\n方括号 = 三连音（括号内三个时值按 3:2 压缩）\n尖括号 = 倚音（装饰音不增加小节拍长）\n圆括号 = 和弦（括号内音符同时发声）\n\n(B⁣F)...M./..../...M./⁣D.[⁣⁣N.⁣⁣0.⁣A⁣⁣0.]Z./\n\n// @jpeditor {\"v\":2,\"vc\":2,\"k\":\"k\",\"kl\":false,\"kz\":false,\"kh\":false,\"n\":\"\",\"bpm\":90,\"bu\":\"quarter\",\"f\":0,\"m\":[4,4],\"s\":{\".\":16},\"ms\":false,\"sp\":null,\"nd\":null,\"er\":false,\"ri\":true,\"b\":\"a\",\"q\":\"t\",\"vb\":\"n\",\"x\":\"g\",\"p\":\"c\",\"o\":\"pitch-asc\",\"i\":\"钢琴\",\"an\":[{\"type\":\"triplet\",\"part\":1,\"voice\":2,\"measure\":0,\"offset\":3.25,\"scope\":\"voice\",\"end\":3.75,\"members\":[0.25,0.25,0.25],\"memberRests\":[false,true,true],\"restoreUnit\":0.5,\"ordinary\":[{\"part\":0,\"offset\":3.5,\"duration\":0.5,\"rest\":false}]}]}\n"
+  },
+  {
+    "id": "R8-S0",
+    "operation": {
+      "part": 1,
+      "measure": 1,
+      "offset": "9/4",
+      "changed": true,
+      "span": "1/2"
+    },
+    "beforeText": "键盘谱\n// 每行一小节，/ 分隔拍组；未识别的其他文字作为注释保留。\n标题 = 键盘谱\n1 = C\n4/4拍：\n速度 = 每分钟90四分音符(90 BPM)\n. = 16分音符\n花括号 = 琶音（括号内两个及以上音按滚奏和弦处理）\n方括号 = 三连音（括号内三个时值按 3:2 压缩）\n尖括号 = 倚音（装饰音不增加小节拍长）\n圆括号 = 和弦（括号内音符同时发声）\n\n(M⁣H)..N.Z./.B.../⁣S.⁣D..⁣F./.Z.V.⁣F./\n\n// @jpeditor {\"v\":2,\"vc\":2,\"k\":\"k\",\"kl\":false,\"kz\":false,\"kh\":false,\"n\":\"\",\"bpm\":90,\"bu\":\"quarter\",\"f\":0,\"m\":[4,4],\"s\":{\".\":16},\"ms\":false,\"sp\":null,\"nd\":null,\"er\":false,\"ri\":false,\"b\":\"a\",\"q\":\"t\",\"vb\":\"n\",\"x\":\"g\",\"p\":\"c\",\"o\":\"pitch-asc\",\"i\":\"钢琴\"}\n",
+    "filledText": "键盘谱\n// 每行一小节，/ 分隔拍组；未识别的其他文字作为注释保留。\n标题 = 键盘谱\n1 = C\n4/4拍：\n速度 = 每分钟90四分音符(90 BPM)\n. = 16分音符\n花括号 = 琶音（括号内两个及以上音按滚奏和弦处理）\n方括号 = 三连音（括号内三个时值按 3:2 压缩）\n尖括号 = 倚音（装饰音不增加小节拍长）\n圆括号 = 和弦（括号内音符同时发声）\n\n(M⁣H)..N.Z./.B.../⁣S.[⁣D.⁣S.⁣D.]..⁣F./.Z.V.⁣F./\n\n// @jpeditor {\"v\":2,\"vc\":2,\"k\":\"k\",\"kl\":false,\"kz\":false,\"kh\":false,\"n\":\"\",\"bpm\":90,\"bu\":\"quarter\",\"f\":0,\"m\":[4,4],\"s\":{\".\":16},\"ms\":false,\"sp\":null,\"nd\":null,\"er\":false,\"ri\":true,\"b\":\"a\",\"q\":\"t\",\"vb\":\"n\",\"x\":\"g\",\"p\":\"c\",\"o\":\"pitch-asc\",\"i\":\"钢琴\",\"an\":[{\"type\":\"triplet\",\"part\":0,\"voice\":1,\"measure\":0,\"offset\":2.25,\"scope\":\"voice\",\"end\":2.75,\"members\":[0.25,0.25,0.25],\"memberRests\":[false,false,false],\"restoreUnit\":0.5}]}\n"
+  },
+  {
+    "id": "R29-S0",
+    "operation": {
+      "part": 2,
+      "measure": 1,
+      "offset": "0",
+      "changed": true,
+      "span": "1/2"
+    },
+    "beforeText": "数字谱\n// 每行一小节，/ 分隔拍组；未识别的其他文字作为注释保留。\n标题 = 数字谱\n1 = C\n4/4拍：\n速度 = 每分钟90四分音符(90 BPM)\n. = 16分音符\n花括号 = 琶音（括号内两个及以上音按滚奏和弦处理）\n方括号 = 三连音（括号内三个时值按 3:2 压缩）\n尖括号 = 倚音（装饰音不增加小节拍长）\n圆括号 = 和弦（括号内音符同时发声）\n\n(-5⁣7).⁣5.-2../..../.⁣3.(-2⁣7).⁣3./-7.⁣7.-2.⁣6./\n\n// @jpeditor {\"v\":2,\"vc\":2,\"k\":\"n\",\"kl\":false,\"kz\":false,\"kh\":false,\"n\":\"\",\"bpm\":90,\"bu\":\"quarter\",\"f\":0,\"m\":[4,4],\"s\":{\".\":16},\"ms\":false,\"sp\":null,\"nd\":null,\"er\":false,\"ri\":true,\"b\":\"a\",\"q\":\"t\",\"vb\":\"n\",\"x\":\"g\",\"p\":\"c\",\"o\":\"pitch-asc\",\"i\":\"钢琴\"}\n"
+  },
+  {
+    "id": "M127",
+    "operation": {
+      "part": 2,
+      "measure": 1,
+      "offset": "5/4",
+      "span": "1/4"
+    },
+    "beforeText": "键盘谱\n// 每行一小节，/ 分隔拍组；未识别的其他文字作为注释保留。\n标题 = 键盘谱\n1 = C\n4/4拍：\n速度 = 每分钟90四分音符(90 BPM)\n. = 16分音符\n花括号 = 和弦（括号内音符同时发声）\n方括号 = 三连音（括号内三个时值按 3:2 压缩）\n尖括号 = 倚音（装饰音不增加小节拍长）\n圆括号 = 和弦（括号内音符同时发声）\n\n[(⁣AG)..#G⁣0..H⁣0..#H]/(⁣#AJ).G.#G.H./(⁣S#H).J.G.#G./(⁣#SH).#H.J.G./\n\n// @jpeditor {\"v\":2,\"vc\":2,\"k\":\"k\",\"kl\":false,\"kz\":false,\"kh\":false,\"n\":\"\",\"bpm\":90,\"bu\":\"quarter\",\"f\":0,\"m\":[4,4],\"s\":{\".\":16},\"ms\":false,\"sp\":null,\"nd\":null,\"er\":false,\"ri\":true,\"b\":\"c\",\"q\":\"t\",\"vb\":\"n\",\"x\":\"g\",\"p\":\"c\",\"o\":\"pitch-asc\",\"i\":\"钢琴\",\"an\":[{\"type\":\"triplet\",\"part\":0,\"voice\":1,\"measure\":0,\"offset\":0,\"scope\":\"voice\",\"end\":1,\"members\":[0.5,0.5,0.5],\"memberRests\":[false,true,true],\"restoreUnit\":1,\"ordinary\":[{\"part\":1,\"offset\":0,\"duration\":0.25,\"rest\":false},{\"part\":1,\"offset\":0.25,\"duration\":0.25,\"rest\":false},{\"part\":1,\"offset\":0.5,\"duration\":0.25,\"rest\":false},{\"part\":1,\"offset\":0.75,\"duration\":0.25,\"rest\":false}]}]}\n",
+    "savedText": "键盘谱\n// 每行一小节，/ 分隔拍组；未识别的其他文字作为注释保留。\n标题 = 键盘谱\n1 = C\n4/4拍：\n速度 = 每分钟90四分音符(90 BPM)\n. = 16分音符\n花括号 = 和弦（括号内音符同时发声）\n方括号 = 三连音（括号内三个时值按 3:2 压缩）\n尖括号 = 倚音（装饰音不增加小节拍长）\n圆括号 = 和弦（括号内音符同时发声）\n\n[(⁣AG)..#G⁣0..H⁣0..#H]/(⁣#AJ).[⁣⁣G⁣⁣0⁣⁣0].#G.H./(⁣S#H).J.G.#G./(⁣#SH).#H.J.G./\n\n// @jpeditor {\"v\":2,\"vc\":2,\"k\":\"k\",\"kl\":false,\"kz\":false,\"kh\":false,\"n\":\"\",\"bpm\":90,\"bu\":\"quarter\",\"f\":0,\"m\":[4,4],\"s\":{\".\":16},\"ms\":false,\"sp\":null,\"nd\":null,\"er\":false,\"ri\":true,\"b\":\"a\",\"q\":\"t\",\"vb\":\"n\",\"x\":\"g\",\"p\":\"c\",\"o\":\"pitch-asc\",\"i\":\"钢琴\",\"an\":[{\"type\":\"triplet\",\"part\":0,\"voice\":1,\"measure\":0,\"offset\":0,\"scope\":\"voice\",\"end\":1,\"members\":[0.5,0.5,0.5],\"memberRests\":[false,true,true],\"restoreUnit\":1,\"ordinary\":[{\"part\":1,\"offset\":0,\"duration\":0.25,\"rest\":false},{\"part\":1,\"offset\":0.25,\"duration\":0.25,\"rest\":false},{\"part\":1,\"offset\":0.5,\"duration\":0.25,\"rest\":false},{\"part\":1,\"offset\":0.75,\"duration\":0.25,\"rest\":false}]},{\"type\":\"triplet\",\"part\":1,\"voice\":2,\"measure\":0,\"offset\":1.25,\"scope\":\"voice\",\"end\":1.5,\"members\":[0.125,0.125,0.125],\"memberRests\":[false,true,true],\"restoreUnit\":0.25}]}\n"
+  }
+]

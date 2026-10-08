@@ -281,7 +281,7 @@ try {
       const opt = window.__app.painter.layout.options;
       return Boolean(
         meta && instrument && pageNumber &&
-        Math.abs(Number(meta.getAttribute("font-size")) - opt.numberSize * 0.87) < 0.01 &&
+        Math.abs(Number(meta.getAttribute("font-size")) - opt.publicationUnit * 0.87) < 0.01 &&
         Math.abs(Number(instrument.getAttribute("font-size")) - opt.lrcFont.size * 0.56 / 1.5) < 0.01 &&
         Math.abs(Number(pageNumber.getAttribute("font-size")) - opt.lrcFont.size * 0.8 / 3) < 0.01
       );
@@ -290,9 +290,9 @@ try {
     instrumentLabels: [...document.querySelectorAll("#score-pane svg text")].filter((text) => text.textContent === "中国钢琴").length,
     obsoleteHandLabels: [...document.querySelectorAll("#score-pane svg text")].filter((text) => text.textContent === "右手" || text.textContent === "左手").length,
     finalSegments: [...document.querySelectorAll("#score-pane svg line")]
-      .filter((line) => Math.abs(Number(line.getAttribute("stroke-width")) - 5) < 0.001).length,
+      .filter((line) => Math.abs(Number(line.getAttribute("stroke-width")) - 5 * window.__app.engravingStyle.notationScale) < 0.001).length,
     connectorSegments: [...document.querySelectorAll("#score-pane svg line")]
-      .filter((line) => Math.abs(Number(line.getAttribute("stroke-width")) - 6) < 0.001).length,
+      .filter((line) => Math.abs(Number(line.getAttribute("stroke-width")) - 6 * window.__app.engravingStyle.notationScale) < 0.001).length,
     rhythmGuideLines: document.querySelectorAll("#score-pane .rhythm-guide-line").length,
     rhythmGuideMajorTicks: document.querySelectorAll("#score-pane .rhythm-guide-major").length,
     rhythmGuideMinorTicks: document.querySelectorAll("#score-pane .rhythm-guide-minor").length,

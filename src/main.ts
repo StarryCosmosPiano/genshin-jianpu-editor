@@ -7,6 +7,7 @@ import { MixedPainter } from "./mixed/painter";
 import { loadBuiltInSample } from "./bootstrap/sample";
 import { wireWorkspace } from "./bootstrap/workspace";
 import { initializeTheme } from "./ui/theme";
+import { wireStaffPreview } from "./staff-preview/controller";
 
 // Use the same Bravura font for measurement and drawing.
 async function registerBravura(): Promise<void> {
@@ -45,13 +46,16 @@ async function boot(): Promise<void> {
     __mixedPainter: MixedPainter;
     __omr: unknown;
     __abc2musicxml: unknown;
+    __staffPreviewTest: () => Promise<unknown>;
   };
   win.__app = app;
   win.__mixedPainter = new MixedPainter();
   win.__omr = import("./omr");
   win.__abc2musicxml = import("./abc/abc2xml");
+  win.__staffPreviewTest = () => import("./staff-preview/renderer-test-support").then(module => module.staffPreviewTestApi);
 
   await wireWorkspace(app, scorePane);
+  wireStaffPreview(app);
   if (app.restoreLastFileOnStartup) await app.tryRestoreLastFile();
 }
 
