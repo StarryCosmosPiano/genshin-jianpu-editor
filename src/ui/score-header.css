@@ -1,2 +1,6 @@
 #score-pane .publication-header { cursor: pointer; pointer-events: bounding-box; }
 #score-pane .publication-header:hover { filter: drop-shadow(0 0 2px #a98dd480); }
+.app-dialog-field-pair { display: grid; grid-template-columns: minmax(0, 1fr) 130px; gap: 12px; }
+.app-dialog-field-pair .app-dialog-field { min-width: 0; }
+.app-dialog-field-pair input { min-width: 0; width: 100%; }
+@media (max-width: 420px) { .app-dialog-field-pair { grid-template-columns: minmax(0, 1fr) 100px; gap: 8px; } }

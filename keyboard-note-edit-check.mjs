@@ -35,6 +35,7 @@ const intervals = [0, 2, 4, 5, 7, 9, 11];
 const tonic = 60;
 const expected = new Map(rows.flatMap((row, octave) =>
   [...row].map((key, degree) => [key, tonic + intervals[degree] + (octave - 1) * 12])));
+let fixtureOptions;
 
 const state = () => page.evaluate(() => {
   const app = window.__app;
@@ -49,15 +50,17 @@ const state = () => page.evaluate(() => {
 });
 
 async function reset(labels = true) {
-  await page.evaluate(({ text, labels }) => {
+  await page.evaluate(({ text, labels, options }) => {
     const app = window.__app;
     app.setInputMode(false);
     app.documentFormat = 'keyboard';
-    app.slashOptions.keyboardKeyLabels = labels;
+    // A model edit can respell the generated text and update its duration
+    // options. Reloading the original fixture requires its original rules.
+    app.slashOptions = { ...options, keyboardKeyLabels: labels };
     app.setText(text);
     app.resetDocumentUndo();
     app.setCodePaneCollapsed(true);
-  }, { text: fixture, labels });
+  }, { text: fixture, labels, options: fixtureOptions });
   const parsed = await page.evaluate(() => ({
     sources: window.__app._sourceNotes.map(source => ({
       pitch: source.note.pitch, token: window.__app.getText().slice(source.from, source.to),
@@ -71,9 +74,12 @@ async function reset(labels = true) {
 async function clickPitch(pitch, chord = false) {
   const point = await page.evaluate(({ pitch, chord }) => {
     const app = window.__app;
-    const source = app._sourceNotes.find(item => item.note.pitch === pitch
+    const source = app._sourceNotes.find(item => !item.grace && item.note.pitch === pitch
       && item.chord.notes.length === (chord ? 2 : 1));
-    if (!source) return null;
+    if (!source) throw new Error(JSON.stringify({ pitch, chord, parenMode: app.slashOptions?.parenMode,
+      noteDivision: app.slashOptions?.noteDivision,
+      sources: app._sourceNotes.map(item => ({ pitch: item.note.pitch, grace: item.grace,
+        at: item.chord.position.toString(), count: item.chord.notes.length })) }));
     const rendered = app.painter.noteGroupEls(source.chord, source.note)[0];
     if (!rendered) return null;
     rendered.element.scrollIntoView({ block: 'center' });
@@ -90,37 +96,58 @@ async function clickPitch(pitch, chord = false) {
   return point.chordIndex;
 }
 
-async function chordSnapshot() {
-  return page.evaluate(() => {
+async function chordSnapshot(anchor = null) {
+  return page.evaluate(anchor => {
     const app = window.__app;
-    const source = app._sourceNotes.find(item => item.chord.notes.length === 2);
-    if (!source) return null;
+    const selected = app._selectedNotes.at(-1);
+    const partIndex = anchor?.partIndex ?? selected?.source.partIndex;
+    const measureIndex = anchor?.measureIndex ?? selected?.visualNote.chord.measure.index;
+    const position = anchor?.position ?? selected?.visualNote.chord.position.toString();
+    const chord = app.painter.score.parts[partIndex]?.measures[measureIndex]?.entries
+      .find(entry => entry.notes && entry.position.toString() === position);
+    if (!chord) return null;
     return {
-      pitches: source.chord.notes.map(note => note.pitch).sort((a, b) => a - b),
-      duration: source.chord.duration?.toString() ?? null,
-      position: source.chord.position.toString(),
-      count: source.chord.notes.length,
+      partIndex, measureIndex,
+      pitches: chord.notes.map(note => note.pitch).sort((a, b) => a - b),
+      duration: chord.duration?.toString() ?? null,
+      position: chord.position.toString(),
+      count: chord.notes.length,
     };
-  });
+  }, anchor);
+}
+
+async function timelineSnapshot() {
+  return page.evaluate(() => window.__app.painter.score.parts.flatMap((part, partIndex) =>
+    part.measures.flatMap((measure, measureIndex) => measure.entries.filter(entry => entry.notes).map(chord => ({
+      partIndex, measureIndex, position: chord.position.toString(), duration: chord.duration?.toString(),
+      pitches: chord.notes.map(note => note.pitch).sort((a, b) => a - b),
+    })))));
 }
 
 try {
-  await page.goto(`http://127.0.0.1:${server.address().port}/`, { waitUntil: 'networkidle' });
+  await page.goto(process.env.APP_TEST_URL || `http://127.0.0.1:${server.address().port}/`, { waitUntil: 'networkidle' });
   // Import through the actual TXT dialog so the slash-score model and option
   // metadata are initialized just as they are in the product.
   await page.evaluate(text => {
+    window.__app.loadText(".Title\n.Voice\n1--- |]", null);
     void window.__app.importBytes(new TextEncoder().encode(text), 'keyboard-entry.txt');
   }, fixture);
   await page.locator('.slash-import-box').waitFor();
   const labels = page.locator('.slash-import-box .modal-row')
     .filter({ hasText: '谱面显示键盘按键' }).locator('input[type="checkbox"]');
   await labels.check();
+  // Each beat contains two eighth-note events. Give them explicit durations
+  // so adjacent parentheses remain timed chords under the current grammar.
+  await page.locator('.slash-import-box select[data-slash-import="paren"]').selectOption('chord');
+  await page.locator('.slash-import-box select[name="noteDivision"]').selectOption('8');
   await page.getByRole('button', { name: '导入为单行简谱' }).click();
   await page.locator('.slash-import-box').waitFor({ state: 'detached' });
   assert.equal(await page.evaluate(() => window.__app.slashOptions.keyboardKeyLabels), true);
   assert.equal(await page.evaluate(() => window.__app.documentFormat), 'keyboard');
+  assert.equal(await page.evaluate(() => window.__app.slashOptions.parenMode), 'chord');
   assert.equal(await page.evaluate(() => window.__app.slashOptions.fifths), 0,
     'pitch expectations use the imported C tonic');
+  fixtureOptions = await page.evaluate(() => structuredClone(window.__app.slashOptions));
 
   // With labels hidden, a selected note enters score input on N and exits on
   // the next N. Both lower- and uppercase letters must work.
@@ -133,6 +160,7 @@ try {
   assert.equal((await state()).text, beforeN.text, 'entering input does not edit the document');
   await page.keyboard.press('Shift+N');
   assert.equal((await state()).input, false, 'uppercase N exits input mode when labels are hidden');
+  assert.equal(await page.evaluate(() => window.__app.interactionMode), 'select', 'N exit returns to selection rather than view');
   assert.equal((await state()).text, beforeN.text, 'leaving input does not edit a note');
 
   // The display option must gate all piano-letter edits. Modifiers cannot
@@ -178,13 +206,14 @@ try {
     if (key === 'N') continue;
     await reset(true);
     const chordIndex = await clickPitch(72);
+    await page.evaluate(() => window.__app.setInputMode(true));
     const spelling = index % 2 ? key.toLowerCase() : `Shift+${key}`;
     await page.keyboard.press(spelling);
     const actual = await page.evaluate(chordIndex => window.__app._sourceNotes
       .find(source => source.chordIndex === chordIndex && source.chord.notes.length === 1)?.note.pitch,
     chordIndex);
     assert.equal(actual, pitch, `${spelling} should write MIDI pitch ${pitch}`);
-    assert.equal((await state()).input, false, `${spelling} must not switch modes`);
+    assert.equal((await state()).input, true, `${spelling} remains in input mode`);
   }
 
   await reset(true);
@@ -199,20 +228,33 @@ try {
   // rhythmic position, and duration, then Ctrl+Z restores the source.
   await reset(true);
   await clickPitch(67, true);
+  await page.evaluate(() => window.__app.setInputMode(true));
   const chordBefore = await chordSnapshot();
   const sourceBefore = (await state()).text;
+  const timelineBefore = await timelineSnapshot();
+  assert.deepEqual(chordBefore?.pitches, [48, 67], 'fixture selects the real ZG chord');
   await page.keyboard.press('q');
-  const chordAfter = await chordSnapshot();
+  const chordAfter = await chordSnapshot(chordBefore);
   assert.deepEqual(chordAfter?.pitches, [48, 72], 'only selected chord tone changes');
   assert.equal(chordAfter?.count, chordBefore?.count, 'retuning preserves chord cardinality');
   assert.equal(chordAfter?.duration, chordBefore?.duration, 'retuning preserves duration');
   assert.equal(chordAfter?.position, chordBefore?.position, 'retuning preserves timing');
+  assert.deepEqual(await timelineSnapshot(), timelineBefore.map(chord =>
+    chord.partIndex === chordBefore.partIndex && chord.measureIndex === chordBefore.measureIndex
+      && chord.position === chordBefore.position ? { ...chord, pitches: [48, 72] } : chord),
+  'retuning changes only the exact selected onset and preserves all other pitches and durations');
+  assert.equal(await page.evaluate(() => {
+    const app = window.__app;
+    return app._selectedNotes.length === 1 && app._selectedNotes[0].visualNote.pitch === 72
+      && app.inputFocus()?.note === app._selectedNotes[0].visualNote;
+  }), true, 'retuned member remains the exact selected input focus');
   await page.keyboard.press('Control+Z');
   await page.waitForFunction(text => window.__app.getText() === text, sourceBefore);
   await page.waitForFunction(() => window.__app._sourceNotes
     .some(source => source.chord.notes.length === 2
       && source.chord.notes.some(note => note.pitch === 67)));
-  assert.deepEqual((await chordSnapshot())?.pitches, chordBefore?.pitches, 'Ctrl+Z restores both chord pitches');
+  assert.deepEqual((await chordSnapshot(chordBefore))?.pitches, chordBefore?.pitches, 'Ctrl+Z restores both chord pitches');
+  assert.deepEqual(await timelineSnapshot(), timelineBefore, 'Ctrl+Z restores the complete original timeline');
 
   // Text focus remains ordinary typing even when keyboard labels are visible.
   await reset(true);

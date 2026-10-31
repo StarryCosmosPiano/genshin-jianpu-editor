@@ -3,12 +3,23 @@ import type { App } from "./app";
 import { scoreToMidi } from "../score/midi";
 import { scoreToMusicXml } from "../score/musicxml-export";
 import { buildPptx } from "./pptx";
-import { isTauriRuntime, saveBytes } from "./fileio";
+import { isTauriRuntime, isFilePickerCancellation, saveBytes, saveByteFiles } from "./fileio";
 import { asset } from "../common/asset";
-import { zipSync } from "fflate";
+import { archiveByteFiles } from "./file-archive";
+import { RasterPdfWriter } from "./file-pdf";
+import { createFileTask, throwIfFileTaskAborted, withFileTask, yieldFileTask, type FileTask } from "./file-task";
+import { isTouchWorkspace } from "../bootstrap/device-mode";
 import { showMessageDialog } from "../ui/app-dialog";
-import { DEFAULT_WATERMARK, withWatermark, type WatermarkOptions } from "./watermark";
-import { choosePageExportOptions } from "./watermark-dialog";
+import { DEFAULT_WATERMARK, type WatermarkOptions } from "./watermark";
+import { composeExportPageSvg } from "./export-page";
+import { choosePageExportOptions, type PageExportOptions } from "./watermark-dialog";
+import { editableDocumentFileInfo } from "./file-format";
+import { applyKeyboardKeyLabels } from "../slashscore";
+import { createStaffNoteRegistry } from "../staff-preview/identity";
+import { applyExportVoiceColor, cloneExportScore, exportContinuationVoiceColor, resetExportNumberLabels, type ExportAppearance, type ExportPage } from "./export-display";
+import type { JinpuPainter } from "../layout/painter";
+import type { PageItem } from "../layout/layout";
+import type { Note } from "../score/score";
 
 const SVG_NS = "http://www.w3.org/2000/svg";
 
@@ -41,9 +52,10 @@ async function svgToCanvas(
   scale: number,
   transparent: boolean,
   watermark?: WatermarkOptions,
+  includeRhythmGuides = false,
 ): Promise<HTMLCanvasElement> {
   const { width, height } = svgDimensions(svg);
-  const clone = withWatermark(svg, watermark ?? DEFAULT_WATERMARK, transparent);
+  const clone = composeExportPageSvg(svg, watermark ?? DEFAULT_WATERMARK, transparent, includeRhythmGuides);
   clone.setAttribute("xmlns", SVG_NS);
   clone.setAttribute("width", String(width));
   clone.setAttribute("height", String(height));
@@ -70,12 +82,15 @@ async function svgToCanvas(
   const canvas = document.createElement("canvas");
   canvas.width = Math.max(1, Math.round(width * scale));
   canvas.height = Math.max(1, Math.round(height * scale));
-  const ctx = canvas.getContext("2d")!;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) throw new Error("浏览器无法创建导出画布，请减少导出页数后重试");
   if (!transparent) {
     ctx.fillStyle = "#fff";
     ctx.fillRect(0, 0, canvas.width, canvas.height);
   }
   ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+  img.onload = img.onerror = null;
+  img.src = "";
   return canvas;
 }
 
@@ -95,8 +110,11 @@ async function svgToBytes(
   scale: number,
   transparent = false,
   watermark?: WatermarkOptions,
+  includeRhythmGuides = false,
 ): Promise<Uint8Array> {
-  return canvasToBytes(await svgToCanvas(svg, scale, transparent, watermark), "image/png");
+  const canvas = await svgToCanvas(svg, scale, transparent, watermark, includeRhythmGuides);
+  try { return await canvasToBytes(canvas, "image/png"); }
+  finally { canvas.width = 1; canvas.height = 1; }
 }
 
 function baseName(app: App): string {
@@ -105,195 +123,217 @@ function baseName(app: App): string {
 }
 
 export async function exportCurrentPagePng(app: App): Promise<void> {
-  const source = await pageExportSource(app);
-  const page = source.pages.find((item) => item.page === source.currentPage);
-  if (!page) throw new Error("当前没有可导出的谱面页面");
-  const options = await choosePageExportOptions([page], page.page, "导出当前页 PNG", true);
-  if (!options) return;
-  const bytes = await svgToBytes(page.svg, 2, options.transparent, options.watermark);
-  await saveBytes(bytes, `${baseName(app)}-第${page.page + 1}页.png`, "image/png");
+  const selected = await chooseVisualExport(app, "导出当前页 PNG", true, true);
+  if (!selected) return;
+  const { options, pages: [page] } = selected;
+  await saveBytes(
+    () => withFileTask("导出当前页 PNG", async task => {
+      task.update({ completed: 0, total: 1, message: `正在生成第 ${page.page + 1} 页…` });
+      await yieldFileTask(task.signal);
+      try {
+        const bytes = await svgToBytes(page.svg, 2, options.transparent, options.watermark, options.includeRhythmGuides);
+        throwIfFileTaskAborted(task.signal);
+        return bytes;
+      } finally { page.svg.replaceChildren(); }
+    }),
+    `${baseName(app)}-第${page.page + 1}页.png`, "image/png",
+  );
 }
 
-async function pageExportSource(app: App): ReturnType<App["getPageExportSource"]> {
-  const source = await app.getPageExportSource();
-  return { ...source, pages: source.pages.map((page) => {
-    const svg = page.svg.cloneNode(true) as SVGSVGElement;
-    svg.style.removeProperty("transform");
-    svg.style.removeProperty("transform-origin");
-    svg.removeAttribute("tabindex");
-    for (const node of svg.querySelectorAll(".selected,.playing,.input-focused,.staff-selected,.staff-playing")) {
-      node.classList.remove("selected", "playing", "input-focused", "staff-selected", "staff-playing");
-    }
-    svg.querySelectorAll("[data-staff-hit],rect[fill='transparent'][pointer-events='all']")
-      .forEach((node) => node.remove());
-    return { ...page, svg };
-  }) };
+/** One isolated source per display choice, shared by the dialog and writer. */
+async function chooseVisualExport(app: App, title: string, pngOptions = false, currentOnly = false, pptx = false) {
+  const { surface: initialSurface, currentPage: initialCurrentPage } = await app.getPageExportContext();
+  const snapshot = app.getStaffPreviewSnapshot();
+  const availability = app.getStaffPreviewAvailability();
+  const slashOptions = app.slashOptions ? structuredClone(app.slashOptions) : null;
+  const voiceColors = [...app.slashVoiceColors];
+  const cache = new Map<string, Promise<{ pages: ExportPage[]; painter?: JinpuPainter }>>();
+  const get = (appearance: ExportAppearance) => {
+    const key = JSON.stringify(appearance);
+    let result = cache.get(key);
+    if (result) return result;
+    if (cache.size >= 2) cache.clear();
+    result = (async () => {
+      const { score, copies } = cloneExportScore(snapshot.score);
+      if (appearance.notation !== "current") resetExportNumberLabels(score);
+      if (appearance.notation === "keyboard") applyKeyboardKeyLabels(score,
+        slashOptions?.keyboardTieAsZero ?? false, slashOptions?.keyboardHideTieLabels ?? false);
+      const sources = snapshot.sources.map(source => ({ ...source,
+        chord: copies.get(source.chord) as typeof source.chord, note: copies.get(source.note) as Note }));
+      const colors = new Map<Note, string>();
+      if (appearance.voiceColors) for (const source of sources) {
+        if (!source.voiceIndex || source.voiceIndex >= (slashOptions?.voiceCount ?? 1)) continue;
+        const color = voiceColors[source.voiceIndex - 1];
+        if (color && /^#[\da-f]{6}$/i.test(color)) colors.set(source.note, color);
+      }
+      const registry = createStaffNoteRegistry(score, sources, snapshot.revision);
+      for (const target of registry.targets) {
+        const color = target.source ? colors.get(target.source.note) : undefined;
+        if (color) colors.set(target.note, color);
+      }
+      let pages: ExportPage[];
+      let painter: JinpuPainter | undefined;
+      if (appearance.surface === "staff") {
+        if (!availability.supported) throw new Error(availability.reason);
+        const prepared = await (await import("../staff-preview/renderer")).prepareStaffPreview({ ...snapshot,
+          score, sources, registry });
+        try {
+          pages = Array.from({ length: prepared.pageCount }, (_, page) => {
+            const rendered = prepared.renderPage(page);
+            for (const note of rendered.notes) {
+              const target = registry.resolve(note.ref)?.note;
+              const color = target ? colors.get(target) : undefined;
+              if (color) applyExportVoiceColor(note.element, color);
+            }
+            return { page, svg: rendered.svg, widthPt: prepared.pageWidth * 72 / 96, heightPt: prepared.pageHeight * 72 / 96 };
+          });
+        } finally { prepared.dispose(); }
+      } else {
+        painter = app.createPageExportPainter(score);
+        pages = painter.layout.pages.map((_, page) => ({ page, svg: painter!.renderPage(page) }));
+        for (const [note, color] of colors) for (const rendered of painter.noteGroupEls(note.chord, note)) {
+          const paint = exportContinuationVoiceColor(color, note, snapshot.engravingStyle?.tieContinuationGray ?? false);
+          applyExportVoiceColor(rendered.element, paint);
+          const item = painter.pageItemForTarget(rendered.element);
+          if (item) colorExportItem(item, Number.parseInt(paint.slice(1), 16) | 0xff000000);
+        }
+      }
+      if (currentOnly) pages = [pages[Math.min(initialCurrentPage, pages.length - 1)]].filter(Boolean);
+      return { pages, painter };
+    })();
+    cache.set(key, result);
+    return result;
+  };
+  const appearance: ExportAppearance = { surface: pptx ? "jianpu" : initialSurface, notation: "current", voiceColors: false };
+  const first = await get(appearance);
+  if (!snapshot.current) throw new Error("乐谱已更新，请重新导出。");
+  if (!first.pages.length) throw new Error("当前没有可导出的谱面页面");
+  const options = await choosePageExportOptions(first.pages, initialCurrentPage, title, pngOptions, {
+    initialSurface: appearance.surface, staffAvailable: !pptx && availability.supported,
+    staffReason: pptx ? "PPTX 矢量导出支持简谱及键盘字母。" : availability.reason,
+    renderPages: async next => (await get(next)).pages,
+  });
+  if (!options) return null;
+  if (!snapshot.current) throw new Error("乐谱已更新，请重新导出。");
+  const rendered = await get(options.appearance!);
+  return { options, ...rendered, pages: rendered.pages.filter(page => !options.pages || options.pages.includes(page.page)) };
+}
+
+function colorExportItem(item: PageItem, color: number): void {
+  for (const property of ["color", "fillColor", "strokeColor"] as const) {
+    if (property in item) (item as unknown as Record<string, unknown>)[property] = color;
+  }
+  item.children.forEach(child => colorExportItem(child, color));
 }
 
 export async function exportAllPagesPng(app: App): Promise<void> {
-  const source = await pageExportSource(app);
-  const pages = source.pages;
-  if (pages.length === 0) throw new Error("当前没有可导出的谱面页面");
-  const options = await choosePageExportOptions(pages, source.currentPage, `导出 PNG（共 ${pages.length} 页）`, true);
-  if (!options) return;
+  const selected = await chooseVisualExport(app, "导出 PNG（全部页面）", true);
+  if (!selected) return;
+  const { options, pages } = selected;
 
   const name = baseName(app);
-  const files: Record<string, Uint8Array> = {};
-  for (const page of pages) {
-    files[`${name}-第${page.page + 1}页.png`] = await svgToBytes(
-      page.svg,
-      2,
-      options.transparent,
-      options.watermark,
-    );
+  let task: FileTask | null = null;
+  let completed = 0;
+  const ensureTask = (): FileTask => task ??= createFileTask("导出 PNG");
+  const closeTask = (): void => { task?.close(); task = null; };
+  const files = pages.map((page) => ({
+    name: `${name}-第${page.page + 1}页.png`,
+    bytes: async () => {
+      const running = ensureTask();
+      await yieldFileTask(running.signal);
+      running.update({ completed, total: pages.length, message: `正在生成第 ${page.page + 1} 页（${completed + 1}/${pages.length}）…` });
+      try {
+        const bytes = await svgToBytes(page.svg, 2, options.transparent, options.watermark, options.includeRhythmGuides);
+        throwIfFileTaskAborted(running.signal);
+        completed++;
+        running.update({ completed, total: pages.length, message: `已生成 ${completed}/${pages.length} 页` });
+        return bytes;
+      } finally { page.svg.replaceChildren(); }
+    },
+  }));
+  const mobileZip = isTouchWorkspace() && !isTauriRuntime() && files.length > 1
+    && typeof (window as unknown as { showDirectoryPicker?: unknown }).showDirectoryPicker !== "function";
+  try {
+    if (options.zip || mobileZip) {
+      await saveBytes(async () => {
+        const running = ensureTask();
+        try { return await archiveByteFiles(files, { signal: running.signal }); }
+        finally { closeTask(); }
+      }, `${name}-PNG.zip`, "application/zip");
+    } else if (files.length === 1) {
+      await saveBytes(async () => {
+        try { return await files[0].bytes(); }
+        finally { closeTask(); }
+      }, files[0].name, "image/png");
+    } else {
+      await saveByteFiles(files);
+    }
+  } finally {
+    closeTask();
+    pages.forEach(page => page.svg.replaceChildren());
   }
-  if (options.zip) {
-    await saveBytes(
-      zipSync(files, { level: 6 }),
-      `${name}-PNG.zip`,
-      "application/zip",
-    );
-    return;
-  }
-  for (const [filename, bytes] of Object.entries(files)) {
-    await saveBytes(bytes, filename, "image/png");
-  }
-}
-
-interface PdfRasterPage {
-  jpeg: Uint8Array;
-  pixelWidth: number;
-  pixelHeight: number;
-  pageWidth: number;
-  pageHeight: number;
-}
-
-function concatBytes(chunks: readonly Uint8Array[]): Uint8Array {
-  const length = chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0);
-  const result = new Uint8Array(length);
-  let offset = 0;
-  for (const chunk of chunks) {
-    result.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return result;
-}
-
-function buildRasterPdf(pages: readonly PdfRasterPage[]): Uint8Array {
-  const encoder = new TextEncoder();
-  const text = (value: string) => encoder.encode(value);
-  const objectCount = 2 + pages.length * 3;
-  const offsets = new Array<number>(objectCount + 1).fill(0);
-  const chunks: Uint8Array[] = [];
-  let length = 0;
-  const append = (chunk: Uint8Array) => {
-    chunks.push(chunk);
-    length += chunk.byteLength;
-  };
-  const writeObject = (number: number, body: readonly Uint8Array[]) => {
-    offsets[number] = length;
-    append(text(`${number} 0 obj\n`));
-    for (const chunk of body) append(chunk);
-    append(text("\nendobj\n"));
-  };
-
-  append(text("%PDF-1.4\n%JPEDITOR\n"));
-  writeObject(1, [text("<< /Type /Catalog /Pages 2 0 R >>")]);
-  const pageNumbers = pages.map((_page, index) => 3 + index * 3);
-  writeObject(2, [text(
-    `<< /Type /Pages /Count ${pages.length} /Kids [${pageNumbers.map((n) => `${n} 0 R`).join(" ")}] >>`,
-  )]);
-
-  pages.forEach((page, index) => {
-    const pageObject = 3 + index * 3;
-    const contentObject = pageObject + 1;
-    const imageObject = pageObject + 2;
-    const width = Math.round(page.pageWidth * 1000) / 1000;
-    const height = Math.round(page.pageHeight * 1000) / 1000;
-    writeObject(pageObject, [text(
-      `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${width} ${height}] `
-      + `/Resources << /ProcSet [/PDF /ImageC] /XObject << /Im0 ${imageObject} 0 R >> >> `
-      + `/Contents ${contentObject} 0 R >>`,
-    )]);
-    const content = text(`q\n${width} 0 0 ${height} 0 0 cm\n/Im0 Do\nQ`);
-    writeObject(contentObject, [
-      text(`<< /Length ${content.byteLength} >>\nstream\n`),
-      content,
-      text("\nendstream"),
-    ]);
-    writeObject(imageObject, [
-      text(
-        `<< /Type /XObject /Subtype /Image /Width ${page.pixelWidth} `
-        + `/Height ${page.pixelHeight} /ColorSpace /DeviceRGB `
-        + `/BitsPerComponent 8 /Filter /DCTDecode /Length ${page.jpeg.byteLength} >>\nstream\n`,
-      ),
-      page.jpeg,
-      text("\nendstream"),
-    ]);
-  });
-
-  const xrefOffset = length;
-  append(text(`xref\n0 ${objectCount + 1}\n0000000000 65535 f \n`));
-  for (let object = 1; object <= objectCount; object++) {
-    append(text(`${String(offsets[object]).padStart(10, "0")} 00000 n \n`));
-  }
-  append(text(
-    `trailer\n<< /Size ${objectCount + 1} /Root 1 0 R >>\n`
-    + `startxref\n${xrefOffset}\n%%EOF\n`,
-  ));
-  return concatBytes(chunks);
 }
 
 export async function exportScorePdf(app: App): Promise<void> {
-  const source = await pageExportSource(app);
-  const pages = source.pages;
-  if (pages.length === 0) throw new Error("当前没有可导出的谱面页面");
-  const options = await choosePageExportOptions(pages, source.currentPage, `导出 PDF（共 ${pages.length} 页）`);
-  if (!options) return;
-  const rasterPages: PdfRasterPage[] = [];
-  for (const page of pages) {
-    const { width, height } = svgDimensions(page.svg);
-    const canvas = await svgToCanvas(page.svg, 2, false, options.watermark);
-    rasterPages.push({
-      jpeg: await canvasToBytes(canvas, "image/jpeg", 0.96),
-      pixelWidth: canvas.width,
-      pixelHeight: canvas.height,
-      pageWidth: page.widthPt ?? width,
-      pageHeight: page.heightPt ?? height,
-    });
-  }
-  await saveBytes(
-    buildRasterPdf(rasterPages),
-    `${baseName(app)}.pdf`,
-    "application/pdf",
-  );
+  const selected = await chooseVisualExport(app, "导出 PDF（全部页面）");
+  if (!selected) return;
+  const { options, pages } = selected;
+  await saveBytes(() => rasterizePdfPages(pages, options), `${baseName(app)}.pdf`, "application/pdf");
+}
+
+async function rasterizePdfPages(pages: readonly ExportPage[], options: PageExportOptions): Promise<Blob> {
+  return withFileTask("导出 PDF", async task => {
+    const writer = new RasterPdfWriter(pages.length);
+    try {
+      for (let index = 0; index < pages.length; index++) {
+        await yieldFileTask(task.signal);
+        const page = pages[index];
+        task.update({ completed: index, total: pages.length, message: `正在生成第 ${page.page + 1} 页（${index + 1}/${pages.length}）…` });
+        const { width, height } = svgDimensions(page.svg);
+        const canvas = await svgToCanvas(page.svg, 2, false, options.watermark, options.includeRhythmGuides);
+        try {
+          const jpeg = await canvasToBytes(canvas, "image/jpeg", 0.96);
+          throwIfFileTaskAborted(task.signal);
+          writer.addPage({ jpeg, pixelWidth: canvas.width, pixelHeight: canvas.height,
+            pageWidth: page.widthPt ?? width, pageHeight: page.heightPt ?? height });
+        } finally { canvas.width = 1; canvas.height = 1; page.svg.replaceChildren(); }
+        task.update({ completed: index + 1, total: pages.length, message: `已生成 ${index + 1}/${pages.length} 页` });
+      }
+      throwIfFileTaskAborted(task.signal);
+      return writer.finish();
+    } finally { writer.dispose(); pages.forEach(page => page.svg.replaceChildren()); }
+  });
 }
 
 export async function exportMidi(app: App): Promise<void> {
-  const bytes = scoreToMidi(app.painter.score, { partVolumes: app.partVolumes });
-  await saveBytes(bytes, `${baseName(app)}.mid`, "audio/midi");
-}
-
-export async function exportMusicXml(app: App): Promise<void> {
-  const text = app.mode === "mixed" && app.mixedXmlText
-    ? app.mixedXmlText
-    : scoreToMusicXml(app.painter.score);
   await saveBytes(
-    new TextEncoder().encode(text),
-    `${baseName(app)}.musicxml`,
-    "application/vnd.recordare.musicxml+xml",
+    () => scoreToMidi(app.painter.score, { partVolumes: app.partVolumes }),
+    `${baseName(app)}.mid`, "audio/midi",
   );
 }
 
+export async function exportMusicXml(app: App): Promise<void> {
+  await saveBytes(() => {
+    const text = app.mode === "mixed" && app.mixedXmlText
+      ? app.mixedXmlText : scoreToMusicXml(app.painter.score);
+    return new TextEncoder().encode(text);
+  }, `${baseName(app)}.musicxml`, "application/vnd.recordare.musicxml+xml");
+}
+
 export async function exportPptx(app: App): Promise<void> {
-  const source = await pageExportSource(app);
-  if (source.surface !== "jianpu") throw new Error("当前谱面暂不支持 PPTX 导出");
-  if (!source.pages.length) throw new Error("当前没有可导出的谱面页面");
-  const options = await choosePageExportOptions(source.pages, source.currentPage, `导出 PPTX（共 ${source.pages.length} 页）`);
-  if (!options) return;
-  const bytes = await buildPptx(app.painter, options.watermark);
+  const selected = await chooseVisualExport(app, "导出 PPTX（全部页面）", false, false, true);
+  if (!selected?.painter) return;
+  const { options, painter, pages } = selected;
   await saveBytes(
-    bytes,
+    () => withFileTask("导出 PPTX", async task => {
+      try {
+        return await buildPptx(painter, options.watermark, options.includeRhythmGuides, {
+          signal: task.signal, pages: pages.map(page => page.page),
+          onProgress: (completed, total) => task.update({ completed, total,
+            message: completed === total ? "正在打包 PPTX…" : `正在生成幻灯片 ${completed + 1}/${total}…` }),
+        });
+      } finally { pages.forEach(page => page.svg.replaceChildren()); }
+    }),
     `${baseName(app)}.pptx`,
     "application/vnd.openxmlformats-officedocument.presentationml.presentation",
   );
@@ -385,12 +425,10 @@ async function exportTextScore(
     ? { includeVoiceMarkers: true, includeMetadata: true }
     : await chooseSlashTextExportOptions();
   if (!options) return;
-  const result = app.exportTextDocument(
-    format,
-    options.includeVoiceMarkers,
-    options.includeMetadata,
-  );
-  await saveBytes(result.bytes, result.name, result.mime);
+  const fileInfo = editableDocumentFileInfo(format);
+  await saveBytes(() => app.exportTextDocument(
+    format, options.includeVoiceMarkers, options.includeMetadata,
+  ).bytes, `${baseName(app)}${fileInfo.extension}`, fileInfo.mime);
 }
 
 /** Export mixed-mode pages to PDF via Tauri svg2pdf command or browser print dialog. */
@@ -403,6 +441,13 @@ export async function exportMixedPdf(app: App): Promise<void> {
   if (!sourcePages.length) throw new Error("当前没有可导出的谱面页面");
   const options = await choosePageExportOptions(sourcePages, app.pageIndex, `导出混排 PDF（共 ${sourcePages.length} 页）`);
   if (!options) return;
+  const selectedPages = sourcePages.filter(page => !options.pages || options.pages.includes(page.page));
+
+  if (!isTauriRuntime() && isTouchWorkspace()) {
+    await saveBytes(() => rasterizePdfPages(selectedPages.map(page => ({ ...page, widthPt: wPt, heightPt: hPt })), options),
+      `${painter.title || "混排"}.pdf`, "application/pdf");
+    return;
+  }
 
   if (isTauriRuntime()) {
     // Tauri path: serialize SVGs and invoke Rust export_pdf command
@@ -412,8 +457,8 @@ export async function exportMixedPdf(app: App): Promise<void> {
     const outPath = await save({ defaultPath: `${title}.pdf`, filters: [{ name: "PDF", extensions: ["pdf"] }] });
     if (!outPath) return;
     const pages: string[] = [];
-    for (const page of sourcePages) {
-      const svg = withWatermark(page.svg, options.watermark);
+    for (const page of selectedPages) {
+      const svg = composeExportPageSvg(page.svg, options.watermark, false, options.includeRhythmGuides);
       svg.setAttribute("xmlns", "http://www.w3.org/2000/svg");
       svg.setAttribute("width", `${wPt}pt`);
       svg.setAttribute("height", `${hPt}pt`);
@@ -423,7 +468,7 @@ export async function exportMixedPdf(app: App): Promise<void> {
   } else {
     // Browser path: open print window with embedded font
     const win = window.open("", "_blank", "width=800,height=900");
-    if (!win) return;
+    if (!win) throw new Error("浏览器阻止了打印窗口，请允许此页面打开弹窗后重试；在系统打印窗口选择“另存为 PDF”及保存位置。");
     const bravuraUrl = await bravuraDataUrl();
     const d = win.document;
     const wMm = (wPt * 25.4 / 72).toFixed(1);
@@ -434,8 +479,8 @@ export async function exportMixedPdf(app: App): Promise<void> {
 body{margin:0;padding:0;background:#fff}
 svg{display:block;width:100%;page-break-after:always}
 </style></head><body>`);
-    for (const page of sourcePages) {
-      const svg = withWatermark(page.svg, options.watermark);
+    for (const page of selectedPages) {
+      const svg = composeExportPageSvg(page.svg, options.watermark, false, options.includeRhythmGuides);
       svg.setAttribute("xmlns", SVG_NS);
       svg.setAttribute("width", `${wPt}pt`);
       svg.setAttribute("height", `${hPt}pt`);
@@ -468,6 +513,7 @@ export function showExportDialog(app: App): void {
       try {
         await fn();
       } catch (e) {
+        if (isFilePickerCancellation(e)) { app.reportFileStatus("已取消导出，当前乐谱没有更改。"); return; }
         console.error(e);
         await showMessageDialog("导出失败", e instanceof Error ? e.message : String(e));
       }

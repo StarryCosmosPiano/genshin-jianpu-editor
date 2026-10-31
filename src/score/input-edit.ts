@@ -1,5 +1,6 @@
 import { Fraction } from "../common/fraction";
 import { BarStyle, Chord, Key, LineBreak, Measure, Note, Part, Score, Time, Tuplet } from "./score";
+import { chordArpeggioPitchGroups, setChordArpeggioPitchGroups } from "./arpeggio";
 import {
   normalizeScoreRestSpelling,
   noteTimingStep,
@@ -34,6 +35,9 @@ export interface InputEditResult {
 
 export interface InputNoteSpec {
   pitch: number;
+  step?: string;
+  alter?: number;
+  octave?: number;
   number?: string;
   jpOctave?: number;
   jpAlter?: string;
@@ -458,6 +462,9 @@ function detachInputTie(note: Note): void {
 
 function applyInputSpec(note: Note, spec: InputNoteSpec): void {
   note.pitch = spec.pitch;
+  if (spec.step !== undefined) note.step = spec.step;
+  if (spec.alter !== undefined) note.alter = spec.alter;
+  if (spec.octave !== undefined) note.octave = spec.octave;
   if (spec.number !== undefined) note.number = spec.number;
   if (spec.jpOctave !== undefined) note.jpOctave = spec.jpOctave;
   if (spec.jpAlter !== undefined) note.jpAlter = spec.jpAlter;
@@ -995,6 +1002,163 @@ export function inputNoteAtCursor(
   return { changed: true, measure, chord, note, createdMeasure: ensured.created, splitRests };
 }
 
+/** Add new pitches over the longest remaining held member of an occupied
+ * column. Reuse its exact written segments so shorter members and unrelated
+ * attacks in subsequent shared columns keep their own endpoints. */
+export function appendInputChordAtCursor(score: Score, cursor: NotationCursor,
+  specsAt: (chord: Chord) => readonly InputNoteSpec[]): InputEditResult {
+  const measure = score.parts[cursor.partIndex]?.measures[cursor.measureIndex];
+  const chord = measure?.entries.find((entry): entry is Chord => entry instanceof Chord
+    && entry.position.equals(cursor.offset) && !entry.rest) ?? null;
+  const failed = (): InputEditResult => ({ changed: false, measure: measure ?? new Measure(cursor.measureIndex),
+    chord, note: null, createdMeasure: false, splitRests: 0 });
+  const originals = chord?.notes.filter(note => !note.rest && !note.softDeleted) ?? [];
+  if (!chord || originals.length === 0) return failed();
+  const chains = originals.map(note => {
+    const chain: Note[] = [], seen = new Set<Note>();
+    for (let current: Note | null = note; current && !seen.has(current); current = current.tieNext) {
+      seen.add(current); chain.push(current);
+    }
+    return chain;
+  });
+  const end = (chain: Note[]): Fraction => chain[chain.length - 1].absoluteTick
+    .plus(chain[chain.length - 1].chord.duration ?? ZERO);
+  const spine = chains.reduce((longest, chain) => end(chain).compareTo(end(longest)) > 0 ? chain : longest);
+  const newPitches = new Set(specsAt(chord).filter(spec => !originals.some(note => note.pitch === spec.pitch)).map(spec => spec.pitch));
+  const plans = spine.map(template => ({ template, chord: template.chord,
+    specs: [...new Map(specsAt(template.chord).filter(spec => newPitches.has(spec.pitch)).map(spec => [spec.pitch, spec])).values()],
+    arpeggios: chordArpeggioPitchGroups(template.chord) }));
+  if (newPitches.size === 0 || plans.some(plan => !plan.chord.duration || plan.chord.duration.compareTo(ZERO) <= 0
+    || plan.specs.length !== newPitches.size || plan.specs.some(spec => !Number.isInteger(spec.pitch) || spec.pitch < 0 || spec.pitch > 127)))
+    return failed();
+  let first: Note | null = null;
+  let previous: Note[] = [];
+  for (const plan of plans) {
+    const current = plan.specs.map(spec => {
+      const note = new Note(plan.chord);
+      applyInputSpec(note, spec);
+      note.tuplet = plan.template.tuplet;
+      note.tupletBegin = plan.template.tupletBegin;
+      note.tupletEnd = plan.template.tupletEnd;
+      const prior = previous.find(member => member.pitch === spec.pitch);
+      if (prior) {
+        prior.tieNext = note; prior.tieStart = true;
+        note.tiePrev = prior; note.tieEnd = true;
+      }
+      plan.chord.add(note);
+      return note;
+    });
+    first ??= current[0];
+    previous = current;
+    const continued = plan.chord.notes.filter(note => !note.rest).every(note => note.tiePrev !== null);
+    plan.chord.transparentContinuation = continued;
+    plan.chord.generatedTimingContinuation = continued && plan.chord.generatedTimingContinuation;
+    if (!continued) plan.chord.persistGeneratedContinuation = false;
+    setChordArpeggioPitchGroups(plan.chord, plan.arpeggios);
+  }
+  clearInputTimingOverlay(score);
+  return { changed: true, measure: chord.measure, chord, note: first, createdMeasure: false, splitRests: 0 };
+}
+
+/** Replace the sounding group at one written position, retaining its longest
+ * remaining tied span. Only the forward suffix is replaced when the cursor
+ * points at a continuation: the preceding sound ends at this cursor.
+ * Every continuation column keeps unrelated attacks and its original timing.
+ * The caller supplies spelling at each segment so key changes stay exact. */
+export function replaceInputChordAtCursor(score: Score, cursor: NotationCursor,
+  specsAt: (chord: Chord) => readonly InputNoteSpec[]): InputEditResult {
+  const measure = score.parts[cursor.partIndex]?.measures[cursor.measureIndex];
+  const chord = measure?.entries.find((entry): entry is Chord => entry instanceof Chord
+    && entry.position.equals(cursor.offset) && !entry.rest) ?? null;
+  const failed = (): InputEditResult => ({ changed: false, measure: measure ?? new Measure(cursor.measureIndex),
+    chord, note: null, createdMeasure: false, splitRests: 0 });
+  const originals = chord?.notes.filter(note => !note.rest && !note.softDeleted) ?? [];
+  if (!chord || originals.length === 0) return failed();
+  const suffix = (note: Note): Note[] => {
+    const result: Note[] = [], seen = new Set<Note>();
+    for (let current: Note | null = note; current && !seen.has(current); current = current.tieNext) {
+      seen.add(current); result.push(current);
+    }
+    return result;
+  };
+  const chains = originals.map(suffix);
+  const end = (chain: Note[]): Fraction => chain[chain.length - 1].absoluteTick
+    .plus(chain[chain.length - 1].chord.duration ?? ZERO);
+  const spine = chains.reduce((longest, chain) => end(chain).compareTo(end(longest)) > 0 ? chain : longest);
+  const plans = spine.map(template => ({ template, chord: template.chord, specs: specsAt(template.chord) }));
+  if (plans.some(plan => !plan.chord.duration || plan.chord.duration.compareTo(ZERO) <= 0
+    || plan.specs.length === 0 || plan.specs.some(spec => !Number.isInteger(spec.pitch) || spec.pitch < 0 || spec.pitch > 127)))
+    return failed();
+  const removed = new Set(chains.flat());
+  const affected = new Set([...removed].map(note => note.chord));
+  const tuplets = new Set([...removed].flatMap(note => note.tuplet ? [note.tuplet] : []));
+  const spineChords = new Set(plans.map(plan => plan.chord));
+  for (const note of removed) detachInputTie(note);
+  for (const affectedChord of affected) {
+    const template = affectedChord.notes.find(note => removed.has(note))!;
+    affectedChord.notes = affectedChord.notes.filter(note => !removed.has(note) && !note.rest);
+    if (affectedChord.notes.length === 0 && !spineChords.has(affectedChord)) {
+      const rest = new Note(affectedChord);
+      rest.rest = true; rest.number = "0";
+      rest.tuplet = template.tuplet; rest.tupletBegin = template.tupletBegin; rest.tupletEnd = template.tupletEnd;
+      affectedChord.add(rest); affectedChord.rest = true;
+    }
+  }
+  let first: Note | null = null;
+  let previous: Note[] = [];
+  for (const plan of plans) {
+    const current = plan.specs.map(spec => {
+      const note = new Note(plan.chord);
+      applyInputSpec(note, spec);
+      note.tuplet = plan.template.tuplet;
+      note.tupletBegin = plan.template.tupletBegin;
+      note.tupletEnd = plan.template.tupletEnd;
+      const prior = previous.find(member => member.pitch === spec.pitch);
+      if (prior) {
+        prior.tieNext = note; prior.tieStart = true;
+        note.tiePrev = prior; note.tieEnd = true;
+      }
+      plan.chord.add(note);
+      return note;
+    });
+    current[0].lyrics = [...plan.template.lyrics];
+    first ??= current[0];
+    previous = current;
+    plan.chord.rest = false;
+  }
+  for (const affectedChord of affected) {
+    const sounding = affectedChord.notes.filter(note => !note.rest);
+    const continued = sounding.length > 0 && sounding.every(note => note.tiePrev !== null);
+    affectedChord.transparentContinuation = continued;
+    affectedChord.generatedTimingContinuation = continued && affectedChord.generatedTimingContinuation;
+    if (!continued) affectedChord.persistGeneratedContinuation = false;
+    // Rolled subsets referring to deleted tones cannot survive replacement.
+    // Unrelated pitches in a shared later column retain their subset.
+    const groups = affectedChord.arpeggioPitchGroups
+      ?? (affectedChord.arpeggio ? [affectedChord.arpeggioPitches ?? sounding.map(note => note.pitch)] : []);
+    const valid = groups.map(group => group.filter(pitch => sounding.some(note => note.pitch === pitch)))
+      .filter(group => group.length >= 2);
+    affectedChord.arpeggio = valid.length > 0;
+    affectedChord.arpeggioPitchGroups = valid.length > 1 ? valid : null;
+    affectedChord.arpeggioPitches = valid.length > 0 ? valid.flat() : null;
+  }
+  for (const tuplet of tuplets) {
+    if (removed.has(tuplet.first)) tuplet.first = tuplet.first.chord.notes.find(note => note.tuplet === tuplet) ?? tuplet.first;
+    if (removed.has(tuplet.last)) tuplet.last = tuplet.last.chord.notes.find(note => note.tuplet === tuplet) ?? tuplet.last;
+    tuplet.refreshTiming();
+  }
+  const editedMarks = new Set(score.crossPartArpeggios.filter(mark => mark.pitches.length > 0
+    && mark.measure === cursor.measureIndex && mark.offset.equals(cursor.offset)));
+  for (const mark of editedMarks) {
+    mark.pitches = mark.pitches.filter(member => member.part !== cursor.partIndex
+      || chord.notes.some(note => !note.rest && note.pitch === member.pitch));
+  }
+  score.crossPartArpeggios = score.crossPartArpeggios.filter(mark => !editedMarks.has(mark) || mark.pitches.length >= 2);
+  clearInputTimingOverlay(score);
+  normalizeScoreRestSpelling(score);
+  return { changed: true, measure: chord.measure, chord, note: first, createdMeasure: false, splitRests: 0 };
+}
+
 /**
  * Turn a rendered gray timing continuation into a real attack at the cursor.
  *
@@ -1374,7 +1538,10 @@ function extendAcrossGaps(measure: Measure): void {
     return;
   }
   const sounding = measure.entries
-    .filter((entry): entry is Chord => entry instanceof Chord && !entry.rest && !entry.generatedTimingContinuation)
+    // A generated tie continuation still occupies this measure. Ignoring it
+    // inserts a leading/full-measure rest over the held sound; TXT reparse
+    // then stops the incoming tie when input mode is closed.
+    .filter((entry): entry is Chord => entry instanceof Chord && !entry.rest)
     .filter((entry) => !entry.notes.some((note) => note.tuplet !== null))
     .sort((left, right) => left.position.compareTo(right.position));
   if (sounding.length === 0) {

@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { mkdir, readFile } from "node:fs/promises";
 import { extname, join, normalize } from "node:path";
-import { chromium } from "playwright";
+import { installSavePickerTestBridge, launchSaveCheckBrowser } from "./browser-save-test-helpers.mjs";
 import { unzipSync } from "fflate";
 
 const root = join(process.cwd(), "dist");
@@ -19,8 +19,9 @@ const server = createServer(async (req, res) => {
   } catch { res.writeHead(404); res.end(); }
 });
 await new Promise((resolve) => server.listen(0, resolve));
-const browser = await chromium.launch({ channel: "msedge", headless: true });
+const browser = await launchSaveCheckBrowser();
 const page = await browser.newPage({ viewport: { width: 1440, height: 960 }, acceptDownloads: true });
+const savedFiles = await installSavePickerTestBridge(page);
 const errors = [];
 page.on("pageerror", (error) => errors.push(error.message));
 const artifacts = join(process.cwd(), "artifacts", "content-scale-20261007");
@@ -150,16 +151,21 @@ const openPageExport = async (name) => {
   await page.locator(".modal-box button", { hasText: name }).click();
   const dialog = page.locator(".watermark-dialog");
   await dialog.waitFor();
+  await page.waitForFunction(() => {
+    const preview = document.querySelector(".watermark-preview");
+    return preview?.querySelector("svg") && preview.getAttribute("aria-busy") !== "true"
+      && !document.querySelector(".watermark-dialog button.primary")?.disabled;
+  });
   const watermark = dialog.locator(".watermark-controls input[type=checkbox]").first();
   if (await watermark.isChecked()) await watermark.uncheck();
   const zip = dialog.locator(".watermark-controls label", { hasText: "ZIP" }).locator("input");
-  if (await zip.count()) await zip.check();
+  if (await zip.isVisible()) await zip.check();
   return dialog;
 };
 
 const download = async (name) => {
   const dialog = await openPageExport(name);
-  const pending = page.waitForEvent("download");
+  const pending = savedFiles.nextExport();
   await dialog.locator("footer button.primary").click();
   const file = await pending;
   return { filename: file.suggestedFilename(), bytes: await readFile(await file.path()) };
@@ -301,6 +307,7 @@ try {
   assert.notDeepEqual(scaledStaffPng.data, normalStaffPng.data);
   assert.deepEqual(pdfPaper(scaledStaffPdf), pdfPaper(normalStaffPdf));
   assert.notDeepEqual(scaledStaffPdf.bytes, normalStaffPdf.bytes);
+  savedFiles.assertNoDownloads();
   assert.deepEqual(errors, []);
   console.log("content-scale: draft 50/150%, cancel, persistence, same-source note picking at 137% screen zoom, A4 PNG/PDF/PPTX, and staff export passed");
 } finally {

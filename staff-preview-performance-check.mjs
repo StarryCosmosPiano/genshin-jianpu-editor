@@ -119,7 +119,7 @@ try {
 
   // Select an actual visible notehead and replay its callbacks without audio/network.
   await page.evaluate(() => {
-    const app = window.__app; app._player = { state: "stopped", stop() { this.state = "stopped"; app.onPlayChord(null, 0); app.onPlayState("stopped"); }, stopAudition() {}, audition() {} };
+    const app = window.__app; app._player = { state: "stopped", stop() { this.state = "stopped"; app.onPlayChord(null, 0); app.onPlayState("stopped"); }, stopAudition() {}, async audition() {} };
     const pane = document.getElementById("staff-pane"); pane.scrollTop = 0;
   });
   await page.waitForTimeout(50);

@@ -6,7 +6,8 @@
 .watermark-controls { display: flex; flex-direction: column; gap: 15px; }
 .watermark-controls label { display: flex; flex-direction: column; gap: 7px; }
 .watermark-controls label.inline { flex-direction: row; align-items: center; justify-content: space-between; }
-.watermark-controls input[type=text] { box-sizing: border-box; width: 100%; padding: 8px 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); color: var(--text); font: inherit; }
+.watermark-controls input[type=text], .watermark-controls select { box-sizing: border-box; width: 100%; padding: 8px 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); color: var(--text); font: inherit; }
+.watermark-controls [hidden] { display: none; }
 .watermark-controls input[type=range] { width: 100%; accent-color: var(--gold); }
 .watermark-controls small { color: var(--muted); line-height: 1.45; }
 .watermark-preview { display: grid; place-items: center; min-height: 370px; overflow: hidden; border: 1px solid var(--line); border-radius: 10px; background: #e5e5e5; }
@@ -15,5 +16,6 @@
 .watermark-dialog footer { display: flex; justify-content: flex-end; gap: 8px; padding: 12px 18px; border-top: 1px solid var(--line); }
 .watermark-dialog button { min-height: 36px; padding: 7px 13px; border-radius: 9px; border: 1px solid var(--line); background: var(--surface); color: var(--text); font: inherit; cursor: pointer; }
 .watermark-dialog button.primary { background: var(--gold); color: var(--gold-ink); border-color: var(--gold); }
-.watermark-dialog button:focus-visible, .watermark-dialog input:focus-visible { outline: 2px solid var(--purple); outline-offset: 2px; }
+.watermark-dialog button:focus-visible, .watermark-dialog input:focus-visible, .watermark-dialog select:focus-visible { outline: 2px solid var(--purple); outline-offset: 2px; }
+.watermark-dialog button:disabled { opacity: .55; cursor: wait; }
 @media (max-width: 700px) { .watermark-dialog-body { grid-template-columns: 1fr; } .watermark-preview { min-height: 250px; } .watermark-preview svg { max-height: 40vh; } }

@@ -3,6 +3,7 @@ import { createServer } from "node:http";
 import { mkdir, readFile } from "node:fs/promises";
 import { extname, join, normalize } from "node:path";
 import { chromium } from "playwright";
+import { acceptFixtureImport } from "./browser-test-helpers.mjs";
 
 const dist = join(process.cwd(), "dist");
 const mime = { ".html": "text/html", ".js": "text/javascript", ".css": "text/css", ".json": "application/json", ".woff2": "font/woff2" };
@@ -47,6 +48,44 @@ const source = () => page.evaluate(() => window.__app.getText());
 async function settingsBackdrop() {
   await page.locator(".modal-overlay").click({ position: { x: 2, y: 2 } });
   await page.getByRole("dialog", { name: "设置尚未保存", exact: true }).waitFor();
+}
+async function slashMetadataSnapshot() {
+  return page.evaluate(() => {
+    const app = window.__app;
+    const tick = value => Math.round(value * 384);
+    const notes = app.painter.score.parts.flatMap((part, partIndex) => part.measures.flatMap(measure =>
+      measure.entries.flatMap(chord => (chord.notes ?? []).filter(note =>
+        !note.rest && !note.softDeleted && !note.tieEnd).map(note => {
+        const start = measure.position.toFloat() + chord.position.toFloat();
+        let end = start + chord.duration.toFloat();
+        let continuation = note.tieNext;
+        const visited = new Set([note]);
+        while (continuation && !visited.has(continuation)) {
+          visited.add(continuation);
+          const next = continuation.chord;
+          end = Math.max(end, next.measure.position.toFloat() + next.position.toFloat() + next.duration.toFloat());
+          continuation = continuation.tieNext;
+        }
+        return [partIndex, note.pitch, tick(start), tick(end)];
+      }))));
+    notes.sort((left, right) => left[0] - right[0] || left[2] - right[2] || left[1] - right[1]);
+    const text = app.getText();
+    const footer = text.match(/^\s*\/\/\s*@jpeditor\s+(\{.*\})\s*$/m);
+    return { text, notes, footer: footer ? JSON.parse(footer[1]) : null, options: app.slashOptions };
+  });
+}
+async function importMetadataText(text) {
+  await page.evaluate(sourceText => {
+    window.__metadataImportDone = null;
+    window.__metadataImportError = null;
+    void window.__app.importBytes(new TextEncoder().encode(sourceText), "dialog-metadata.txt")
+      .then(ok => { window.__metadataImportDone = ok; })
+      .catch(error => { window.__metadataImportError = String(error); window.__metadataImportDone = false; });
+  }, text);
+  await page.locator(".slash-import-box").waitFor({ state: "visible" });
+  await acceptFixtureImport(page, page.getByRole("button", { name: "导入为 2 声部简谱", exact: true }));
+  await page.waitForFunction(() => window.__metadataImportDone !== null);
+  assert.deepEqual(await page.evaluate(() => [window.__metadataImportDone, window.__metadataImportError]), [true, null]);
 }
 try {
   await page.goto(`http://127.0.0.1:${server.address().port}/`, { waitUntil: "networkidle" });
@@ -173,6 +212,77 @@ try {
   await settings.waitFor({ state: "hidden" });
   assert.equal(await page.evaluate(() => window.__app.showTextOnStartup), !originalStartup);
 
+  // Enter through the real fresh-file TXT dialog. Neither an active TXT
+  // session nor a private MIDI fixture can supply these nested options.
+  await page.evaluate(text => window.__app.loadText(text, null), fixture);
+  const separator = "\u2063";
+  const tripletAnnotation = { type: "triplet", part: 0, voice: 1, measure: 0,
+    offset: 1, end: 2, scope: "all", members: [.5, .5, .5],
+    memberContinuations: [true, false, false] };
+  const timingEdit = { part: 1, chord: 0, move: "0", duration: "-1/4" };
+  const metadataText = ["键盘谱", "标题 = 导入元数据回归", "1 = C", "4/4拍：", ". = 16分音符",
+    "方括号 = 三连音", "圆括号 = 和弦",
+    `(Z${separator}A)..../[${separator}A..${separator}S..${separator}D..]/${separator}G..../${separator}H..../`,
+    "", `// @jpeditor ${JSON.stringify({ v: 2, vc: 2, k: "k", n: "导入元数据回归",
+      bpm: 90, f: 0, m: [4, 4], s: { ".": 16 }, q: "t", p: "c", ri: true,
+      an: [tripletAnnotation], ne: [timingEdit] })}`, ""].join("\n");
+  await importMetadataText(metadataText);
+  const importedMetadata = await slashMetadataSnapshot();
+  assert.deepEqual(importedMetadata.options.annotations[0].members, tripletAnnotation.members);
+  assert.deepEqual(importedMetadata.options.annotations[0].memberContinuations, tripletAnnotation.memberContinuations);
+  assert.deepEqual(importedMetadata.options.noteTimingEdits, [timingEdit]);
+  assert.deepEqual(importedMetadata.footer.an[0].memberContinuations, [true, false, false]);
+  assert.deepEqual(importedMetadata.footer.ne, [timingEdit]);
+  // The repeated C is one held sound, while the lower Z edit ends a quarter
+  // beat early. Merely retaining a JSON field without applying it must fail.
+  assert.deepEqual(importedMetadata.notes.filter(note => note[0] === 0), [
+    [0, 60, 0, 512], [0, 62, 512, 640], [0, 64, 640, 768],
+    [0, 67, 768, 1152], [0, 69, 1152, 1536],
+  ]);
+  assert.deepEqual(importedMetadata.notes.filter(note => note[0] === 1 && note[1] === 48), [[1, 48, 0, 1440]]);
+  const scoreSettings = page.locator('.inspector-pane[data-inspector-id="score"]');
+  await page.locator("#btn-score-settings").click();
+  await scoreSettings.waitFor({ state: "visible" });
+  await scoreSettings.getByRole("button", { name: "应用到当前乐谱", exact: true }).click();
+  await scoreSettings.waitFor({ state: "hidden" });
+  await page.waitForFunction(() => document.querySelector("#score-pane svg"));
+  const appliedMetadata = await slashMetadataSnapshot();
+  assert.deepEqual(appliedMetadata.notes, importedMetadata.notes,
+    "Applying unchanged TXT settings changed the continuation or timing edit");
+  await page.locator("#btn-score-settings").click();
+  await scoreSettings.waitFor({ state: "visible" });
+  await scoreSettings.getByRole("button", { name: "取消", exact: true }).click();
+  await scoreSettings.waitFor({ state: "hidden" });
+  const cancelledMetadata = await slashMetadataSnapshot();
+  assert.equal(cancelledMetadata.text, appliedMetadata.text, "Cancelling TXT settings changed the saved footer");
+  assert.deepEqual(cancelledMetadata.notes, appliedMetadata.notes);
+
+  // A changed header must exercise readOptions too; a clean-settings shortcut
+  // alone would hide dropped annotations in the settings return value.
+  const annotationOnlyText = metadataText.replace(/^\/\/ @jpeditor (\{.*\})$/m, (_, json) => {
+    const stored = JSON.parse(json);
+    delete stored.ne;
+    return `// @jpeditor ${JSON.stringify(stored)}`;
+  });
+  await page.evaluate(text => window.__app.loadText(text, null), fixture);
+  await importMetadataText(annotationOnlyText);
+  const beforeHeaderChange = await slashMetadataSnapshot();
+  await page.locator("#btn-score-settings").click();
+  await scoreSettings.waitFor({ state: "visible" });
+  const headerDetails = scoreSettings.locator("details").filter({ hasText: "标题与署名" });
+  await headerDetails.locator("summary").click();
+  await headerDetails.locator("label").filter({ hasText: "标题" }).first().locator("input")
+    .fill("修改标题后保留三连音");
+  await scoreSettings.getByRole("button", { name: "应用到当前乐谱", exact: true }).click();
+  await scoreSettings.waitFor({ state: "hidden" });
+  await page.waitForFunction(() => window.__app.painter.score.title === "修改标题后保留三连音");
+  const afterHeaderChange = await slashMetadataSnapshot();
+  assert.deepEqual(afterHeaderChange.notes, beforeHeaderChange.notes,
+    "Applying a changed header lost the triplet continuation");
+  assert.deepEqual(afterHeaderChange.options.annotations[0].memberContinuations, [true, false, false]);
+  assert.deepEqual(afterHeaderChange.footer.an[0].members, [.5, .5, .5]);
+  assert.deepEqual(afterHeaderChange.footer.an[0].memberContinuations, [true, false, false]);
+
   await setup();
   await openMenu("设置当前位置速度…");
   await page.setViewportSize({ width: 390, height: 700 });
@@ -180,16 +290,27 @@ try {
   assert(mobile.x >= 0 && mobile.y >= 0 && mobile.x + mobile.width <= 391 && mobile.y + mobile.height <= 701);
   await dialog.getByRole("button", { name: "取消", exact: true }).click();
   await page.setViewportSize({ width: 1440, height: 950 });
-  await page.evaluate(() => { window.__savedPages = window.__app.pageEls; window.__app.pageEls = []; });
+  await page.evaluate(() => {
+    const app = window.__app;
+    app.reload(app.getText());
+    window.__savedPages = app.pageEls;
+    window.__savedLayoutPages = app.painter.layout.pages;
+    // Export includes unmounted pages; the failure fixture needs an empty layout.
+    app.pageEls = [];
+    app.painter.layout.pages = [];
+  });
   await page.locator("#btn-export").click();
   await page.getByRole("button", { name: "PNG（全部页面）", exact: true }).click();
   await page.getByRole("dialog", { name: "导出失败", exact: true }).waitFor();
   assert.match(await dialog.textContent(), /当前没有可导出的谱面页面/);
   await dialog.getByRole("button", { name: "知道了", exact: true }).click();
-  await page.evaluate(() => window.__app.pageEls = window.__savedPages);
+  await page.evaluate(() => {
+    window.__app.pageEls = window.__savedPages;
+    window.__app.painter.layout.pages = window.__savedLayoutPages;
+  });
   assert.deepEqual(nativeDialogs, [], "browser-native prompt/confirm/alert was shown");
   assert.deepEqual(errors, []);
-  console.log("App dialogs: tempo/ramp/grace/ornament/text, validation/cancel/undo, drag/resize/focus, document replacement, settings choices and export failure OK");
+  console.log("App dialogs: tempo/ramp/grace/ornament/text, validation/cancel/undo, drag/resize/focus, document replacement, settings choices, TXT metadata import/apply/cancel and export failure OK");
 } finally {
   await browser.close();
   await new Promise(resolve => server.close(resolve));

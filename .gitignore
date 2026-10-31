@@ -21,6 +21,7 @@ testdata
 # 本地回归截图与临时构建文件
 artifacts
 tmp
+/test-results/
 PACKAGE-NOTES.txt
 /-
 /.tmp-overlap-probe.ts

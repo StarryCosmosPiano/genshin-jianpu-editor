@@ -85,7 +85,7 @@ export function showShortcutSettingsDialog(): void {
   title.textContent = "快捷键编辑";
   const hint = document.createElement("p");
   hint.className = "shortcut-hint";
-  hint.textContent = "点击键位后按新组合键；一个操作可保留多个键位。Esc 取消录制，仅在“应用”后保存。复制、剪切、粘贴沿用系统快捷键。";
+  hint.textContent = "点击键位后按新组合键；一个操作可保留多个键位。Esc 取消录制，仅在“应用”后保存。Ctrl／⌘+S 保存乐谱，Ctrl／⌘+Shift+S 另存副本，这两组键位固定保留。复制、剪切、粘贴沿用系统快捷键。";
   const search = document.createElement("input");
   search.className = "shortcut-search";
   search.type = "search";
@@ -116,6 +116,7 @@ export function showShortcutSettingsDialog(): void {
 
   const stopRecording = (): void => {
     recording = null;
+    delete dialog.dataset.shortcutRecording;
     recordingPane?.remove();
     recordingPane = null;
   };
@@ -127,6 +128,7 @@ export function showShortcutSettingsDialog(): void {
   const startRecording = (id: string, index: number | null, trigger: HTMLButtonElement): void => {
     stopRecording();
     recording = { id, index, trigger };
+    dialog.dataset.shortcutRecording = "true";
     recordingPane = document.createElement("div");
     recordingPane.className = "shortcut-recording";
     recordingPane.textContent = "请按新快捷键 · Esc 取消";
@@ -212,7 +214,7 @@ export function showShortcutSettingsDialog(): void {
       if (!chord) return;
       const { id, index } = recording;
       if (!shortcutBindingAllowed(id, chord)) {
-        if (recordingPane) recordingPane.textContent = "文本编辑不能占用普通文字或符号，请加 Ctrl／⌘／Alt 等修饰键";
+        if (recordingPane) recordingPane.textContent = "此键位不可分配：Ctrl／⌘+S（含 Shift）固定用于文档保存；文本编辑不能占用普通文字或符号。";
         return;
       }
       if (index === null) draft[id].push(chord);

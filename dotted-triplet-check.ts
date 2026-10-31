@@ -4,7 +4,7 @@ import { Chord, Score } from "./src/score/score";
 import { createInputTriplet, inputNoteAtCursor, inputRestAtCursor } from "./src/score/input-edit";
 import { analyzeSlashScore, defaultSlashScoreOptions, embedSlashScoreOptionsFromScore, parseSlashScore, scoreToSlashScore, type SlashScoreOptions } from "./src/slashscore";
 
-const source = "键盘谱\n4/4拍：\n点=16分音符\n(V\u2063G).\u2063W.\u2063Y.(A\u2063W)./.(V\u2063W).A.\u2063W./B.\u2063Q.\u2063U.(M\u2063J)./.(B\u2063Q).M.\u2063J./\n";
+const source = "键盘谱\n4/4拍：\n点=16分音符\n方括号=三连音\n(V\u2063G).\u2063W.\u2063Y.(A\u2063W)./.(V\u2063W).A.\u2063W./B.\u2063Q.\u2063U.(M\u2063J)./.(B\u2063Q).M.\u2063J./\n";
 const state = (score: Score, part: number, min = 0): string => JSON.stringify(score.parts[part]?.measures.flatMap((measure) => measure.entries.filter((entry): entry is Chord => entry instanceof Chord && entry.position.compareTo(new Fraction(min)) >= 0).map((chord) => ({ at: chord.position.toString(), dur: chord.duration?.toString(), pitches: chord.notes.filter((note) => !note.rest).map((note) => note.pitch), rest: chord.rest, dot: chord.dot, tuple: chord.notes.some((note) => note.tuplet) }))) ?? []);
 const noErrors = (text: string): void => assert.equal(parseSlashScore(text, defaultSlashScoreOptions("keyboard", analyzeSlashScore(text))).summary.diagnostics.some((item) => item.severity === "error"), false);
 

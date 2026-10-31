@@ -1,15 +1,17 @@
 import { MusicCommon, quarterBpmFromUnit, tempoBpmForUnit, type Score, type TempoBeatUnit } from "../score/score";
 import { positiveNumberError, showInputDialog } from "../ui/app-dialog";
 import "../ui/score-header.css";
+import { HEADER_TEXT_FIELDS, normalizeHeaderTypography, type HeaderTextField, type HeaderTypography } from "../score/header-typography";
 
-export type HeaderTarget = "credits" | "rhythm";
+export type HeaderTarget = "credits" | "rhythm" | HeaderTextField;
 export type HeaderChange =
-  | { kind: "credits"; values: { title: string; subtitle: string; composer: string; arranger: string; lyricist: string } }
+  | { kind: "credits"; values: { title: string; subtitle: string; composer: string; arranger: string; lyricist: string }; headerTypography?: HeaderTypography }
   | { kind: "rhythm"; values: { fifths: number; beats: number; beatType: number; tempoBpm: number; tempoBeatUnit: TempoBeatUnit } };
 
 export function scoreHeaderValues(score: Score) {
   const first = score.parts[0]?.measures[0];
   return { title: score.title, subtitle: score.subtitle, composer: score.composer, arranger: score.arranger,
+    headerTypography: score.headerTypography,
     lyricist: score.lyricist, fifths: first?.key.fifths ?? 0, beats: first?.time.beats ?? 4,
     beatType: first?.time.beatType ?? 4, tempoBpm: score.tempoBpm, tempoBeatUnit: score.tempoBeatUnit };
 }
@@ -17,6 +19,9 @@ export function scoreHeaderValues(score: Score) {
 export function scoreHeaderTarget(target: EventTarget | null): HeaderTarget | null {
   if (!(target instanceof Element)) return null;
   if (target.closest(".publication-meta")) return "rhythm";
+  for (const field of HEADER_TEXT_FIELDS) {
+    if (target.closest(`.publication-${field}`)) return field;
+  }
   return target.closest(".publication-title,.publication-subtitle,.publication-credit") ? "credits" : null;
 }
 
@@ -30,14 +35,26 @@ export function replaceOpeningMeterDirective(text: string, firstNoteFrom: number
   return text.slice(0, last.index) + value + text.slice(last.index! + last[0].length);
 }
 
-export async function showScoreHeaderEditor(score: Score, target: HeaderTarget): Promise<HeaderChange | null> {
-  if (target === "credits") {
-    const result = await showInputDialog({ title: "标题与署名", message: "修改会同步到乐谱设置中的“标题与署名”。",
+export async function showScoreHeaderEditor(score: Score, target: HeaderTarget, defaults?: HeaderTypography): Promise<HeaderChange | null> {
+  if (target !== "rhythm") {
+    const result = await showInputDialog({ title: "标题与署名", message: "文字与字号保存到当前乐谱。字号单位为 pt；留空使用默认字号。",
+      initialFocusField: target === "credits" ? "title" : target,
       fields: ([
         ["title", "标题"], ["subtitle", "副标题"], ["lyricist", "作词"], ["composer", "作曲"], ["arranger", "编曲"],
-      ] as const).map(([name, label]) => ({ name, label, value: score[name] })) });
+      ] as const).flatMap(([name, label]) => [
+        { name, label, value: score[name] },
+        { name: `${name}Size`, label: `${label}字号（pt）`, value: String(score.headerTypography?.[name] ?? ""),
+          placeholder: defaults?.[name] === undefined ? "默认" : `默认 ${Number(defaults[name].toFixed(2))}`,
+          inputMode: "decimal" as const, inlineWithPrevious: true,
+          validate: (value: string) => !value.trim() || Number.isFinite(Number(value)) && Number(value) >= 8 && Number(value) <= 144
+            ? null : "字号须为 8–144 pt，或留空使用默认字号" },
+      ]) });
     return result ? { kind: "credits", values: { title: result.title.trim() || "未命名", subtitle: result.subtitle.trim(),
-      lyricist: result.lyricist.trim(), composer: result.composer.trim(), arranger: result.arranger.trim() } } : null;
+      lyricist: result.lyricist.trim(), composer: result.composer.trim(), arranger: result.arranger.trim() },
+      headerTypography: normalizeHeaderTypography(Object.fromEntries(HEADER_TEXT_FIELDS
+        .filter(field => result[`${field}Size`].trim())
+        .map(field => [field, Number(result[`${field}Size`])]))),
+    } : null;
   }
   const first = score.parts[0]?.measures[0];
   if (!first) return null;

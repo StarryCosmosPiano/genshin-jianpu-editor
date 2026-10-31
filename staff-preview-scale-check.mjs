@@ -110,6 +110,9 @@ try {
         barlineWidth: attr(first('g.vf-stavebarline rect'), 'width'), tuplet,
         clef: textInfo('g.vf-clef text'), time: textInfo('g.vf-timesignature text'),
         key: textInfo('g.vf-keysignature text'), dot: dotGlyphs,
+        accidental: [...root.querySelectorAll('text')].filter(node => !node.closest('g.vf-keysignature')
+          && [0xe260, 0xe261, 0xe262, 0xe263, 0xe264].some(code => node.textContent === String.fromCharCode(code)))
+          .map(node => ({ size: attr(node, 'font-size'), box: box(node), text: node.textContent })),
         ornament: textInfo('g.vf-ornament text'),
         flag: textInfo('g.vf-flag text'),
         tempo: textInfo('[data-staff-prose="annotation"]'),
@@ -123,26 +126,31 @@ try {
   const near = (actual, expected, tolerance = .05) => actual !== null
     && Math.abs(actual - expected) <= tolerance * Math.max(1, expected);
   for (const row of rows) {
+    const musicScale = row.scale * 0.75;
     assert.equal(row.fallbackScale, 1, `scale ${row.scale}: unexpected whole-system fallback`);
     assert.equal(row.page, '0 0 794 1123');
     assert.equal(row.staveLineCount, 5);
     assert.equal(row.headCount, 6);
-    assert(near(row.staveGap, 10 * row.scale, .01));
-    assert(near(row.staveLineWidth, row.scale, .01));
-    assert(near(row.stemWidth, 1.5 * row.scale, .01));
-    assert(near(row.barlineWidth, row.scale, .01));
-    assert(near(row.clef[0]?.size, 30 * row.scale, .01));
-    assert(near(row.time[0]?.size, 30 * row.scale, .01), `scale ${row.scale}: time signature did not follow staff spacing`);
-    assert(near(row.key[0]?.size, 30 * row.scale, .01));
-    assert(near(row.flag[1]?.size, 30 * row.scale, .01));
-    assert(row.dot.length > 0 && near(row.dot[0]?.size, 30 * row.scale, .01));
-    assert(near(row.tuplet.rule, row.scale, .01) && near(row.tuplet.numeralSize, 30 * row.scale, .01));
-    assert(near(row.arcInk.midpoint, 1.25 * row.scale, .02));
+    assert(near(row.staveGap, 10 * musicScale, .01));
+    assert(near(row.staveLineWidth, musicScale, .01));
+    assert(near(row.stemWidth, 1.5 * musicScale, .01));
+    assert(near(row.barlineWidth, musicScale, .01));
+    assert(near(row.clef[0]?.size, 30 * musicScale, .01));
+    assert(near(row.time[0]?.size, 30 * musicScale, .01), `scale ${row.scale}: time signature did not follow staff spacing`);
+    assert(near(row.key[0]?.size, 30 * musicScale, .01));
+    assert(row.accidental.some(item => near(item.size, 30 * musicScale, .01)),
+      `scale ${row.scale}: attached main-note accidental did not follow music size`);
+    assert(row.accidental.some(item => near(item.size, 20 * musicScale, .01)),
+      `scale ${row.scale}: attached grace accidental did not follow grace size`);
+    assert(near(row.flag[1]?.size, 30 * musicScale, .01));
+    assert(row.dot.length > 0 && near(row.dot[0]?.size, 30 * musicScale, .01));
+    assert(near(row.tuplet.rule, musicScale, .01) && near(row.tuplet.numeralSize, 30 * musicScale, .01));
+    assert(near(row.arcInk.midpoint, 1.45 * musicScale, .02));
     assert(row.arcInk.endpoint > row.arcInk.midpoint * .25
-      && row.arcInk.endpoint < row.arcInk.midpoint * .4 && row.arcInk.midpoint < 1.5 * row.scale,
+      && row.arcInk.endpoint < row.arcInk.midpoint * .4 && row.arcInk.midpoint < 1.6 * musicScale,
       `scale ${row.scale}: tie must taper gently from fine to slightly thick and back`);
     assert.equal(row.arcInk.fill, '#111');
-    assert(row.arcBox.height <= 5.5 * row.scale,
+    assert(row.arcBox.height <= 5.5 * musicScale,
       `scale ${row.scale}: ordinary tie curvature remained too tall`);
     assert.equal(row.tempo[0]?.size, 14, 'page prose changed with notation size');
   }

@@ -1,0 +1,41 @@
+.mobile-file-layer {
+  position: fixed; inset: 0; z-index: 12000; display: grid; place-items: center;
+  padding: max(12px, env(safe-area-inset-top)) max(12px, env(safe-area-inset-right))
+    max(12px, env(safe-area-inset-bottom)) max(12px, env(safe-area-inset-left));
+  background: rgb(20 16 28 / 45%); box-sizing: border-box;
+}
+.mobile-file-sheet {
+  width: min(560px, 100%); max-height: 100%; max-height: calc(100dvh - 32px);
+  display: flex; flex-direction: column; gap: 12px; overflow: auto;
+  padding: 20px; box-sizing: border-box; border-radius: 18px;
+  color: var(--text, #24212b); background: var(--surface, #fff);
+  box-shadow: 0 12px 60px rgb(0 0 0 / 25%);
+}
+.mobile-file-sheet h2 { margin: 0; font-size: 20px; line-height: 1.4; }
+.mobile-file-body { min-width: 0; overflow-wrap: anywhere; }
+.mobile-file-body p { margin: 4px 0 12px; }
+.mobile-file-body progress { width: 100%; height: 16px; accent-color: var(--purple, #67508c); }
+.mobile-file-message { margin: 0; font-size: 14px; line-height: 1.6; overflow-wrap: anywhere; }
+.mobile-file-message:empty { display: none; }
+.mobile-file-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
+.mobile-file-actions button, .mobile-file-list button {
+  min-height: 44px; padding: 10px 16px; touch-action: manipulation; font: inherit;
+  border: 1px solid var(--line, #d9d1e0); border-radius: 10px;
+  background: var(--surface, #fff); color: var(--text, #24212b);
+}
+.mobile-file-actions button.primary { background: var(--purple, #67508c); color: #fff; }
+.mobile-file-actions button:disabled { opacity: .5; }
+.mobile-file-list { display: grid; gap: 8px; }
+.mobile-file-list button { width: 100%; text-align: left; overflow-wrap: anywhere; }
+.mobile-file-list small { display: block; opacity: .75; margin-top: 3px; }
+.mobile-file-page-range { display: grid; gap: 8px; margin-block: 12px; }
+.mobile-file-page-range input { min-height: 44px; padding: 8px; font: inherit; box-sizing: border-box; width: 100%; }
+#mobile-draft-status { font-size: 12px; line-height: 1.4; }
+#mobile-draft-status[data-state=failed] { color: #b3261e; }
+html[data-workspace-mode=phone] .mobile-file-layer { align-items: end; }
+html[data-workspace-mode=phone] .mobile-file-sheet { border-radius: 18px 18px 10px 10px; }
+:is(html[data-workspace-mode=phone], html[data-workspace-mode=tablet]) .mobile-file-layer {
+  top: var(--workspace-viewport-top, 0px); bottom: auto;
+  height: var(--workspace-viewport-height, 100dvh);
+}
+:is(html[data-workspace-mode=phone], html[data-workspace-mode=tablet]) .mobile-file-sheet { max-height: 100%; }

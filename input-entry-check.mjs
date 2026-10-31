@@ -31,9 +31,9 @@ const clickNote = async (number, modifier) => {
   const target = page.locator('#score-pane g.entry text').filter({ hasText: new RegExp(`^${number}$`) }).first();
   await target.click(modifier ? { modifiers: ['Control'] } : {});
 };
-const snapshot = () => page.evaluate(() => ({ cursor: window.__app._input.snapshot(), text: window.__app.getText(), scroll: window.__app.scorePane.scrollTop }));
+const snapshot = () => page.evaluate(() => ({ mode: window.__app.interactionMode, cursor: window.__app._input.snapshot(), text: window.__app.getText(), scroll: window.__app.scorePane.scrollTop }));
 try {
-  await page.goto(`http://127.0.0.1:${server.address().port}/`, { waitUntil: 'networkidle' });
+  await page.goto(process.env.APP_TEST_URL || `http://127.0.0.1:${server.address().port}/`, { waitUntil: 'networkidle' });
   await reset();
   const initial = await snapshot();
   await page.locator('#btn-input-mode').click();
@@ -49,6 +49,10 @@ try {
   await page.locator('#btn-input-mode').click();
   assert.equal((await snapshot()).cursor.offset, '1', 'score entry follows selected note');
   assert.equal((await snapshot()).text, initial.text);
+  await page.keyboard.press('n');
+  assert.equal((await snapshot()).mode, 'select', 'N exits existing input back to selection');
+  await page.keyboard.press('n');
+  assert.equal((await snapshot()).cursor.offset, '1', 'N restores the remembered input entry');
 
   await reset();
   await clickNote('2'); await clickNote('5', true);
@@ -114,7 +118,13 @@ try {
   assert.equal((await snapshot()).cursor.offset, '1/3', 'triplet entry is exact');
 
   // New-document boundary clears old mode, source origin and cursor.
-  await page.evaluate(async () => { await window.__app.importBytes(new TextEncoder().encode('.Title\n.Voice\n7--- |]'), 'new.jpwabc'); });
+  await page.evaluate(() => {
+    window.__newDocumentImported = false;
+    void window.__app.importBytes(new TextEncoder().encode('.Title\n.Voice\n7--- |]'), 'new.jpwabc')
+      .then(() => { window.__newDocumentImported = true; });
+  });
+  await page.getByRole('button', { name: '不保存', exact: true }).click();
+  await page.waitForFunction(() => window.__newDocumentImported);
   assert.equal(await page.evaluate(() => window.__app.inputModeEnabled), false);
   await page.locator('#btn-input-mode').click();
   assert.equal((await snapshot()).cursor, null);
@@ -146,7 +156,8 @@ try {
   assert.ok(Math.abs((await snapshot()).scroll - selectedScroll) < 2, 'cross-page entry preserves visible position');
   await page.locator('#btn-select-mode').click();
   await page.locator('#btn-input-mode').click();
-  assert.equal((await snapshot()).cursor, null, 'reentry does not restore previous input session');
+  assert.equal((await snapshot()).cursor.measureIndex, 70, 'reentry restores previous input session without a new selection');
+  assert.equal((await snapshot()).cursor.offset, '1');
   assert.deepEqual(errors, []);
   console.log('Input entry: waiting, score/text active end, pending parse, chord/multiselect, grey continuation, triplet, document reset and scroll passed.');
 } finally { await browser.close(); await new Promise(resolve => server.close(resolve)); }

@@ -3,7 +3,9 @@
 // minimal valid .pptx deck, and zips with fflate. SMuFL glyphs become outline
 // freeforms via opentype.js (Bravura.otf).
 
-import { zipSync, type Zippable } from "fflate";
+import type { Zippable } from "fflate";
+import { compressArchive } from "./file-archive";
+import { throwIfFileTaskAborted, yieldFileTask } from "./file-task";
 import * as opentype from "opentype.js";
 import { asset } from "../common/asset";
 import {
@@ -80,7 +82,9 @@ function glyphSegs(font: opentype.Font, ch: string, size: number): { segs: PathS
 }
 
 // ---------------- tree walk -> shapes ----------------
-function collectShapes(item: PageItem, font: opentype.Font, out: Shape[]): void {
+function collectShapes(item: PageItem, font: opentype.Font, out: Shape[], includeRhythmGuides: boolean): void {
+  if (item.classes.has("notation-hidden-label")) return;
+  if (!includeRhythmGuides && (item.classes.has("rhythm-guide-line") || item.classes.has("rhythm-guide-tick"))) return;
   if (item instanceof GraphicLine) {
     const pp = item.pos(null);
     const x0 = item.p0.x + pp.x, y0 = item.p0.y + pp.y;
@@ -139,7 +143,7 @@ function collectShapes(item: PageItem, font: opentype.Font, out: Shape[]): void 
     return;
   }
   // Group / bare PageItem: recurse
-  for (const ch of item.children) collectShapes(ch, font, out);
+  for (const ch of item.children) collectShapes(ch, font, out, includeRhythmGuides);
 }
 
 // ---------------- OOXML shape builders ----------------
@@ -243,9 +247,23 @@ function buildDeck(slides: string[], wEmu: number, hEmu: number): Zippable {
   return z;
 }
 
-export async function buildPptx(painter: JinpuPainter, watermark?: WatermarkOptions): Promise<Uint8Array> {
+export interface PptxBuildOptions {
+  signal?: AbortSignal;
+  pages?: readonly number[];
+  onProgress?: (completed: number, total: number) => void;
+}
+
+export async function buildPptx(painter: JinpuPainter, watermark?: WatermarkOptions, includeRhythmGuides = false,
+  options: PptxBuildOptions = {}): Promise<Uint8Array> {
+  throwIfFileTaskAborted(options.signal);
   const font = await loadBravura();
-  const slides = painter.layout.pages.map((pg) => {
+  const pages = options.pages ? options.pages.map(index => painter.layout.pages[index]).filter(page => !!page)
+    : painter.layout.pages;
+  const slides: string[] = [];
+  for (let index = 0; index < pages.length; index++) {
+    await yieldFileTask(options.signal);
+    options.onProgress?.(index, pages.length);
+    const pg = pages[index];
     const shapes: Shape[] = [];
     const opts = watermark && normalizeWatermarkOptions(watermark);
     const value = opts?.text.trim() ?? "";
@@ -253,7 +271,7 @@ export async function buildPptx(painter: JinpuPainter, watermark?: WatermarkOpti
       const size = watermarkFontSize(value, painter.pageWidth, painter.pageHeight);
       const width = Math.min(painter.pageWidth * 0.59, [...value].length * size);
       const height = size * 1.3;
-      for (const [nx, ny] of watermarkPositions(opts.density)) {
+      for (const [nx, ny] of watermarkPositions(opts.density, painter.pageWidth, painter.pageHeight)) {
         shapes.push({
           kind: "text", x: painter.pageWidth * nx - width / 2,
           y: painter.pageHeight * ny - height / 2, w: width, h: height,
@@ -263,11 +281,13 @@ export async function buildPptx(painter: JinpuPainter, watermark?: WatermarkOpti
         });
       }
     }
-    collectShapes(pg, font, shapes);
-    return slideXml(shapes);
-  });
+    collectShapes(pg, font, shapes, includeRhythmGuides);
+    slides.push(slideXml(shapes));
+  }
+  throwIfFileTaskAborted(options.signal);
+  options.onProgress?.(pages.length, pages.length);
   const deck = buildDeck(slides, EMU(painter.pageWidth), EMU(painter.pageHeight));
-  return zipSync(deck);
+  return compressArchive(deck, options.signal);
 }
 
 // Minimal theme / master / layout (enough for PowerPoint + LibreOffice).

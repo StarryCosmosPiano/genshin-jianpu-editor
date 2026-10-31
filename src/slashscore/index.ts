@@ -1,4 +1,5 @@
 import { Fraction } from "../common/fraction";
+import { chordArpeggioPitchGroups, setChordArpeggioPitchGroups } from "../score/arpeggio";
 import {
   Chord,
   formatTempoBpm,
@@ -15,8 +16,7 @@ import {
   Tuplet,
   type TempoBeatUnit,
 } from "../score/score";
-import { midiToScore } from "../midi/importer";
-import { detectMidiSlashGestures, type MidiSlashGesture } from "../midi/gestures";
+import { midiToScore, detectMidiSlashGestures, importedMidiSlashGestures, type MidiSlashGesture } from "../midi";
 import type {
   MidiImportOptions,
   MidiQuantizeDivision,
@@ -26,15 +26,24 @@ import type {
 } from "../midi/types";
 import {
   applyNoteTimingEdits,
+  applyExplicitNoteTies,
+  noteTieAnnotations,
+  normalizeExplicitNoteTies,
+  partNeedsExplicitNoteTies,
+  type ExplicitNoteTie,
   normalizeNoteTimingEdits,
   normalizeScoreRestSpelling,
   type NoteTimingEditData,
 } from "../score/note-timing";
 import { applyKeyChangeKeepingDegrees } from "../score/key-edit";
 import { sliceBeatTupletEvents } from "./beat-sliced-tuplet";
+import { normalizeHeaderTypography, type HeaderTypography } from "../score/header-typography";
+import { projectSourceTimedRows } from "./add-slashes";
 
 export type SlashScoreKind = "keyboard" | "number";
-export type SlashDurationDivision = 4 | 8 | 16 | 32 | 64;
+// A generated mixed binary/triplet cell may need one explicit 128th value.
+// MIDI import UI quantization choices still stop at 64.
+export type SlashDurationDivision = 4 | 8 | 16 | 32 | 64 | 128;
 export type SlashGroupMode = "none" | "chord" | "subdivide" | "grace" | "arpeggio" | "triplet" | "trill";
 export type SlashDelimiterId = "brace" | "bracket" | "bar" | "angle" | "paren";
 /** Zero-width marker used by editable TXT scores to assign one pitch to a voice. */
@@ -112,6 +121,7 @@ export interface SlashOrdinaryTiming {
  * files so future versions can add annotations without breaking old builds.
  */
 export type NotationAnnotationData =
+  | ({ type: "note-tie"; measure: number; offset: number } & ExplicitNoteTie)
   | { type: "key"; measure: number; offset: number; fifths: number }
   | { type: "meter"; measure: number; beats: number; beatType: 2 | 4 | 8 | 16 }
   | { type: "tempo"; measure: number; offset: number; bpm: number; beatUnit?: TempoBeatUnit }
@@ -159,6 +169,8 @@ export type NotationAnnotationData =
     members?: number[];
     /** Silent members may be omitted from a compact overlapping bracket. */
     memberRests?: boolean[];
+    /** Printed members that continue the immediately preceding same-voice sound. */
+    memberContinuations?: boolean[];
     /** Binary cell value restored when the bracket is deleted. */
     restoreUnit?: number;
     /** Ordinary parallel atoms in source order, outside the 3:2 timing grid. */
@@ -169,6 +181,7 @@ export type NotationAnnotationData =
   | { type: "text"; part: number; measure: number; offset: number; text: string };
 
 export interface SlashScoreOptions {
+  headerTypography?: HeaderTypography;
   kind: SlashScoreKind;
   /** Keyboard TXT only: show A-Z key labels without changing pitch semantics. */
   keyboardKeyLabels?: boolean;
@@ -199,6 +212,9 @@ export interface SlashScoreOptions {
   noteDivision: SlashDurationDivision | null;
   /** True means every `/` segment is one complete measure rather than one beat group. */
   wholeMeasureGroups?: boolean;
+  /** Imported literal rows keep their source spelling; slash marks do not truncate durations. */
+  sourceTimedRows?: boolean;
+  adjacentAsChord?: boolean;
   /** Write a completely empty slash group as ` - ` instead of duration markers. */
   emptyGroupsAsRests?: boolean;
   /** Whether keyboard/number TXT should preserve explicit rest tokens. */
@@ -230,9 +246,12 @@ export interface SlashMeterSuggestion {
   groupsPerMeasure: number;
   groupQuarterNotes: number;
   explicit: boolean;
+  /** Evidence did not identify a conventional meter; the importer must ask. */
+  requiresInput?: boolean;
 }
 
 export interface SlashScoreAnalysis {
+  headerTypography?: HeaderTypography;
   detectedKind: SlashScoreKind;
   keyboardKeyLabels: boolean;
   keyboardTieAsZero: boolean;
@@ -242,6 +261,11 @@ export interface SlashScoreAnalysis {
   commentCount: number;
   ignoredTagCount: number;
   observedSymbols: string[];
+  observedDelimiters?: SlashDelimiterId[];
+  requiresMeterInput?: boolean;
+  /** Newly detected duration symbols must be assigned before importing. */
+  requiresSymbolMapping?: boolean;
+  timingInferred?: boolean;
   containsScoreSpaces: boolean;
   suggestedMappings: Record<string, SlashDurationDivision>;
   multiDurationSymbols: boolean;
@@ -249,6 +273,8 @@ export interface SlashScoreAnalysis {
   suggestedNoteDivision: SlashDurationDivision | null;
   /** The imported TXT uses one complete measure per `/` segment. */
   wholeMeasureGroups: boolean;
+  sourceTimedRows?: boolean;
+  adjacentAsChord?: boolean;
   emptyGroupsAsRests: boolean;
   showExplicitRests: boolean;
   meter: SlashMeterSuggestion;
@@ -366,7 +392,30 @@ interface SourceLines {
   ignoredTags: number;
 }
 
+function mapProjectedSources(sources: SlashPitchSource[], offsets: readonly number[]): SlashPitchSource[] {
+  return sources.flatMap(source => {
+    const from = offsets[source.from];
+    const last = offsets[source.to - 1];
+    if (from === undefined || last === undefined || from < 0 || last < from) return [];
+    const marker = offsets[source.markerFrom];
+    return [{ ...source, from, to: last + 1,
+      markerFrom: marker !== undefined && marker >= 0 ? marker : from }];
+  });
+}
+
+function mapProjectedDiagnostics(diagnostics: SlashScoreDiagnostic[], offsets: readonly number[], text: string): SlashScoreDiagnostic[] {
+  return diagnostics.map(diagnostic => {
+    const positions = offsets.slice(diagnostic.from, diagnostic.to).filter(position => position >= 0);
+    const from = positions[0] ?? 0;
+    const to = positions.length ? positions[positions.length - 1] + 1 : from;
+    return { ...diagnostic, from, to, line: text.slice(0, from).split(/\r\n|\r|\n/).length };
+  });
+}
+
 interface Directives {
+  sourceTimedRows?: boolean;
+  adjacentAsChord?: boolean;
+  headerTypography?: HeaderTypography;
   kind: SlashScoreKind | null;
   keyboardKeyLabels: boolean | null;
   keyboardTieAsZero: boolean | null;
@@ -402,6 +451,8 @@ interface Directives {
   noteTimingEdits: NoteTimingEditData[];
 }
 
+type SlashArpeggioGroup = Array<{ part: number; pitch: number }>;
+
 interface TimedEvent {
   start: number;
   end: number;
@@ -422,6 +473,7 @@ interface TimedEvent {
   arpeggio?: boolean;
   /** Only this subset receives the wave when a simultaneous main pitch is present. */
   arpeggioPitches?: number[];
+  arpeggioGroups?: SlashArpeggioGroup[];
   /** A semantic mordent/trill written as nested timing containers. */
   ornamentKind?: "upper-mordent" | "lower-mordent" | "trill";
   /** Zero-based part/voice index. Old single-voice events omit this field. */
@@ -443,6 +495,8 @@ interface TimedEvent {
   /** Explicitly voice-marked TXT containers stay voice-local even when the
    * source has no persisted @jpeditor ownership annotation yet. */
   tripletScope?: "voice" | "all";
+  /** A sustained ordinary note written on an existing shared 3:2 grid. */
+  tripletSpelling?: boolean;
 }
 
 interface PitchToken {
@@ -450,7 +504,7 @@ interface PitchToken {
   next: number;
 }
 
-const DIVISIONS: SlashDurationDivision[] = [4, 8, 16, 32, 64];
+const DIVISIONS: SlashDurationDivision[] = [4, 8, 16, 32, 64, 128];
 const DEGREE_INTERVALS = [0, 2, 4, 5, 7, 9, 11];
 const KEYBOARD_ROWS = ["ZXCVBNM", "ASDFGHJ", "QWERTYU"] as const;
 const LINE_TAG_RE = /\[(?:line|end)\s*\d+\s*\]/gi;
@@ -508,12 +562,11 @@ function looksLikeScoreLine(line: string, inScoreSection = false): boolean {
     // must survive TXT save/reopen instead of being mistaken for prose.
     if (withoutTags.includes("0")
       && /^[\s\u20630()[\]{}<>|.=*_~:·/]+$/.test(withoutTags)) return true;
-    // MIDI-to-TXT can legitimately emit a completely silent measure as
-    // `..../..../..../..../`.  Inside an explicit keyboard/number section it
-    // is unambiguously score data; dropping it shifts every later meter and
-    // tempo annotation one measure to the left.
+    // Explicit score sections can contain whole continuation measures or
+    // a final short continuation group. A single closing slash still marks
+    // score data; dropping it would shorten the preceding sustained note.
     return inScoreSection
-      && slashCount >= 2
+      && slashCount >= 1
       && /^[\s.=*_~:·/]+$/.test(withoutTags);
   }
   const nonSpace = Array.from(withoutTags).filter((c) => !/\s/.test(c) && c !== SLASH_VOICE_SEPARATOR);
@@ -606,6 +659,49 @@ export function hasSlashScoreLines(text: string, kind: SlashScoreKind): boolean 
   return records.some((_record, index) => selectedScoreLine(records, index, kind));
 }
 
+/** Original accepted rows, shared with live TXT syntax/metadata maintenance. */
+export function slashScoreSourceRows(text: string, kind: SlashScoreKind): Array<{
+  from: number; to: number; text: string;
+}> {
+  const records = sourceLineRecords(text);
+  return records.filter((_record, index) => selectedScoreLine(records, index, kind))
+    .map((record) => ({ from: record.from, to: record.to, text: record.raw }));
+}
+
+/** Musical coordinate of a source container, including silent groups that
+ * have no pitch-source mapping. Used to retain/remove their saved timing. */
+export function slashSourcePosition(text: string, position: number, options: SlashScoreOptions): {
+  measure: number; offset: number;
+} | null {
+  const records = sourceLineRecords(text);
+  const rows = records.filter((_record, index) => selectedScoreLine(records, index, options.kind));
+  const rowIndex = rows.findIndex((row) => position >= row.from && position <= row.to);
+  if (rowIndex < 0) return null;
+  const row = rows[rowIndex];
+  let meter = { beats: options.beats, beatType: options.beatType };
+  for (const record of records) {
+    if (record.from >= row.from) break;
+    const match = /^\s*(\d{1,2})\s*\/\s*(2|4|8|16)\s*拍\s*[：:]\s*$/.exec(record.raw);
+    if (match) meter = { beats: Number(match[1]), beatType: Number(match[2]) };
+  }
+  const groupCount = groupsForMeter(meter as SlashMeterSuggestion);
+  const groupLength = meter.beats * 4 / meter.beatType / groupCount;
+  const whole = options.wholeMeasureGroups ?? slashGroupsUseWholeMeasures(
+    rows.map((record) => record.text), options, groupLength, meter.beats * 4 / meter.beatType,
+  );
+  const preceding = row.raw.slice(0, position - row.from);
+  const group = (preceding.match(/\//g) ?? []).length;
+  const measure = whole
+    ? rows.slice(0, rowIndex).reduce((sum, record) => sum + splitGroups(record.text).length, 0) + group
+    : rows.length === 1 ? Math.floor(group / groupCount) : rowIndex;
+  const groupOffset = whole ? 0 : group % groupCount * groupLength;
+  const prefix = stripLineTags(preceding.slice(preceding.lastIndexOf("/") + 1)).text;
+  return { measure, offset: groupOffset + segmentMarkerDuration(prefix,
+    effectiveMappings(options), options.braceMode, options.noteDivision,
+    options.bracketMode ?? "triplet", { ...options, durationMeasure: measure, durationOffset: groupOffset },
+    undefined, false, options.voiceCount, false, false) };
+}
+
 export interface SlashDelimiterMigrationResult {
   text: string;
   changed: number;
@@ -649,6 +745,302 @@ export function migrateSlashDelimiters(
   const lines = records.map((record, index) =>
     selectedScoreLine(records, index, current.kind) ? rewrite(record.raw) : record.raw);
   return { text: bom + lines.join(lineEnding), changed };
+}
+
+export interface SlashDelimiterClearResult {
+  text: string;
+  options: SlashScoreOptions;
+  removed: number;
+}
+
+/** Clearing a delimiter is an edit to its source syntax, not merely a parser
+ * preference. Stage the entire rewrite before returning, so callers can keep
+ * text and settings unchanged if a restored ordinary value does not fit. */
+export function clearSlashDelimiters(
+  text: string, current: SlashScoreOptions, next: SlashScoreOptions,
+): SlashDelimiterClearResult {
+  const disabled = new Set(slashDelimiterSpecs(current)
+    .filter(spec => spec.mode !== "none"
+      && slashDelimiterSpecs(next).find(target => target.id === spec.id)?.mode === "none")
+    .map(spec => spec.id));
+  const options = { ...next, symbolDurations: { ...next.symbolDurations } };
+  if (!disabled.size) return { text, options, removed: 0 };
+  const mappings = effectiveMappings(next);
+  const ownUnit = next.noteDivision ? 4 / next.noteDivision : 0;
+  const separator = next.spaceDivision ? "\t" : " ";
+  const finest = Math.max(4, current.noteDivision ?? 4, ...Object.values(effectiveMappings(current)));
+  const atomsFallback = 4 / finest;
+  const records = sourceLineRecords(text);
+  const selected = records.filter((_record, index) => selectedScoreLine(records, index, current.kind));
+  const originalGroupLength = current.beats >= 6 && current.beatType === 8 && current.beats % 3 === 0
+    ? 1.5 : 4 / current.beatType;
+  const wholeMeasures = current.wholeMeasureGroups ?? slashGroupsUseWholeMeasures(
+    selected.map(record => record.text), current, originalGroupLength, current.beats * 4 / current.beatType,
+  );
+  type ClearedRange = { measure: number; from: number; to: number; groupEnd: number;
+    mode: SlashGroupMode; delta: number; part: number | null };
+  const cleared: ClearedRange[] = [];
+  const retainedOrnaments: { measure: number; offset: number }[] = [];
+  let removed = 0;
+  let reencoded = 0;
+  let restoredTriplet = false;
+  let measure = 0;
+  let meter = { beats: current.beats, beatType: current.beatType };
+  const exactDuration = (duration: number, line: number): string => {
+    if (duration < -1e-8) throw new Error(`第 ${line} 行三连音成员比音符自身时值更短，请先把自身时值改到所需最短时值再取消括号。`);
+    let remaining = Math.max(0, duration);
+    let result = "";
+    const alphabet = Object.entries(mappings).sort((a, b) => a[1] - b[1]);
+    for (const [glyph, division] of alphabet) {
+      const unit = 4 / division;
+      const count = Math.floor((remaining + 1e-8) / unit);
+      result += glyph.repeat(count);
+      remaining -= count * unit;
+    }
+    if (remaining > 1e-8) {
+      const required = [4, 8, 16, 32, 64, 128].find(value =>
+        Math.abs(duration * value / 4 - Math.round(duration * value / 4)) < 1e-8) ?? 128;
+      throw new Error(`第 ${line} 行取消三连音需要至少 ${required} 分音符时值，请先设置可精确表示的细单位；原文和设置未更改。`);
+    }
+    return result;
+  };
+  const spanDuration = (body: string, fillTail = true): number => segmentMarkerDuration(body,
+    effectiveMappings(current), current.braceMode, current.noteDivision,
+    current.bracketMode ?? "triplet", current, undefined, false, current.voiceCount, false, fillTail);
+  const rewrite = (source: string, line: number, measureIndex: number, groupStart: number,
+    groupEnd: number, origin = 0): string => {
+    let result = "";
+    for (let index = 0; index < source.length;) {
+      const tag = /^\[(?:line|end)\s*\d+\s*\]/i.exec(source.slice(index));
+      if (tag) { result += tag[0]; index += tag[0].length; continue; }
+      const container = slashContainerAt(source, index, current);
+      if (!container) { result += source[index]; index++; continue; }
+      const rawBody = source.slice(container.bodyFrom, container.bodyTo);
+      let containerEnd = container.end;
+      const from = groupStart + origin + spanDuration(source.slice(0, index), false);
+      const isDisabled = disabled.has(container.spec.id);
+      const preserveTripletInBareSyntax = container.spec.mode === "triplet"
+        && !isDisabled && slashUsesBareChords(next) && !slashUsesBareChords(current);
+      if (container.spec.mode === "triplet" && (isDisabled || preserveTripletInBareSyntax)) {
+        let nestedSubdivision = false;
+        const checkNested = (body: string): void => {
+          for (let cursor = 0; cursor < body.length;) {
+            const nested = slashContainerAt(body, cursor, current);
+            if (nested?.spec.mode === "triplet"
+              && !semanticMordentAtom(body.slice(nested.bodyFrom, nested.bodyTo), current)) {
+              throw new Error(`第 ${line} 行包含源解析不支持的嵌套节奏分组，无法精确恢复普通顺序时值，请先整理内层分组再取消；原文和设置未更改。`);
+            }
+            if (nested?.spec.mode === "subdivide") {
+              nestedSubdivision = true;
+              checkNested(body.slice(nested.bodyFrom, nested.bodyTo));
+            }
+            if (nested?.spec.mode === "triplet") nestedSubdivision = true;
+            cursor = nested?.end ?? cursor + 1;
+          }
+        };
+        checkNested(rawBody);
+        const atoms = timedContainerAtoms(rawBody, current, atomsFallback,
+          Array.from({ length: current.voiceCount }, (_unused, voice) => voice));
+        if (isDisabled && current.noteDivision !== null) {
+          const stored = current.annotations?.find((item): item is Extract<NotationAnnotationData, { type: "triplet" }> =>
+            item.type === "triplet" && item.measure === measureIndex
+            && Math.abs(item.offset - from) <= 1 / 192 && item.end !== undefined
+            && (item.members?.length ?? 0) > 0);
+          if (stored?.members?.length === atoms.length) {
+            atoms.forEach((atom, index) => { atom.nominalDuration = stored.members![index]!; });
+          } else if (!stored) {
+            let budget = 4 / current.noteDivision;
+            const sourceMappings = effectiveMappings(current);
+            while (sourceMappings[source[containerEnd] ?? ""] !== undefined) {
+              budget += 4 / sourceMappings[source[containerEnd]!]!;
+              containerEnd++;
+            }
+            const weight = atoms.reduce((sum, atom) => sum + atom.nominalDuration, 0);
+            // Removing 3:2 restores the members' written values, derived
+            // from the whole bracket's real budget rather than its weights.
+            if (weight > 1e-9) atoms.forEach((atom) => { atom.nominalDuration *= budget * 1.5 / weight; });
+          }
+        }
+        // The source parser flattens subdivision members inside a tuplet.
+        // Once the outer tuplet is removed, that still-enabled subdivision
+        // applies its own half-value. Spell its members twice as long so only
+        // the removed outer 3:2 ratio changes, while keeping every inner atom.
+        let renderedAtoms = 0;
+        const nestedPieces = (body: string, offset: number, depth: number): string => {
+          let written = "";
+          for (let cursor = 0; cursor < body.length;) {
+            const nested = slashContainerAt(body, cursor, current);
+            if (nested?.spec.mode === "subdivide") {
+              const innerDisabled = disabled.has(nested.spec.id);
+              const inner = nestedPieces(body.slice(nested.bodyFrom, nested.bodyTo),
+                offset + nested.bodyFrom, depth + (innerDisabled ? 0 : 1));
+              if (innerDisabled) removed++;
+              written += (innerDisabled ? inner
+                : nested.spec.open + inner + nested.spec.close) + separator;
+              cursor = nested.end;
+              continue;
+            }
+            const atomIndex = atoms.findIndex(atom => atom.sourceFrom === offset + cursor);
+            if (atomIndex < 0) { cursor++; continue; }
+            const atom = atoms[atomIndex]!;
+            renderedAtoms++;
+            let end = body.length;
+            for (let scan = cursor + 1; scan < body.length;) {
+              const following = slashContainerAt(body, scan, current);
+              if (following?.spec.mode === "subdivide"
+                || atoms.some(item => item.sourceFrom === offset + scan)) { end = scan; break; }
+              scan = following?.end ?? scan + 1;
+            }
+            let token = "";
+            const chunk = body.slice(cursor, end);
+            for (let scan = 0; scan < chunk.length;) {
+              const inner = slashContainerAt(chunk, scan, current);
+              if (inner) {
+                if (inner.spec.mode === "triplet") {
+                  if (disabled.has(inner.spec.id)) {
+                    const helperBody = chunk.slice(inner.bodyFrom, inner.bodyTo);
+                    const main = semanticMordentAtom(helperBody, current)!;
+                    token += helperBody.slice(main.from, main.to);
+                    removed++;
+                  } else {
+                    retainedOrnaments.push({ measure: measureIndex, offset: from
+                      + atoms.slice(0, atomIndex).reduce((sum, item) => sum + item.nominalDuration, 0) * 2 / 3 });
+                    token += chunk.slice(scan, inner.end);
+                  }
+                } else token += rewrite(chunk.slice(scan, inner.end), line, measureIndex,
+                  from, groupEnd, 0);
+                scan = inner.end;
+              } else if (effectiveMappings(current)[chunk[scan]] !== undefined
+                || /\s/.test(chunk[scan])) scan++;
+              else { token += chunk[scan]; scan++; }
+            }
+            const innerFactor = isDisabled && depth > 0 ? 2 : 1;
+            written += token + exactDuration(atom.nominalDuration * innerFactor - ownUnit, line)
+              + separator;
+            cursor = end;
+          }
+          return written.endsWith(separator) ? written.slice(0, -separator.length) : written;
+        };
+        // Preserve each atom's original pitch/ornament spelling. Remove only
+        // its outer duration glyphs, then spell the ordinary value explicitly.
+        const pieces = nestedSubdivision ? [nestedPieces(rawBody, 0, 0)] : atoms.map((atom, atomIndex) => {
+          const start = atom.sourceFrom ?? 0;
+          const end = atoms[atomIndex + 1]?.sourceFrom ?? rawBody.length;
+          const chunk = rawBody.slice(start, end);
+          let token = "";
+          for (let cursor = 0; cursor < chunk.length;) {
+            const nested = slashContainerAt(chunk, cursor, current);
+            if (nested) {
+              token += rewrite(chunk.slice(cursor, nested.end), line, measureIndex,
+                from, groupEnd, 0);
+              cursor = nested.end;
+            } else if (effectiveMappings(current)[chunk[cursor]] !== undefined
+              || /\s/.test(chunk[cursor])) cursor++;
+            else { token += chunk[cursor]; cursor++; }
+          }
+          return token + exactDuration(atom.nominalDuration - ownUnit, line);
+        });
+        if (nestedSubdivision && renderedAtoms !== atoms.length) {
+          throw new Error(`第 ${line} 行嵌套节奏分组的成员无法完整恢复；原文和设置未更改。`);
+        }
+        if (!atoms.length) throw new Error(`第 ${line} 行三连音没有可恢复的普通音符，请先整理括号内容。`);
+        const ordinaryLength = atoms.reduce((sum, atom) => sum + atom.nominalDuration, 0);
+        const oldLength = ordinaryLength * 2 / 3;
+        if (isDisabled) {
+          cleared.push({ measure: measureIndex, from, to: from + oldLength, groupEnd,
+            mode: "triplet", delta: ordinaryLength - oldLength,
+            part: explicitTimedContainerVoice(rawBody) });
+          result += pieces.join(separator);
+          restoredTriplet = true;
+          removed++;
+        } else {
+          result += container.spec.open + pieces.join(separator) + container.spec.close;
+          reencoded++;
+        }
+      } else {
+        const body = rewrite(rawBody, line, measureIndex, groupStart, groupEnd,
+          origin + spanDuration(source.slice(0, index), false));
+        if (isDisabled) {
+          cleared.push({ measure: measureIndex, from,
+            to: from + (container.spec.mode === "chord" ? 0 : spanDuration(rawBody)),
+            groupEnd, mode: container.spec.mode, delta: 0,
+            part: explicitTimedContainerVoice(rawBody) });
+          result += body;
+          removed++;
+        } else result += container.spec.open + body + container.spec.close;
+      }
+      index = containerEnd;
+    }
+    return result;
+  };
+  const output = records.map((record, recordIndex) => {
+    const meterMatch = /^\s*(\d{1,2})\s*\/\s*(2|4|8|16)\s*拍\s*[：:]\s*$/.exec(record.raw);
+    if (meterMatch) meter = { beats: Number(meterMatch[1]), beatType: Number(meterMatch[2]) };
+    if (!selectedScoreLine(records, recordIndex, current.kind)) return record.raw;
+    const groupCount = groupsForMeter({ ...meter } as SlashMeterSuggestion);
+    const length = meter.beats * 4 / meter.beatType;
+    const capacity = wholeMeasures ? length : length / groupCount;
+    const comment = /\s\/\/|[;；]/.exec(record.raw);
+    const codeEnd = comment?.index ?? record.raw.length;
+    const groups = record.raw.slice(0, codeEnd).split("/");
+    const realGroups = splitGroups(record.raw.slice(0, codeEnd)).length;
+    const continuous = selected.length === 1 && !wholeMeasures;
+    const rewritten = groups.map((group, groupIndex) => {
+      if (groupIndex >= realGroups) return group;
+      const measureIndex = wholeMeasures ? measure + groupIndex
+        : continuous ? measure + Math.floor(groupIndex / groupCount) : measure;
+      const groupStart = wholeMeasures ? 0 : (groupIndex % groupCount) * capacity;
+      const before = removed;
+      const value = rewrite(group, record.line, measureIndex, groupStart, groupStart + capacity);
+      if (removed > before && restoredTriplet && !current.sourceTimedRows) {
+        const duration = segmentMarkerDuration(value, mappings, next.braceMode,
+          next.noteDivision, next.bracketMode ?? "triplet", next,
+          undefined, false, next.voiceCount);
+        if (duration > capacity + 1e-8) {
+          throw new Error(`第 ${record.line} 行第 ${groupIndex % groupCount + 1} 拍取消三连音后放不下，请先腾出空间再取消；原文和设置未更改。`);
+        }
+      }
+      return value;
+    });
+    measure += wholeMeasures ? realGroups : continuous ? Math.ceil(realGroups / groupCount) : 1;
+    return rewritten.join("/") + record.raw.slice(codeEnd);
+  });
+  if (!removed && !reencoded) return { text, options, removed: 0 };
+  if (restoredTriplet) options.wholeMeasureGroups = wholeMeasures;
+  if (slashUsesBareChords(options)) options.adjacentAsChord = true;
+  const remap = (measureIndex: number, offset: number): number => {
+    let moved = offset;
+    for (const range of cleared.filter(item => item.mode === "triplet" && item.measure === measureIndex)) {
+      if (offset >= range.to - 1e-8 && offset < range.groupEnd - 1e-8) moved += range.delta;
+      else if (offset >= range.from && offset < range.to) moved += (offset - range.from) / 2;
+    }
+    return moved;
+  };
+  options.annotations = (next.annotations ?? current.annotations ?? []).filter(annotation => {
+    if (annotation.type !== "triplet" && annotation.type !== "cross-arpeggio"
+      && annotation.type !== "ornament") return true;
+    if (annotation.type === "ornament" && retainedOrnaments.some(item =>
+      item.measure === annotation.measure && Math.abs(item.offset - annotation.offset) < 1e-8)) return true;
+    return !cleared.some(range => range.measure === annotation.measure
+      && annotation.offset >= range.from - 1e-8
+      && (Math.abs(annotation.offset - range.from) < 1e-8 || annotation.offset < range.to - 1e-8)
+      && (range.part === null || !("part" in annotation) || annotation.part === range.part)
+      && (annotation.type === "triplet" && range.mode === "triplet"
+        || annotation.type === "cross-arpeggio" && range.mode === "arpeggio"
+        || annotation.type === "ornament" && (range.mode === "trill"
+          || range.mode === "triplet")));
+  }).map(annotation => {
+    if ("measure" in annotation && "offset" in annotation) return { ...annotation,
+      offset: remap(annotation.measure, annotation.offset),
+      ...(annotation.type === "triplet" && annotation.end !== undefined
+        ? { end: remap(annotation.measure, annotation.end) } : {}) };
+    if (annotation.type === "slur" || annotation.type === "tempo-ramp") return { ...annotation,
+      from: { ...annotation.from, offset: remap(annotation.from.measure, annotation.from.offset) },
+      to: { ...annotation.to, offset: remap(annotation.to.measure, annotation.to.offset) } };
+    return annotation;
+  });
+  const lineEnding = text.includes("\r\n") ? "\r\n" : "\n";
+  return { text: (text.startsWith("\uFEFF") ? "\uFEFF" : "") + output.join(lineEnding), options, removed };
 }
 
 function sourceLines(text: string, kind?: SlashScoreKind): SourceLines {
@@ -783,10 +1175,10 @@ function straySlashVoiceMarkerCount(text: string, kind?: SlashScoreKind): number
 function divisionFromText(value: string): SlashDurationDivision | null {
   const normalized = value.replace(/\s/g, "");
   const chinese: Array<[RegExp, SlashDurationDivision]> = [
-    [/六十四分/, 64], [/三十二分/, 32], [/十六分/, 16], [/八分/, 8], [/四分/, 4],
+    [/一百二十八分/, 128], [/六十四分/, 64], [/三十二分/, 32], [/十六分/, 16], [/八分/, 8], [/四分/, 4],
   ];
   for (const [pattern, division] of chinese) if (pattern.test(normalized)) return division;
-  const numeric = /(?:^|[^\d])(64|32|16|8|4)\s*分/.exec(value);
+  const numeric = /(?:^|[^\d])(128|64|32|16|8|4)\s*分/.exec(value);
   return numeric ? parseInt(numeric[1], 10) as SlashDurationDivision : null;
 }
 
@@ -812,6 +1204,10 @@ export function normalizeNotationAnnotations(value: unknown): NotationAnnotation
     if (!item || typeof item !== "object") return [];
     const record = item as Record<string, unknown>;
     const type = record.type;
+    if (type === "note-tie") {
+      return normalizeExplicitNoteTies([record]).map(tie => ({ ...tie, type,
+        measure: tie.from.measure, offset: Fraction.fromString(tie.from.offset).toFloat() }));
+    }
     if (type === "meter") {
       const measure = Math.round(Number(record.measure));
       const beats = Math.round(Number(record.beats));
@@ -933,6 +1329,10 @@ export function normalizeNotationAnnotations(value: unknown): NotationAnnotation
         && record.memberRests.length === members.length
         && record.memberRests.every((value) => typeof value === "boolean")
         ? record.memberRests as boolean[] : undefined;
+      const memberContinuations = Array.isArray(record.memberContinuations)
+        && record.memberContinuations.length === members.length
+        && record.memberContinuations.every((value) => typeof value === "boolean")
+        ? record.memberContinuations as boolean[] : undefined;
       const ordinary: SlashOrdinaryTiming[] = Array.isArray(record.ordinary)
         ? record.ordinary.flatMap((item) => {
           if (!item || typeof item !== "object") return [];
@@ -953,6 +1353,7 @@ export function normalizeNotationAnnotations(value: unknown): NotationAnnotation
           ...(end !== null && end > offset ? { end } : {}),
           ...(members.length > 0 ? { members } : {}),
           ...(memberRests ? { memberRests } : {}),
+          ...(memberContinuations ? { memberContinuations } : {}),
           ...(restoreUnit !== null ? { restoreUnit } : {}),
           ...(ordinary.length > 0 ? { ordinary } : {}),
           ...(record.beatSlices === true ? { beatSlices: true } : {}),
@@ -1196,7 +1597,7 @@ function readDirectives(text: string): Directives {
     const doubleDot = /^\s*两个点\s*[=：:]\s*(.*?)\s*$/.exec(line);
     if (doubleDot) {
       const combined = divisionFromText(doubleDot[1]);
-      if (combined && combined < 64) result.mappings["."] = (combined * 2) as SlashDurationDivision;
+      if (combined && combined < 128) result.mappings["."] = (combined * 2) as SlashDurationDivision;
     }
     const symbol = /^\s*符号\s*[（(](.*?)[）)]\s*[=：:]\s*(.*?)\s*$/.exec(line);
     if (symbol) {
@@ -1220,13 +1621,18 @@ function readDirectives(text: string): Directives {
     }
     const groupMode = (label: string): SlashGroupMode | null => {
       if (!line.includes(label)) return null;
-      if (/(?:留空|忽略|不使用|无特殊功能)/.test(line)) return "none";
-      if (/(?:和弦|同时按)/.test(line)) return "chord";
-      if (/倚音/.test(line)) return "grace";
-      if (/琶音/.test(line)) return "arpeggio";
-      if (/三连音/.test(line)) return "triplet";
-      if (/颤音|\bTr\b/i.test(line)) return "trill";
-      if (/(?:细分|计拍|最低)/.test(line)) return "subdivide";
+      // The assigned mode is authoritative. Exported explanations such as
+      // “琶音（按滚奏和弦处理）” must not override it with a later keyword.
+      // Keep the legacy whole-line reader for directives without assignment.
+      const assignment = line.match(new RegExp(`^\\s*${label}\\s*[=：:]\\s*(.*)$`));
+      const modeText = assignment?.[1].split(/[（(]/, 1)[0].trim() || line;
+      if (/(?:留空|忽略|不使用|无特殊功能)/.test(modeText)) return "none";
+      if (/(?:和弦|同时按)/.test(modeText)) return "chord";
+      if (/倚音/.test(modeText)) return "grace";
+      if (/琶音/.test(modeText)) return "arpeggio";
+      if (/三连音/.test(modeText)) return "triplet";
+      if (/颤音|\bTr\b/i.test(modeText)) return "trill";
+      if (/(?:细分|计拍|最低)/.test(modeText)) return "subdivide";
       return null;
     };
     result.braceMode = groupMode("花括号") ?? result.braceMode;
@@ -1246,6 +1652,7 @@ function readDirectives(text: string): Directives {
         bu?: TempoBeatUnit;
         sp?: SlashDurationDivision | null; nd?: SlashDurationDivision | null;
         wg?: boolean;
+        st?: boolean; ac?: boolean;
         ms?: boolean;
         er?: boolean;
         ri?: boolean;
@@ -1258,8 +1665,10 @@ function readDirectives(text: string): Directives {
         kc?: SlashKeyChange[];
         an?: unknown;
         ne?: NoteTimingEditData[];
+        ht?: unknown;
       };
       const value = JSON.parse(stored[1]) as Stored;
+      result.headerTypography = normalizeHeaderTypography(value.headerTypography ?? value.ht);
       const storedKind = value.kind ?? (value.k === "k" ? "keyboard" : value.k === "n" ? "number" : undefined);
       if (storedKind === "keyboard" || storedKind === "number") result.kind = storedKind;
       const storedKeyboardKeyLabels = value.keyboardKeyLabels ?? value.kl;
@@ -1322,6 +1731,10 @@ function readDirectives(text: string): Directives {
         result.noteDivision = storedNote as SlashDurationDivision | null;
       }
       const storedWholeMeasureGroups = value.wholeMeasureGroups ?? value.wg;
+      const sourceTimedRows = value.sourceTimedRows ?? value.st;
+      const adjacentAsChord = value.adjacentAsChord ?? value.ac;
+      if (typeof sourceTimedRows === "boolean") result.sourceTimedRows = sourceTimedRows;
+      if (typeof adjacentAsChord === "boolean") result.adjacentAsChord = adjacentAsChord;
       if (typeof storedWholeMeasureGroups === "boolean") {
         result.wholeMeasureGroups = storedWholeMeasureGroups;
       }
@@ -1412,14 +1825,21 @@ function detectKind(text: string, lines: SourceLines, directive: Directives): Sl
   return keyboardCount > numberCount ? "keyboard" : "number";
 }
 
-function observedSymbols(lines: string[]): { symbols: string[]; spaces: boolean } {
+function observedSymbols(lines: string[], kind?: SlashScoreKind): { symbols: string[]; spaces: boolean } {
   const found = new Set<string>();
   let spaces = false;
   for (const line of lines) {
+    const hasDurationMinus = kind === "keyboard" && line.split("/")
+      .some(group => group.includes("-") && !/^\s*-\s*$/.test(group));
     for (const char of Array.from(line)) {
       if (char === " ") { spaces = true; continue; }
       if (/\s/.test(char)) continue;
       if (char === SLASH_VOICE_SEPARATOR) continue;
+      if (kind === "keyboard" && (char === "+" || char === "-")) {
+        // A whole rest slash group is not a duration symbol.
+        if (char !== "-" || hasDurationMinus) found.add(char);
+        continue;
+      }
       if (/[A-Za-z0-9+\-#♭♯/(){}<>|[\],']/.test(char)) continue;
       found.add(char);
     }
@@ -1445,6 +1865,8 @@ function effectiveMappings(
   for (const reserved of ["{", "}", "[", "]", "<", ">", "|", "(", ")"]) {
     delete mappings[reserved];
   }
+  // Tab is a formatting separator, including in legacy options comments.
+  delete mappings["\t"];
   if (options.spaceDivision) mappings[" "] = options.spaceDivision;
   else delete mappings[" "];
   return mappings;
@@ -1468,6 +1890,10 @@ function slashDelimiterSpecs(options: SlashDelimiterModes): SlashDelimiterSpec[]
     { id: "angle", open: "<", close: ">", mode: options.angleMode ?? "grace" },
     { id: "paren", open: "(", close: ")", mode: options.parenMode ?? "chord" },
   ];
+}
+
+export function slashUsesBareChords(options: SlashDelimiterModes): boolean {
+  return !slashDelimiterSpecs(options).some(spec => spec.mode === "chord");
 }
 
 function slashDelimiterAt(
@@ -1738,11 +2164,13 @@ function segmentMarkerDuration(
   braceMode: SlashBraceMode,
   noteDivision: SlashDurationDivision | null = null,
   bracketMode: SlashGroupMode = "triplet",
-  extraModes: Partial<Pick<SlashScoreOptions, "barMode" | "angleMode" | "parenMode" | "annotations">> = {},
+  extraModes: Partial<Pick<SlashScoreOptions, "barMode" | "angleMode" | "parenMode" | "annotations">>
+    & { durationMeasure?: number; durationOffset?: number } = {},
   parallelGroupLimit?: number,
   semanticMordent = false,
   voiceCountHint?: number,
   sequentialTuplets = false,
+  fillUnvaluedTail = true,
 ): number {
   let duration = 0;
   const pitchKind: SlashScoreKind = /[A-Z]/.test(segment) ? "keyboard" : "number";
@@ -1851,7 +2279,11 @@ function segmentMarkerDuration(
       const atomCount = braceAtomsText(content, modes).length;
       let containerDuration = 0;
       if (mode === "triplet") {
-        containerDuration = (nominal > 1e-8 ? nominal : atomCount * (noteUnit || braceUnit)) * 2 / 3;
+        // With intrinsic timing the bracket is one timed unit. Its members
+        // describe relative weights, not additional ordinary note values.
+        containerDuration = noteUnit > 0 && atomCount > 0
+          ? noteUnit
+          : (nominal > 1e-8 ? nominal : atomCount * braceUnit) * 2 / 3;
       } else if (mode === "subdivide") {
         // An angle container around a triplet (`<[...]>`) has two nested
         // timing transforms: the inner 3:2 group occupies 2/3 of its
@@ -1877,23 +2309,42 @@ function segmentMarkerDuration(
         // three finer members occupy one ordinary base cell (2/3 of their
         // nominal span).  Dividing `innerSpan` again was the source of the
         // 0.75-beat diagnostics for `<[ASA]>`.
-        containerDuration = innerSpan > 1e-8
+        containerDuration = noteUnit > 0 && nestedAtomCount > 0
+          ? noteUnit
+          : innerSpan > 1e-8
           ? innerSpan
-          : nominal > 1e-8 ? nominal : atomCount * braceUnit;
+          : timedContainerAtoms(content, {
+            ...durationPitchOptions, noteDivision,
+          }, braceUnit).reduce((sum, atom) => sum + atom.nominalDuration, 0) / 2;
       } else if (mode === "none") {
         containerDuration = nominal > 1e-8 ? nominal : atomCount * braceUnit;
       }
       const parallelVoice = (mode === "triplet" || mode === "subdivide")
         ? explicitTimedContainerVoice(content)
         : null;
-      if (parallelVoice !== null && !sequentialTuplets) {
+      const isParallel = inferredVoiceCount > 1 && parallelVoice !== null && !sequentialTuplets;
+      let containerEnd = container.end;
+      const metadataTiming = extraModes.annotations?.some((annotation) => annotation.type === "triplet"
+        && annotation.end !== undefined && (annotation.members?.length ?? 0) > 0
+        && (extraModes.durationMeasure === undefined || annotation.measure === extraModes.durationMeasure)
+        && Math.abs(annotation.offset - ((extraModes.durationOffset ?? 0) + duration)) <= 1 / 192
+        && (parallelVoice === null || annotation.scope === "all" || annotation.part === parallelVoice));
+      const intrinsicTriplet = mode === "triplet"
+        || mode === "subdivide" && nestedSubdivisionTripletBody(content, modes) !== null;
+      if (isParallel && intrinsicTriplet && noteUnit > 0 && containerDuration > 1e-8 && !metadataTiming) {
+        while (mappings[segment[containerEnd] ?? ""] !== undefined) {
+          containerDuration += 4 / mappings[segment[containerEnd]!]!;
+          containerEnd++;
+        }
+      }
+      if (isParallel) {
         parallelEnd = Math.max(parallelEnd, duration + containerDuration);
       } else {
         duration += containerDuration;
       }
       // Grace notes and arpeggio signs decorate an adjacent sounding event;
       // their own contents do not lengthen the measure.
-      index = container.end;
+      index = containerEnd;
       continue;
     }
     if (char === SLASH_VOICE_SEPARATOR) {
@@ -1906,6 +2357,14 @@ function segmentMarkerDuration(
         lastPitchEnd = -1;
       }
       index = after;
+      continue;
+    }
+    const bare = bareChordAt(segment, index, durationPitchOptions);
+    if (bare) {
+      if (noteUnit > 0) duration += noteUnit;
+      else if (mappings[segment[bare.next] ?? ""] === undefined) trailingUnvaluedMain = true;
+      lastPitchEnd = bare.next;
+      index = bare.next;
       continue;
     }
     // Without an intrinsic note value, tightly attached pitched atoms are
@@ -1948,7 +2407,7 @@ function segmentMarkerDuration(
     }
     index++;
   }
-  if (trailingUnvaluedMain) {
+  if (trailingUnvaluedMain && fillUnvaluedTail) {
     duration = parallelGroupLimit !== undefined
       ? Math.max(duration, parallelGroupLimit)
       : duration + minimumUnit;
@@ -1960,7 +2419,7 @@ function segmentMarkerDuration(
   // the parser keeps the real cross-boundary end and the measure guard in the
   // input command still prevents a tuplet from crossing a barline.
   return parallelGroupLimit !== undefined && parallelEnd > 1e-8
-    ? Math.min(parallelGroupLimit, combined)
+    ? Math.max(duration, Math.min(parallelGroupLimit, parallelEnd))
     : combined;
 }
 
@@ -2009,6 +2468,140 @@ function groupsForMeter(meter: SlashMeterSuggestion): number {
   return meter.beatType === 8 && meter.beats >= 6 && meter.beats % 3 === 0 ? meter.beats / 3 : meter.beats;
 }
 
+const COMMON_SLASH_METERS = new Set(["4/4", "3/4", "2/4", "6/8", "3/8", "9/8", "12/8", "2/2", "3/2"]);
+
+function meterFromEvidence(
+  groupCounts: number[], durations: number[], directive: Pick<Directives, "beats" | "beatType">,
+): SlashMeterSuggestion {
+  const groupsPerMeasure = mode(groupCounts, 4);
+  const groupQuarterNotes = median(durations) || 1;
+  if (directive.beats && directive.beatType) return {
+    beats: directive.beats, beatType: directive.beatType, groupsPerMeasure, groupQuarterNotes,
+    explicit: true, requiresInput: false,
+  };
+  const total = groupQuarterNotes * groupsPerMeasure;
+  let best = { beats: 4, beatType: 4, score: Infinity };
+  for (const beatType of [4, 8, 16, 2]) for (let beats = 1; beats <= 32; beats++) {
+    const measure = beats * 4 / beatType;
+    const expectedGroups = beatType === 8 && beats >= 6 && beats % 3 === 0 ? beats / 3 : beats;
+    let score = Math.abs(measure - total) * 20 + Math.abs(expectedGroups - groupsPerMeasure) * 1.5;
+    if (!COMMON_SLASH_METERS.has(`${beats}/${beatType}`)) score += 4;
+    if (beatType === 4 && Math.abs(groupQuarterNotes - 1) < .08 && beats === groupsPerMeasure) score -= 4;
+    if (beatType === 8 && beats >= 6 && beats % 3 === 0 && Math.abs(groupQuarterNotes - 1.5) < .08 && beats === groupsPerMeasure * 3) score -= 6;
+    if (beatType === 8 && Math.abs(groupQuarterNotes - .5) < .08 && beats === groupsPerMeasure) score -= 4;
+    if (score < best.score) best = { beats, beatType, score };
+  }
+  const suggestion = { beats: best.beats, beatType: best.beatType, groupsPerMeasure, groupQuarterNotes, explicit: false };
+  const expectedGroups = groupsForMeter(suggestion);
+  const target = best.beats * 4 / best.beatType / Math.max(1, expectedGroups);
+  const matching = durations.filter(duration => Math.abs(duration - target) < .08).length;
+  return { ...suggestion, requiresInput: !durations.length
+    || !COMMON_SLASH_METERS.has(`${best.beats}/${best.beatType}`)
+    || expectedGroups !== groupsPerMeasure
+    || matching / durations.length < .55 };
+}
+
+/** Infer only from assigned containers. An unknown bracket is a pending user
+ * choice, not evidence that its contents are triplets or simultaneous notes. */
+function importTimingGroups(lines: string[], modes: SlashDelimiterModes): string[] {
+  const unknown = slashDelimiterSpecs(modes).filter(spec => spec.mode === "none");
+  return lines.flatMap(splitGroups).filter(group => !unknown.some(spec =>
+    group.includes(spec.open) || group.includes(spec.close)));
+}
+
+function inferImportTiming(
+  lines: string[], mappings: Record<string, SlashDurationDivision>, directive: Directives,
+  modes: SlashDelimiterModes,
+): { mappings: Record<string, SlashDurationDivision>; noteDivision: SlashDurationDivision | null;
+  spaceDivision: SlashDurationDivision | null; meter: SlashMeterSuggestion; ambiguous?: boolean } | null {
+  const groups = importTimingGroups(lines, modes);
+  if (!groups.length) return null;
+  const groupCounts = lines.map(line => splitGroups(line).length).filter(count => count > 0);
+  const hasSpaces = groups.some(group => group.includes(" "));
+  const symbols = Object.keys(mappings);
+  const hasSymbols = symbols.length > 0;
+  // Beyond three independent units the notation is under-constrained for a
+  // small bounded search. Keep these actual symbols visible for manual input.
+  if (symbols.length > 3) return null;
+  const divisions: SlashDurationDivision[] = [4, 8, 16, 32, 64];
+  const notes: Array<SlashDurationDivision | null> = hasSymbols ? [null, ...divisions] : divisions;
+  const spaces: Array<SlashDurationDivision | null> = hasSpaces ? [null, ...divisions] : [null];
+  let best: { score: number; evidence: number; result: NonNullable<ReturnType<typeof inferImportTiming>> } | null = null;
+  const candidates: Array<{ evidence: number; result: NonNullable<ReturnType<typeof inferImportTiming>> }> = [];
+  const assignments: Array<Record<string, SlashDurationDivision>> = [];
+  const enumerate = (index: number, values: Record<string, SlashDurationDivision>): void => {
+    if (index === symbols.length) { assignments.push({ ...values }); return; }
+    for (const division of divisions) enumerate(index + 1, { ...values, [symbols[index]]: division });
+  };
+  enumerate(0, {});
+  const shapes = new Map<string, number>();
+  for (const group of groups) {
+    const shape = group.replace(/[A-Z1-7]/g, "A");
+    shapes.set(shape, (shapes.get(shape) ?? 0) + 1);
+  }
+  for (const shifted of assignments) {
+    for (const noteDivision of notes) for (const spaceDivision of spaces) {
+      const effective = effectiveMappings({ symbolDurations: shifted, spaceDivision });
+      const durations = [...shapes].flatMap(([group, count]) => {
+        const duration = segmentMarkerDuration(group, effective, modes.braceMode,
+          noteDivision, modes.bracketMode ?? "none", modes);
+        return Array.from({ length: count }, () => duration);
+      });
+      const positive = durations.filter(duration => duration > 1e-8);
+      const meter = meterFromEvidence(groupCounts, positive, directive);
+      const expectedGroups = groupsForMeter(meter);
+      const target = meter.beats * 4 / meter.beatType / Math.max(1, expectedGroups);
+      const errors = durations.map(duration => Math.abs(duration - target) / target).sort((a, b) => a - b);
+      // A few unfinished or irregular groups must not outweigh many exact
+      // beats. Retain their diagnostics after choosing the dominant grid.
+      const reliable = errors.slice(0, Math.max(1, Math.ceil(errors.length * .85)));
+      let score = reliable.reduce((sum, error) => sum + Math.min(2, error), 0) / reliable.length * 20;
+      score += Math.abs(expectedGroups - mode(groupCounts, 4)) * 3;
+      if (!COMMON_SLASH_METERS.has(`${meter.beats}/${meter.beatType}`)) score += 6;
+      if (meter.requiresInput) score += 8;
+      // Equivalent grid scales favour ordinary quarter-note meters before
+      // half-note or short-eighth alternatives (3/4 before 3/2 or 3/8).
+      if (meter.beatType !== 4) score += .25;
+      const evidence = score;
+      if (noteDivision !== null && hasSymbols) score += .5;
+      if (spaceDivision !== null) score += .15;
+      if (noteDivision !== null && spaceDivision !== null && noteDivision !== spaceDivision) score += .2;
+      score += symbols.reduce((sum, symbol) => sum + Math.abs(Math.log2(shifted[symbol] / mappings[symbol])), 0) * .01;
+      const result = { mappings: shifted, noteDivision, spaceDivision, meter };
+      candidates.push({ evidence, result });
+      if (!best || score < best.score - 1e-8) best = { score, evidence, result };
+    }
+  }
+  const equivalent = best ? candidates.filter(candidate => Math.abs(candidate.evidence - best!.evidence) < 1e-8
+    && candidate.result.meter.beats === best!.result.meter.beats
+    && candidate.result.meter.beatType === best!.result.meter.beatType) : [];
+  const differentBareUnits = best && !hasSymbols && equivalent.some(candidate =>
+    candidate.result.noteDivision !== best!.result.noteDivision || candidate.result.spaceDivision !== best!.result.spaceDivision);
+  const timingSignature = (candidate: NonNullable<ReturnType<typeof inferImportTiming>>): string => {
+    const options = { ...defaultSlashScoreOptions("keyboard"), ...modes, ...candidate,
+      symbolDurations: candidate.mappings, multiDurationSymbols: true,
+      beats: candidate.meter.beats, beatType: candidate.meter.beatType };
+    const target = options.beats * 4 / options.beatType / groupsForMeter(candidate.meter);
+    return JSON.stringify([...shapes.keys()].map(group => {
+      const events: TimedEvent[] = [];
+      parseGroup(group, 0, target, "inference", options, events, null);
+      return events.map(event => [Math.round(event.start * 1e8), Math.round(event.end * 1e8), event.pitches.length]);
+    }));
+  };
+  const bestSignature = best && hasSymbols && equivalent.length > 1 ? timingSignature(best.result) : null;
+  const differentSymbolTiming = bestSignature !== null && equivalent.some(candidate => timingSignature(candidate.result) !== bestSignature);
+  if (best && (differentBareUnits || differentSymbolTiming)) {
+    // E.g. every group is `A `: quarter-note attacks with formatting spaces
+    // and eighth-note attacks plus eighth-note spaces fit equally well.
+    // Symbol combinations can likewise fit a whole beat while placing its
+    // inner attacks differently. Only truly equivalent timelines may share
+    // a recommendation; a name-based unit preference cannot resolve that.
+    return { mappings: {}, noteDivision: null, spaceDivision: null,
+      meter: { ...best.result.meter, requiresInput: !best.result.meter.explicit }, ambiguous: true };
+  }
+  return best?.result ?? null;
+}
+
 export function inferSlashMeter(
   text: string,
   symbolDurations: Record<string, SlashDurationDivision>,
@@ -2025,7 +2618,6 @@ export function inferSlashMeter(
   const lines = sourceLines(text, selectedKind);
   const mappings = effectiveMappings({ symbolDurations, spaceDivision });
   const groupCounts = lines.score.map((line) => splitGroups(line).length).filter((count) => count > 0);
-  const groupsPerMeasure = mode(groupCounts, 4);
   const durations: number[] = [];
   for (const line of lines.score) {
     for (const group of splitGroups(line)) {
@@ -2040,32 +2632,7 @@ export function inferSlashMeter(
       if (duration > 1e-8) durations.push(duration);
     }
   }
-  const groupQuarterNotes = median(durations) || 1;
-  if (directive.beats && directive.beatType) {
-    return {
-      beats: directive.beats,
-      beatType: directive.beatType,
-      groupsPerMeasure,
-      groupQuarterNotes,
-      explicit: true,
-    };
-  }
-
-  const total = groupQuarterNotes * groupsPerMeasure;
-  let best = { beats: 4, beatType: 4, score: Infinity };
-  for (const beatType of [4, 8, 16, 2]) {
-    for (let beats = 1; beats <= 32; beats++) {
-      const measure = beats * 4 / beatType;
-      let score = Math.abs(measure - total) * 20;
-      const expectedGroups = beatType === 8 && beats >= 6 && beats % 3 === 0 ? beats / 3 : beats;
-      score += Math.abs(expectedGroups - groupsPerMeasure) * 1.5;
-      if (beatType === 4 && Math.abs(groupQuarterNotes - 1) < 0.08 && beats === groupsPerMeasure) score -= 4;
-      if (beatType === 8 && beats % 3 === 0 && Math.abs(groupQuarterNotes - 1.5) < 0.08 && beats === groupsPerMeasure * 3) score -= 6;
-      if (beatType === 8 && Math.abs(groupQuarterNotes - 0.5) < 0.08 && beats === groupsPerMeasure) score -= 4;
-      if (score < best.score) best = { beats, beatType, score };
-    }
-  }
-  return { beats: best.beats, beatType: best.beatType, groupsPerMeasure, groupQuarterNotes, explicit: false };
+  return meterFromEvidence(groupCounts, durations, directive);
 }
 
 export function analyzeSlashScore(text: string): SlashScoreAnalysis {
@@ -2073,19 +2640,35 @@ export function analyzeSlashScore(text: string): SlashScoreAnalysis {
   const allLines = sourceLines(text);
   const detectedKind = detectKind(text, allLines, directive);
   const lines = sourceLines(text, detectedKind);
-  const observed = observedSymbols(lines.score);
-  const suggestedMappings: Record<string, SlashDurationDivision> = {};
+  const observed = observedSymbols(lines.score, detectedKind);
+  let suggestedMappings: Record<string, SlashDurationDivision> = {};
   for (const symbol of observed.symbols) {
     suggestedMappings[symbol] = directive.mappings[symbol] ?? defaultDivisionForSymbol(symbol);
   }
   for (const [symbol, division] of Object.entries(directive.mappings)) suggestedMappings[symbol] = division;
-  if (Object.keys(suggestedMappings).length === 0) suggestedMappings["."] = 8;
-  const spaceDivision = directive.spaceDivision ?? null;
-  const noteDivision = directive.noteDivision ?? null;
-  const braceMode = directive.braceMode ?? "arpeggio";
-  const bracketMode = directive.bracketMode ?? "triplet";
+  let savedOptions = false;
+  let savedMappings = false;
+  const stored = /(?:^|\n)\s*\/\/\s*@jpeditor\s+(\{[^\n]*\})\s*(?:\n|$)/.exec(text);
+  if (stored) {
+    try {
+      const value = JSON.parse(stored[1]) as Record<string, unknown>;
+      savedOptions = value !== null && typeof value === "object";
+      savedMappings = savedOptions && (Object.prototype.hasOwnProperty.call(value, "symbolDurations")
+        || Object.prototype.hasOwnProperty.call(value, "s"));
+    } catch { /* ordinary comment */ }
+  }
+  if (savedMappings || Object.keys(directive.mappings).length > 0
+    || directive.noteDivision !== undefined || directive.spaceDivision !== undefined) {
+    // Explicit rules, including an intentionally empty saved mapping, are
+    // authoritative. Any other observed glyph remains pending in the dialog.
+    suggestedMappings = { ...directive.mappings };
+  }
+  let spaceDivision = directive.spaceDivision ?? null;
+  let noteDivision = directive.noteDivision ?? null;
+  const braceMode = directive.braceMode ?? (savedOptions ? "arpeggio" : "none");
+  const bracketMode = directive.bracketMode ?? (savedOptions ? "triplet" : "none");
   const barMode = directive.barMode ?? "none";
-  const angleMode = directive.angleMode ?? "grace";
+  const angleMode = directive.angleMode ?? (savedOptions ? "grace" : "none");
   const parenMode = directive.parenMode ?? "chord";
   let meter = inferSlashMeter(
     text,
@@ -2097,6 +2680,28 @@ export function analyzeSlashScore(text: string): SlashScoreAnalysis {
     detectedKind,
     { barMode, angleMode, parenMode },
   );
+  let timingInferred = false;
+  const explicitOrnamentRules = [directive.braceMode, directive.bracketMode, directive.barMode,
+    directive.angleMode, directive.parenMode].some(mode => mode !== null && mode !== "none" && mode !== "chord");
+  if (!savedOptions && directive.spaceDivision === undefined && directive.noteDivision === undefined
+    && Object.keys(directive.mappings).length === 0 && !explicitOrnamentRules) {
+    const timing = inferImportTiming(lines.score, suggestedMappings, directive,
+      { braceMode, bracketMode, barMode, angleMode, parenMode });
+    if (timing) {
+      suggestedMappings = timing.meter.requiresInput ? {} : timing.mappings;
+      spaceDivision = timing.spaceDivision;
+      noteDivision = timing.noteDivision;
+      meter = timing.meter;
+      timingInferred = !meter.requiresInput && !timing.ambiguous;
+    } else {
+      suggestedMappings = {};
+      meter = { ...meter, requiresInput: !meter.explicit };
+    }
+  }
+  if (!meter.explicit && observed.symbols.some(symbol => suggestedMappings[symbol] === undefined)) {
+    meter = { ...meter, requiresInput: true };
+    timingInferred = false;
+  }
   const rawGroupCount = lines.score.length === 1 ? splitGroups(lines.score[0]).length : 0;
   // A single unbroken run that would imply an unusually long simple meter is
   // more likely several measures without line/bar separators. Ask for a meter
@@ -2129,13 +2734,22 @@ export function analyzeSlashScore(text: string): SlashScoreAnalysis {
     commentCount: lines.comments.length,
     ignoredTagCount: lines.ignoredTags,
     observedSymbols: observed.symbols,
+    observedDelimiters: slashDelimiterSpecs({ braceMode, bracketMode, barMode, angleMode, parenMode })
+      .filter(spec => lines.score.some(line => line.includes(spec.open) || line.includes(spec.close)))
+      .map(spec => spec.id),
+    requiresMeterInput: meter.requiresInput ?? false,
+    requiresSymbolMapping: !savedOptions && !explicitOrnamentRules
+      && observed.symbols.some(symbol => suggestedMappings[symbol] === undefined),
+    timingInferred,
     containsScoreSpaces: observed.spaces,
     suggestedMappings,
     multiDurationSymbols: directive.multiDurationSymbols
-      ?? Object.keys(directive.mappings).length > 1,
+      ?? Object.keys(suggestedMappings).length > 1,
     suggestedSpaceDivision: spaceDivision,
     suggestedNoteDivision: noteDivision,
     wholeMeasureGroups,
+    sourceTimedRows: directive.sourceTimedRows,
+    adjacentAsChord: directive.adjacentAsChord,
     emptyGroupsAsRests: directive.emptyGroupsAsRests ?? false,
     showExplicitRests: directive.showExplicitRests ?? true,
     meter,
@@ -2143,6 +2757,7 @@ export function analyzeSlashScore(text: string): SlashScoreAnalysis {
     tempoBeatUnit: directive.tempoBeatUnit ?? "quarter",
     fifths: directive.fifths ?? 0,
     title: directive.title,
+    headerTypography: normalizeHeaderTypography(directive.headerTypography),
     subtitle: directive.subtitle,
     composer: directive.composer,
     arranger: directive.arranger,
@@ -2170,6 +2785,7 @@ export function defaultSlashScoreOptions(kind: SlashScoreKind, analysis?: SlashS
     voiceCount: analysis?.voiceCount ?? 1,
     instrumentName: "钢琴",
     title: analysis?.title ?? "",
+    headerTypography: normalizeHeaderTypography(analysis?.headerTypography),
     subtitle: analysis?.subtitle ?? "",
     composer: analysis?.composer ?? "",
     arranger: analysis?.arranger ?? "",
@@ -2184,6 +2800,8 @@ export function defaultSlashScoreOptions(kind: SlashScoreKind, analysis?: SlashS
     spaceDivision: analysis?.suggestedSpaceDivision ?? null,
     noteDivision: analysis?.suggestedNoteDivision ?? null,
     wholeMeasureGroups: analysis?.wholeMeasureGroups ? true : undefined,
+    sourceTimedRows: analysis?.sourceTimedRows,
+    adjacentAsChord: analysis?.adjacentAsChord,
     emptyGroupsAsRests: analysis?.emptyGroupsAsRests ?? false,
     showExplicitRests: analysis?.showExplicitRests ?? true,
     braceMode: analysis?.suggestedBraceMode ?? "arpeggio",
@@ -2251,6 +2869,19 @@ function pitchAt(text: string, at: number, options: SlashScoreOptions): PitchTok
   return options.kind === "keyboard" ? keyboardPitchAt(text, at, options.fifths) : numberPitchAt(text, at, options.fifths);
 }
 
+/** Compare source rhythm without confusing equivalent pitch spellings with
+ * a duration edit. Share the real tokenizer, including lowercase keyboard
+ * letters and the distinction between a flat prefix and a standalone B. */
+export function slashPitchShape(text: string, options: SlashScoreOptions): string {
+  let shape = "";
+  for (let index = 0; index < text.length;) {
+    const pitch = pitchAt(text, index, options);
+    if (pitch) { shape += "N"; index = pitch.next; }
+    else { shape += text[index]; index++; }
+  }
+  return shape;
+}
+
 function pitchVoiceAt(text: string, pitchIndex: number, options: SlashScoreOptions): number {
   let markerFrom = pitchIndex;
   while (markerFrom > 0 && text[markerFrom - 1] === SLASH_VOICE_SEPARATOR) markerFrom--;
@@ -2303,12 +2934,14 @@ function compactTimedAtomAt(
   text: string,
   at: number,
   options: SlashScoreOptions,
+  allowBareChord = true,
 ): CompactTimedAtom | null {
   const pitch = pitchAt(text, at, options);
   if (pitch) {
+    const bare = allowBareChord ? bareChordAt(text, at, options) : null;
     return {
       index: at,
-      next: pitch.next,
+      next: bare?.next ?? pitch.next,
       voice: pitchVoiceAt(text, at, options),
       pitch,
       rest: false,
@@ -2355,6 +2988,26 @@ function compactTimedAtomAt(
   };
 }
 
+/** Without a configured chord container, physically touching pitches form
+ * one simultaneous column. Whitespace, rests and duration marks end it. */
+function bareChordAt(text: string, at: number, options: SlashScoreOptions):
+  { next: number; pitches: number[] } | null {
+  if (!slashUsesBareChords(options)) return null;
+  const first = pitchAt(text, at, options);
+  if (!first) return null;
+  const pitches = [first.pitch];
+  let next = first.next;
+  while (next < text.length) {
+    let cursor = next;
+    while (text[cursor] === SLASH_VOICE_SEPARATOR) cursor++;
+    const pitch = pitchAt(text, cursor, options);
+    if (!pitch) break;
+    pitches.push(pitch.pitch);
+    next = pitch.next;
+  }
+  return pitches.length > 1 ? { next, pitches } : null;
+}
+
 function adjacentCompactTimedAtomAfter(
   text: string,
   at: number,
@@ -2386,6 +3039,7 @@ function implicitGraceFollowerAt(
   options: SlashScoreOptions,
   blockedByLeadingDuration = false,
 ): CompactTimedAtom | null {
+  if (!slashDelimiterSpecs(options).some(spec => spec.mode === "chord")) return null;
   if (options.noteDivision !== null
     || blockedByLeadingDuration
     || atom.rest
@@ -2414,6 +3068,10 @@ function startsBetweenCompactBaseCells(value: number, baseUnit: number): boolean
  */
 export function slashPitchSources(text: string, baseOptions: SlashScoreOptions): SlashPitchSource[] {
   const options = optionsWithDirectives(text, baseOptions);
+  if (options.sourceTimedRows) {
+    const projected = projectSourceTimedRows(text, options);
+    return mapProjectedSources(slashPitchSources(projected.text, projected.options), projected.sourceOffsets);
+  }
   const mappings = effectiveMappings(options);
   const result: SlashPitchSource[] = [];
   const lineRecords = sourceLineRecords(text);
@@ -2578,17 +3236,41 @@ export function slashPitchSources(text: string, baseOptions: SlashScoreOptions):
               ? container.bodyFrom + nestedTriplet.to
               : container.bodyTo;
             let cursor = atomFrom;
+            let pendingRolledEvent: number | null = null;
+            let mergeableTimedEvent: number | null = null;
+            const finishTimedArpeggio = (): void => {
+              if (pendingRolledEvent !== null) eventIndex = Math.max(eventIndex, pendingRolledEvent + 1);
+              pendingRolledEvent = null;
+            };
+            const eventForTimedAtom = (): number => {
+              const shared = pendingRolledEvent ?? eventForAtom();
+              finishTimedArpeggio();
+              mergeableTimedEvent = shared;
+              return shared;
+            };
             while (cursor < atomTo) {
               if (/\s/.test(raw[cursor]) || mappings[raw[cursor]]) {
+                if (mappings[raw[cursor]]) {
+                  finishTimedArpeggio();
+                  mergeableTimedEvent = null;
+                }
                 cursor++;
                 continue;
               }
               const atomContainer = slashContainerAt(raw, cursor, options);
+              if (atomContainer && atomContainer.end <= atomTo && atomContainer.spec.mode === "arpeggio") {
+                const shared: number = mergeableTimedEvent ?? pendingRolledEvent ?? eventIndex;
+                appendRange(atomContainer.bodyFrom, atomContainer.bodyTo, shared, false, rhythmicMode === "triplet");
+                if (mergeableTimedEvent === null && pendingRolledEvent === null) pendingRolledEvent = shared;
+                mergeableTimedEvent = shared;
+                cursor = atomContainer.end;
+                continue;
+              }
               if (atomContainer && atomContainer.end <= atomTo && atomContainer.spec.mode === "triplet") {
                 const atom = semanticMordentAtom(raw.slice(atomContainer.bodyFrom, atomContainer.bodyTo), options);
                 if (atom) {
                   appendRange(atomContainer.bodyFrom + atom.from, atomContainer.bodyFrom + atom.to,
-                    eventForAtom(), false, rhythmicMode === "triplet");
+                    eventForTimedAtom(), false, rhythmicMode === "triplet");
                   cursor = atomContainer.end;
                   continue;
                 }
@@ -2598,7 +3280,7 @@ export function slashPitchSources(text: string, baseOptions: SlashScoreOptions):
                   appendRange(
                     atomContainer.bodyFrom,
                     atomContainer.bodyTo,
-                    eventForAtom(),
+                    eventForTimedAtom(),
                     false,
                     rhythmicMode === "triplet",
                   );
@@ -2607,12 +3289,18 @@ export function slashPitchSources(text: string, baseOptions: SlashScoreOptions):
               }
               const atom = pitchAt(raw, cursor, options);
               if (atom && atom.next <= atomTo) {
+                const bare = bareChordAt(raw, cursor, options);
+                if (bare && bare.next <= atomTo) {
+                  appendRange(cursor, bare.next, eventForTimedAtom(), false, rhythmicMode === "triplet");
+                  cursor = bare.next;
+                  continue;
+                }
                 let from = cursor;
                 while (from > atomFrom && raw[from - 1] === SLASH_VOICE_SEPARATOR) from--;
                 appendRange(
                   from,
                   atom.next,
-                  eventForAtom(),
+                  eventForTimedAtom(),
                   false,
                   rhythmicMode === "triplet",
                 );
@@ -2621,6 +3309,7 @@ export function slashPitchSources(text: string, baseOptions: SlashScoreOptions):
               }
               cursor++;
             }
+            finishTimedArpeggio();
             index = container.end;
             continue;
           }
@@ -2642,6 +3331,12 @@ export function slashPitchSources(text: string, baseOptions: SlashScoreOptions):
             mergeableEvent = null;
           }
           index++;
+          continue;
+        }
+        const bare = bareChordAt(raw, index, options);
+        if (bare) {
+          appendRange(index, bare.next, eventForAtom());
+          index = bare.next;
           continue;
         }
         let markerFrom = index;
@@ -2713,6 +3408,24 @@ function voicedPitchesIn(
   return pitches;
 }
 
+/** Read rolled member sets without flattening braces nested in a chord.
+ * The configured delimiter modes, not literal brace characters, own semantics. */
+function arpeggioGroupsInChord(text: string, options: SlashScoreOptions): SlashArpeggioGroup[] {
+  const groups: SlashArpeggioGroup[] = [];
+  for (let index = 0; index < text.length;) {
+    const container = slashContainerAt(text, index, options);
+    if (!container) { index++; continue; }
+    const body = text.slice(container.bodyFrom, container.bodyTo);
+    if (container.spec.mode === "arpeggio") {
+      groups.push(voicedPitchesIn(body, options).map(item => ({ part: item.voice, pitch: item.pitch })));
+    } else if (container.spec.mode === "chord" || container.spec.mode === "none") {
+      groups.push(...arpeggioGroupsInChord(body, options));
+    }
+    index = container.end;
+  }
+  return groups.filter(group => group.length >= 2);
+}
+
 function containsPitchMultiplicity(
   actual: readonly number[],
   expected: readonly number[],
@@ -2728,6 +3441,8 @@ function containsPitchMultiplicity(
 
 interface TimedAtom {
   pitches: number[];
+  /** Original start, including a pending ornament/voice prefix. */
+  sourceFrom?: number;
   /** Zero-based TXT voice for each item in `pitches`. */
   pitchVoices?: number[];
   nominalDuration: number;
@@ -2741,6 +3456,7 @@ interface TimedAtom {
   gracePitches?: number[][];
   arpeggio?: boolean;
   arpeggioPitches?: number[];
+  arpeggioGroups?: SlashArpeggioGroup[];
 }
 
 function timedContainerAtoms(
@@ -2755,7 +3471,9 @@ function timedContainerAtoms(
   const state: { active: TimedAtom | null } = { active: null };
   let leadingDuration = 0;
   let pendingGrace: number[][] = [];
-  let pendingArpeggio: number[] = [];
+  let pendingArpeggio: SlashArpeggioGroup[] = [];
+  let tokenFrom = 0;
+  let pendingSourceFrom: number | null = null;
   let lastPitchEnd = -1;
   let lastPitchVoice = -1;
   let lastAtomWasRest = false;
@@ -2772,12 +3490,14 @@ function timedContainerAtoms(
       if (state.active.nominalDuration <= 1e-9) state.active.nominalDuration = implicitDuration ?? fallback;
       atoms.push(state.active);
     }
-    const rolled = [...new Set(pendingArpeggio)];
+    const rolledMembers = pendingArpeggio.flat();
+    const rolled = rolledMembers.map(item => item.pitch);
     state.active = {
-      pitches: rolled.length > 0 ? [...new Set([...rolled, ...pitches])] : pitches,
-      pitchVoices: rolled.length > 0
-        ? undefined
-        : pitchVoices && pitchVoices.length === pitches.length ? pitchVoices : undefined,
+      sourceFrom: pendingSourceFrom ?? Math.max(0, tokenFrom - compactMarkerCountBefore(text, tokenFrom)),
+      pitches: rolled.length > 0 ? [...rolled, ...pitches] : pitches,
+      pitchVoices: pitchVoices && pitchVoices.length === pitches.length
+        ? [...rolledMembers.map(item => item.part), ...pitchVoices]
+        : undefined,
       nominalDuration: (implicitDuration ?? noteUnit) + leadingDuration,
       compactImplicitDuration: implicitDuration !== undefined || undefined,
       explicitDuration: noteUnit > 0 || undefined,
@@ -2787,10 +3507,12 @@ function timedContainerAtoms(
       gracePitches: pendingGrace.length > 0 ? pendingGrace : undefined,
       arpeggio: rolled.length > 0 || undefined,
       arpeggioPitches: rolled.length > 0 ? rolled : undefined,
+      arpeggioGroups: pendingArpeggio.length > 0 ? pendingArpeggio : undefined,
     };
     leadingDuration = 0;
     pendingGrace = [];
     pendingArpeggio = [];
+    pendingSourceFrom = null;
   };
   const restVoicesIn = (body: string): number[] => {
     const voices: number[] = [];
@@ -2814,8 +3536,10 @@ function timedContainerAtoms(
     return [...new Set(voices)];
   };
   for (let index = 0; index < text.length;) {
+    tokenFrom = index;
     const division = mappings[text[index]];
     if (division) {
+      if (pendingArpeggio.length > 0) start([], [], undefined, []);
       lastPitchEnd = -1;
       lastPitchVoice = -1;
       lastAtomWasRest = false;
@@ -2851,7 +3575,7 @@ function timedContainerAtoms(
       const pitches = voicedPitches.map((item) => item.pitch);
       if (container.spec.mode === "chord") {
         const rests = restVoicesIn(body);
-        const atom = compactTimedAtomAt(text, index, options)!;
+        const atom = compactTimedAtomAt(text, index, options, false)!;
         const nextAtom = adjacentCompactTimedAtomAfter(text, atom.next, options);
         const hasFollowingDuration = mappings[text[atom.next] ?? ""] !== undefined;
         const mayUseImplicitHalf = !hasFollowingDuration;
@@ -2877,6 +3601,10 @@ function timedContainerAtoms(
           : undefined;
         if (pitches.length > 0 || rests.length > 0) {
           start(pitches, rests, tightDuration, voicedPitches.map((item) => item.voice));
+          if (state.active) {
+            const nested = arpeggioGroupsInChord(body, options);
+            if (nested.length > 0) state.active.arpeggioGroups = [...(state.active.arpeggioGroups ?? []), ...nested];
+          }
         }
         attachAfterExplicitDuration = false;
         lastPitchEnd = atom.next;
@@ -2894,17 +3622,26 @@ function timedContainerAtoms(
           lastAtomExplicitDefault = false;
         }
       } else if (container.spec.mode === "grace" && pitches.length > 0) {
+        pendingSourceFrom ??= index;
         lastPitchEnd = -1;
         lastPitchVoice = -1;
         lastAtomWasRest = false;
         lastAtomExplicitDefault = false;
         pendingGrace.push(pitches);
       } else if (container.spec.mode === "arpeggio" && pitches.length > 0) {
+        pendingSourceFrom ??= index;
         lastPitchEnd = -1;
         lastPitchVoice = -1;
         lastAtomWasRest = false;
         lastAtomExplicitDefault = false;
-        pendingArpeggio.push(...pitches);
+        const members = voicedPitches.map(item => ({ part: item.voice, pitch: item.pitch }));
+        if (state.active && !state.active.explicitDuration && pendingArpeggio.length === 0) {
+          const previousVoices = state.active.pitchVoices
+            ?? state.active.pitches.map(() => options.voiceCount - 1);
+          state.active.pitches.push(...pitches);
+          state.active.pitchVoices = [...previousVoices, ...voicedPitches.map(item => item.voice)];
+          state.active.arpeggioGroups = [...(state.active.arpeggioGroups ?? []), members];
+        } else pendingArpeggio.push(members);
       } else if (container.spec.mode === "subdivide" || container.spec.mode === "none") {
         lastPitchEnd = -1;
         lastPitchVoice = -1;
@@ -2916,6 +3653,8 @@ function timedContainerAtoms(
           if (state.active) {
             state.active.nominalDuration = atom.nominalDuration;
             state.active.explicitDuration = atom.explicitDuration;
+            state.active.sourceFrom = container.bodyFrom + (atom.sourceFrom ?? 0);
+            state.active.arpeggioGroups = atom.arpeggioGroups;
           }
         }
       }
@@ -2971,7 +3710,7 @@ function timedContainerAtoms(
       const markerCount = after - index;
       while (/\s/.test(text[after] ?? "")) after++;
       if (text[after] === "0") {
-        const atom = compactTimedAtomAt(text, after, options)!;
+        const atom = compactTimedAtomAt(text, after, options, false)!;
         const nextAtom = adjacentCompactTimedAtomAfter(text, atom.next, options);
         const hasFollowingDuration = mappings[text[atom.next] ?? ""] !== undefined;
         const mayUseImplicitHalf = !hasFollowingDuration
@@ -3023,6 +3762,7 @@ function timedContainerAtoms(
     const pitch = pitchAt(text, index, options);
     if (pitch) {
       const atom = compactTimedAtomAt(text, index, options)!;
+      const bare = bareChordAt(text, index, options);
       const voice = atom.voice;
       const nextAtom = adjacentCompactTimedAtomAfter(text, atom.next, options);
       const hasFollowingDuration = mappings[text[pitch.next] ?? ""] !== undefined;
@@ -3047,13 +3787,15 @@ function timedContainerAtoms(
           || atom.paddingCells > 0)
         ? fallback / 2
         : undefined;
-      start([clamp(pitch.pitch, 0, 127)], [], tightDuration, [voice]);
+      const voiced = bare ? voicedPitchesIn(text.slice(index, bare.next), options) : null;
+      start(bare ? bare.pitches.map(value => clamp(value, 0, 127)) : [clamp(pitch.pitch, 0, 127)],
+        [], tightDuration, voiced ? voiced.map(value => value.voice) : [voice]);
       attachAfterExplicitDuration = false;
-      lastPitchEnd = pitch.next;
+      lastPitchEnd = atom.next;
       lastPitchVoice = voice;
       lastAtomWasRest = false;
       lastAtomExplicitDefault = atom.explicitDefault;
-      index = pitch.next;
+      index = atom.next;
       continue;
     }
     lastPitchEnd = -1;
@@ -3063,6 +3805,7 @@ function timedContainerAtoms(
     attachAfterExplicitDuration = false;
     index++;
   }
+  if (pendingArpeggio.length > 0) start([], [], undefined, []);
   if (state.active) {
     if (state.active.nominalDuration <= 1e-9) state.active.nominalDuration = fallback;
     atoms.push(state.active);
@@ -3163,6 +3906,7 @@ function parseGroup(
     gracePitches: number[][];
     arpeggio: boolean;
     arpeggioPitches: number[];
+    arpeggioGroups?: SlashArpeggioGroup[];
     ornamentKind?: "upper-mordent" | "lower-mordent" | "trill";
     /** Voice owning a semantic ornament.  Without this, the ornament's
      * synthetic main note falls back to the default (last) TXT voice. */
@@ -3202,6 +3946,7 @@ function parseGroup(
       if (active.arpeggioPitches.length > 0) {
         event.arpeggioPitches = [...active.arpeggioPitches];
       }
+      if (active.arpeggioGroups?.length) event.arpeggioGroups = active.arpeggioGroups;
       if (active.ornamentKind) event.ornamentKind = active.ornamentKind;
       if (active.restVoiceIndexes.length > 0) {
         event.restVoiceIndexes = [...new Set(active.restVoiceIndexes)];
@@ -3232,7 +3977,7 @@ function parseGroup(
     implicitDuration?: number,
   ): void => {
     if (active?.awaitingArpeggioMain && !active.hadDuration) {
-      active.pitches = [...new Set([...active.pitches, ...pitches])];
+      active.pitches = [...active.pitches, ...pitches];
       active.awaitingArpeggioMain = false;
       if (pendingGrace.length > 0) {
         active.gracePitches.push(...pendingGrace.map((atom) => atom.pitches));
@@ -3472,6 +4217,10 @@ function parseGroup(
           pendingGrace.push({ pitches, nominalDuration: 0 });
         } else if (pitches.length > 0 || restVoiceIndexes.length > 0) {
           startNote(pitches, false, restVoiceIndexes);
+          const nested = arpeggioGroupsInChord(outerBody, options);
+          if (active && nested.length > 0) {
+            active.arpeggioGroups = [...(active.arpeggioGroups ?? []), ...nested];
+          }
         }
         lastPitchEnd = atom.next;
         index = container.end;
@@ -3549,9 +4298,18 @@ function parseGroup(
         : null;
       const rhythmicMode = nestedTriplet ? "triplet" : mode;
       const timedBody = nestedTriplet?.body ?? outerBody;
+      const containerVoice = explicitTimedContainerVoice(outerBody);
+      const storedTuplet = rhythmicMode === "triplet"
+        ? options.annotations?.find((annotation): annotation is Extract<NotationAnnotationData, { type: "triplet" }> =>
+          annotation.type === "triplet" && annotation.measure === measureIndex
+          && annotation.end !== undefined && (annotation.members?.length ?? 0) > 0
+          && (containerVoice === null || annotation.scope === "all" || annotation.part === containerVoice)
+          && Math.abs(annotation.offset - (groupOffset + cursor)) <= 1 / 192)
+        : undefined;
+      let intrinsicContainer = rhythmicMode === "triplet" && noteUnit !== null && !storedTuplet;
       let leadingTripletDuration = 0;
       let timedBodyStart = 0;
-      if (rhythmicMode === "triplet") {
+      if (rhythmicMode === "triplet" && !intrinsicContainer) {
         while (mappings[timedBody[timedBodyStart] ?? ""] !== undefined) {
           leadingTripletDuration += 4 / mappings[timedBody[timedBodyStart]!]!;
           timedBodyStart++;
@@ -3574,17 +4332,21 @@ function parseGroup(
           ? Array.from({ length: options.voiceCount }, (_unused, voice) => voice)
           : [options.voiceCount - 1],
       );
+      if (atoms.length === 0) intrinsicContainer = false;
       if (mode === "grace") {
         if (active) flush(cursor, true);
         pendingGrace.push(...atoms);
       } else if (mode === "arpeggio") {
-        const rolledChord = [...new Set(atoms.flatMap((atom) => atom.pitches))];
+        const rolledMembers = voicedPitchesIn(outerBody, options)
+          .map(item => ({ part: item.voice, pitch: item.pitch }));
+        const rolledChord = rolledMembers.map(item => item.pitch);
         if (rolledChord.length > 0) {
           if (active && !active.hadDuration) {
             const stillAwaitingMain = active.awaitingArpeggioMain;
-            active.pitches = [...new Set([...active.pitches, ...rolledChord])];
+            active.pitches = [...active.pitches, ...rolledChord];
             active.arpeggio = true;
-            active.arpeggioPitches = [...new Set([...active.arpeggioPitches, ...rolledChord])];
+            active.arpeggioPitches = [...active.arpeggioPitches, ...rolledChord];
+            active.arpeggioGroups = [...(active.arpeggioGroups ?? []), rolledMembers];
             active.awaitingArpeggioMain = stillAwaitingMain;
           } else {
             if (active) flush(cursor, true);
@@ -3592,6 +4354,7 @@ function parseGroup(
             if (active) {
               active.arpeggio = true;
               active.arpeggioPitches = [...rolledChord];
+              active.arpeggioGroups = [rolledMembers];
               active.awaitingArpeggioMain = true;
             }
           }
@@ -3619,8 +4382,9 @@ function parseGroup(
               end: annotation.end!, members: annotation.members! })),
             groupOffset, targetDuration, measureIndex, absoluteStart, sourceGroupKey,
           });
-          for (const item of restored) {
+          for (const { sourceAtom, ...item } of restored) {
             const event: TimedEvent = { ...item,
+              arpeggioGroups: (sourceAtom as TimedAtom | undefined)?.arpeggioGroups,
               metadataVoice: true,
               restVoiceIndexes: item.rest ? [item.voiceIndex] : undefined,
               sourceGroupKey, sourceGroupEnd: absoluteStart + targetDuration,
@@ -3822,6 +4586,7 @@ function parseGroup(
                 start: absoluteStart + start,
                 end: absoluteStart + finish,
                 pitches: component.pitches,
+                arpeggioGroups: atom.arpeggioGroups,
                 restVoiceIndexes: component.pitches.length === 0 && component.rest ? [voice] : undefined,
                 sourceGroupKey,
                 sourceGroupEnd: absoluteStart + containerLimit,
@@ -3922,7 +4687,20 @@ function parseGroup(
         }
         const nestedHasExplicitDuration = nestedTriplet !== null
           && Array.from(nestedTriplet.body).some((item) => mappings[item] !== undefined);
-        const factor = nestedTriplet
+        let intrinsicEnd = container.end;
+        let intrinsicBudget = noteUnit ?? 0;
+        if (intrinsicContainer) {
+          // Adjacent suffix markers (including mapped spaces) lengthen the
+          // complete bracket before its duration is shared by the members.
+          while (mappings[group[intrinsicEnd] ?? ""] !== undefined) {
+            intrinsicBudget += 4 / mappings[group[intrinsicEnd]!]!;
+            intrinsicEnd++;
+          }
+        }
+        const nominalTotal = atoms.reduce((sum, atom) => sum + atom.nominalDuration, 0);
+        const factor = intrinsicContainer && nominalTotal > 1e-9
+          ? intrinsicBudget / nominalTotal
+          : nestedTriplet
           // The inner adjacent atoms already carry the one-level-finer
           // duration.  The legacy outer subdivision wrapper is retained only
           // as a compatibility container, so it must not halve the triplet a
@@ -3963,7 +4741,9 @@ function parseGroup(
         let rhythmicCursor = cursor;
         let tripletIndex = 0;
         for (const atom of atoms) {
-          const duration = atom.nominalDuration * factor;
+          const duration = storedTuplet?.members?.length === atoms.length
+            ? storedTuplet.members[tripletIndex]! * 2 / 3
+            : atom.nominalDuration * factor;
           const start = parallelVoice === null ? cursor : rhythmicCursor;
           const finish = parallelVoice === null
             ? Math.min(targetDuration, start + duration)
@@ -3990,6 +4770,7 @@ function parseGroup(
               tripletIndex++;
             }
             if (atom.gracePitches?.length) event.gracePitches = atom.gracePitches;
+            if (atom.arpeggioGroups?.length) event.arpeggioGroups = atom.arpeggioGroups;
             if (atom.arpeggio) event.arpeggio = true;
             if (atom.arpeggioPitches?.length) {
               event.arpeggioPitches = atom.arpeggioPitches;
@@ -4021,6 +4802,11 @@ function parseGroup(
           // is materialized again as a fresh attack in the released gap.
           parallelTupletSilence = { voiceIndex: parallelVoice, from: rhythmicCursor };
         }
+        if (intrinsicContainer) {
+          index = intrinsicEnd;
+          lastPitchEnd = -1;
+          continue;
+        }
       }
       index = container.end;
       lastPitchEnd = -1;
@@ -4042,6 +4828,7 @@ function parseGroup(
     const pitch = pitchAt(group, index, options);
     if (pitch) {
       const atom = compactTimedAtomAt(group, index, options)!;
+      const bare = bareChordAt(group, index, options);
       const implicitGrace = implicitGraceFollowerAt(
         group,
         atom,
@@ -4054,12 +4841,12 @@ function parseGroup(
           nominalDuration: 0,
         });
       }
-      else startNote([clamp(pitch.pitch, 0, 127)]);
+      else startNote(bare ? bare.pitches.map(value => clamp(value, 0, 127)) : [clamp(pitch.pitch, 0, 127)]);
       if (!implicitGrace && parallelTupletSilence?.voiceIndex === atom.voice) {
         parallelTupletSilence = null;
       }
       lastPitchEnd = pitch.next;
-      index = pitch.next;
+      index = atom.next;
       continue;
     }
     if (char !== "/" && char !== "-" && char !== "0" && char !== SLASH_VOICE_SEPARATOR) ignored++;
@@ -4105,6 +4892,7 @@ function optionsWithDirectives(text: string, base: SlashScoreOptions): SlashScor
   const directive = readDirectives(text);
   return {
     ...base,
+    headerTypography: normalizeHeaderTypography(base.headerTypography ?? directive.headerTypography),
     // The dialog is authoritative: directives only provide its initial values.
     // This lets a user deliberately reinterpret “点=八分” as 16th notes, or
     // supply a meter for a continuous score with no measure separators.
@@ -4146,6 +4934,8 @@ function optionsWithDirectives(text: string, base: SlashScoreOptions): SlashScor
     wholeMeasureGroups: base.wholeMeasureGroups
       ?? directive.wholeMeasureGroups
       ?? undefined,
+    sourceTimedRows: base.sourceTimedRows ?? directive.sourceTimedRows,
+    adjacentAsChord: base.adjacentAsChord ?? directive.adjacentAsChord,
     emptyGroupsAsRests: base.emptyGroupsAsRests
       ?? directive.emptyGroupsAsRests
       ?? false,
@@ -4183,6 +4973,10 @@ export function slashScoreDiagnostics(
   baseOptions: SlashScoreOptions,
 ): SlashScoreDiagnostic[] {
   const options = optionsWithDirectives(text, baseOptions);
+  if (options.sourceTimedRows) {
+    const projected = projectSourceTimedRows(text, options);
+    return mapProjectedDiagnostics(slashScoreDiagnostics(projected.text, projected.options), projected.sourceOffsets, text);
+  }
   const records = sourceLineRecords(text);
   const meterLine = /^\s*(\d{1,2})\s*\/\s*(2|4|8|16)\s*拍\s*[：:]\s*$/;
   let activeMeter = {
@@ -4342,7 +5136,7 @@ export function slashScoreDiagnostics(
         options.braceMode,
         options.noteDivision,
         options.bracketMode ?? "triplet",
-        options,
+        { ...options, durationMeasure: measureIndex, durationOffset: groupOffset },
         options.annotations?.some((annotation) => annotation.type === "triplet"
           && annotation.beatSlices && annotation.measure === measureIndex
           && annotation.offset < groupOffset + targetForGroup - 1e-8
@@ -4429,7 +5223,7 @@ export function slashScoreDiagnostics(
         if (completeIndependentClusters) {
           duration = segmentMarkerDuration(
             group, mappings, options.braceMode, options.noteDivision,
-            options.bracketMode ?? "triplet", options, undefined,
+            options.bracketMode ?? "triplet", { ...options, durationMeasure: measureIndex, durationOffset: groupOffset }, undefined,
             semanticMordentInGroup, options.voiceCount, false,
           ) + tupletCorrection;
         }
@@ -4556,7 +5350,7 @@ function splitTimedEventsByVoice(
   const consumed = new Set<number>();
   const result: TimedEvent[] = [];
   const splitBySource = new Map<TimedEvent, Map<number, TimedEvent>>();
-  const authoritativeTupletPitches = new Map<number, number[][]>();
+  const authoritativeTupletPitches = new Map<number, Array<{ pitches: number[]; eventIndex: number }>>();
   const remember = (source: TimedEvent, voice: number, clone: TimedEvent): void => {
     const voices = splitBySource.get(source) ?? new Map<number, TimedEvent>();
     voices.set(voice, clone);
@@ -4585,13 +5379,19 @@ function splitTimedEventsByVoice(
     remember(event, voice, clone);
     if (event.pitches.length > 0) {
       const queue = authoritativeTupletPitches.get(voice) ?? [];
-      queue.push([...event.pitches].sort((left, right) => left - right));
+      queue.push({ pitches: [...event.pitches].sort((left, right) => left - right), eventIndex: index });
       authoritativeTupletPitches.set(voice, queue);
     }
   });
   let cursor = 0;
   for (const sources of sourceGroups.values()) {
     let main = sources.filter((source) => !source.grace);
+    const completePitches = main.map((source) => source.pitch).sort((a, b) => a - b);
+    const nextCommonEvent = events.findIndex((event, index) => index >= cursor
+      && !consumed.has(index) && !event.continuationOf
+      && event.pitches.length === completePitches.length
+      && containsPitchMultiplicity(event.pitches, completePitches));
+    let consumedOwnedThrough = cursor - 1;
     // The pre-pass above has already materialized each explicitly owned
     // default-voice Tuplet event. Remove exactly those source pitches before
     // matching the remaining ordinary timeline. Without this consumption a
@@ -4600,8 +5400,13 @@ function splitTimedEventsByVoice(
     // Match per voice and by pitch multiset so a mixed visible atom can still
     // leave its non-Tuplet voice (for example G in `(V⁣G)`) to be processed.
     for (const [voice, queue] of authoritativeTupletPitches) {
-      const expected = queue[0];
-      if (!expected) continue;
+      const pending = queue[0];
+      if (!pending) continue;
+      // An identical pitch in an earlier shared Tuplet belongs to that
+      // actual source column, not to a later metadata-owned member. Keep the
+      // source chronology when consuming the pre-materialized voice queue.
+      if (nextCommonEvent >= 0 && nextCommonEvent < pending.eventIndex) continue;
+      const expected = pending.pitches;
       const owned = main.filter((source) => source.tripletSource
         && source.voiceIndex === voice + 1);
       const actual = owned.map((source) => source.pitch).sort((left, right) => left - right);
@@ -4616,8 +5421,12 @@ function splitTimedEventsByVoice(
         return false;
       });
       queue.shift();
+      consumedOwnedThrough = Math.max(consumedOwnedThrough, pending.eventIndex);
     }
-    if (main.length === 0) continue;
+    if (main.length === 0) {
+      cursor = Math.max(cursor, consumedOwnedThrough + 1);
+      continue;
+    }
     const expected = main.map((source) => source.pitch).sort((a, b) => a - b);
     let matched = -1;
     for (let index = cursor; index < events.length; index++) {
@@ -4636,7 +5445,7 @@ function splitTimedEventsByVoice(
     }
     if (matched < 0) continue;
     consumed.add(matched);
-    cursor = Math.max(cursor, matched + 1);
+    cursor = Math.max(cursor, matched + 1, consumedOwnedThrough + 1);
     const sourceEvent = events[matched];
     for (let voice = 1; voice <= options.voiceCount; voice++) {
       const pitches = main
@@ -4705,6 +5514,7 @@ function splitTimedEventsByVoice(
         continuationOf: parent,
         gracePitches: undefined,
         arpeggioPitches: undefined,
+        arpeggioGroups: undefined,
         arpeggio: false,
         restVoiceIndexes: undefined,
       };
@@ -4804,6 +5614,31 @@ function metricalContinuationStarts(
 
 type SlashMeasureMeter = { beats: number; beatType: 2 | 4 | 8 | 16 };
 
+interface SharedTripletRegion {
+  key: string;
+  start: number;
+  end: number;
+}
+
+function sharedTripletRegions(events: readonly TimedEvent[]): SharedTripletRegion[] {
+  const regions = new Map<string, SharedTripletRegion>();
+  for (const event of events) {
+    if (!event.tripletGroup || event.tripletScope === "voice" && !event.tripletSpelling
+      || event.continuationOf && !event.tripletSpelling) continue;
+    const region = regions.get(event.tripletGroup) ?? {
+      key: event.tripletGroup, start: event.start, end: event.tripletEnd ?? event.end,
+    };
+    region.start = Math.min(region.start, event.start);
+    region.end = Math.max(region.end, event.tripletEnd ?? event.end);
+    regions.set(region.key, region);
+  }
+  return [...regions.values()].sort((left, right) => left.start - right.start);
+}
+
+function isBinaryWrittenDuration(duration: number): boolean {
+  return Math.abs(duration * 32 - Math.round(duration * 32)) <= 1e-8;
+}
+
 function metricalContinuationStartsByMeasure(
   start: number,
   end: number,
@@ -4862,6 +5697,140 @@ function metricalContinuationStartsByMeasure(
     .sort((left, right) => left - right);
 }
 
+/** Ordinary sustained notes can enter a shared triplet before their next
+ * attack. Spell that fractional tail on the known 3:2 clock instead of
+ * greedily subtracting binary values (1/3 -> 1/4 + 1/16 + 1/48). */
+function metricalContinuationStartsWithTuplets(
+  start: number,
+  end: number,
+  options: SlashScoreOptions,
+  measureStarts: readonly number[],
+  measureMeters: readonly SlashMeasureMeter[],
+  regions: readonly SharedTripletRegion[],
+): number[] {
+  const fractional = regions.flatMap((region) => {
+    const from = Math.max(start, region.start), to = Math.min(end, region.end);
+    return to > from + 1e-8 && !isBinaryWrittenDuration(to - from)
+      && isBinaryWrittenDuration((to - from) * 1.5)
+      ? [{ from, to }] : [];
+  });
+  if (fractional.length === 0) {
+    return metricalContinuationStartsByMeasure(start, end, options, measureStarts, measureMeters);
+  }
+  const boundaries = [...new Set([start, end, ...fractional.flatMap((range) => [range.from, range.to])])]
+    .sort((left, right) => left - right);
+  const result: number[] = [];
+  for (let index = 0; index + 1 < boundaries.length; index++) {
+    const from = boundaries[index]!, to = boundaries[index + 1]!;
+    if (from > start + 1e-8) result.push(from);
+    if (!fractional.some((range) => from >= range.from - 1e-8 && to <= range.to + 1e-8)) {
+      result.push(...metricalContinuationStartsByMeasure(from, to, options, measureStarts, measureMeters));
+      continue;
+    }
+    let remaining = (to - from) * 1.5, cursor = from;
+    const values = [...METRICAL_DURATION_VALUES.map((item) => item.value), 3 / 64, 1 / 32];
+    for (const value of values) {
+      while (remaining >= value - 1e-8) {
+        remaining -= value;
+        cursor += value * 2 / 3;
+        if (cursor < to - 1e-8) result.push(cursor);
+      }
+    }
+  }
+  return [...new Set(result.map((value) => Math.round(value * 192) / 192))]
+    .filter((value) => value > start + 1e-8 && value < end - 1e-8)
+    .sort((left, right) => left - right);
+}
+
+/** Complete only voices whose sustained fractional values actually use the
+ * shared triplet clock. A binary half note sounding underneath a triplet
+ * remains a half note; a 2/3 + 1/3 accompaniment receives its own two-member
+ * 3:2 spelling, including a source-less tied first member when necessary. */
+function adoptSharedTripletSpelling(events: TimedEvent[], regions: readonly SharedTripletRegion[]): void {
+  for (const region of regions) {
+    const voices = new Set(events.filter((event) => event.start < region.end - 1e-8
+      && event.end > region.start + 1e-8).map((event) => event.voiceIndex ?? 0));
+    const sourceMemberCounts = new Map<number, number>();
+    for (const event of events) {
+      if (event.tripletGroup !== region.key || event.continuationOf) continue;
+      const voice = event.voiceIndex ?? 0;
+      sourceMemberCounts.set(voice, (sourceMemberCounts.get(voice) ?? 0) + 1);
+    }
+    const mostSourceMembers = Math.max(0, ...sourceMemberCounts.values());
+    for (const voice of voices) {
+      const members = events.filter((event) => (event.voiceIndex ?? 0) === voice
+        && event.start >= region.start - 1e-8 && event.start < region.end - 1e-8)
+        .sort((left, right) => left.start - right.start);
+      if (members.length === 0 || Math.abs(members[0].start - region.start) > 1e-8) continue;
+      // A shared printed bracket can overlap a separate voice-local tuplet.
+      // That voice already owns its rhythm; do not fold its ordinary notes
+      // and smaller tuplet into this region's different 3:2 clock.
+      if (members.some((event) => event.tripletGroup && event.tripletGroup !== region.key)) continue;
+      const spans = members.map((event) => Math.min(event.end, region.end) - event.start);
+      if (!spans.some((span) => !isBinaryWrittenDuration(span))) {
+        // The shared bracket can contain only the attack of a longer binary
+        // accompaniment. Once another voice has been re-spelled, that lone
+        // source atom must not become a one-member Tuplet plus a fractional
+        // outside tail merely because the other group now has its own ID.
+        for (const event of members) {
+          if (event.tripletGroup !== region.key
+            || (sourceMemberCounts.get(voice) ?? 0) >= mostSourceMembers
+            || event.end <= (event.tripletEnd ?? event.end) + 1e-8
+            || !isBinaryWrittenDuration(event.end - event.start)) continue;
+          delete event.tripletGroup;
+          delete event.tripletIndex;
+          delete event.tripletEnd;
+          delete event.tripletScope;
+        }
+        continue;
+      }
+      if (!spans.every((span) => span > 1e-8 && isBinaryWrittenDuration(span * 1.5))) continue;
+      if (!members.some((event, index) => event.tripletGroup !== region.key
+        || Math.abs((event.tripletEnd ?? event.end) - (event.start + spans[index]!)) > 1e-8)) continue;
+      if (members.some((event, index) => index + 1 < members.length
+        && Math.abs(event.start + spans[index]! - members[index + 1].start) > 1e-8)) continue;
+      const key = `${region.key}:spelling:v${voice}`;
+      members.forEach((event, index) => {
+        event.tripletGroup = key;
+        event.tripletIndex = index;
+        event.tripletEnd = event.start + spans[index]!;
+        event.tripletScope = "all";
+        event.tripletSpelling = true;
+      });
+    }
+  }
+}
+
+function restoreAnnotatedTripletContinuations(
+  events: TimedEvent[],
+  options: SlashScoreOptions,
+  measureStarts: readonly number[],
+): void {
+  for (const annotation of options.annotations ?? []) {
+    if (annotation.type !== "triplet" || !annotation.members
+      || !annotation.memberContinuations?.some(Boolean)) continue;
+    let start = (measureStarts[annotation.measure] ?? 0) + annotation.offset;
+    for (let index = 0; index < annotation.members.length; index++) {
+      const event = events.find((candidate) => candidate.voiceIndex === annotation.part
+        && Math.abs(candidate.start - start) < 1e-8);
+      if (event) event.tripletSpelling = true;
+      if (annotation.memberContinuations[index]) {
+        const previous = events.filter((candidate) => candidate.voiceIndex === annotation.part
+          && candidate.start < start - 1e-8)
+          .sort((left, right) => right.start - left.start)[0];
+        if (event && event.pitches.length > 0 && previous && previous.end >= start - 1e-8
+          && equalPitches([...event.pitches].sort((a, b) => a - b),
+            [...previous.pitches].sort((a, b) => a - b))) {
+          event.continuationOf = previous;
+          event.syntheticContinuation = true;
+          event.tripletSpelling = true;
+        }
+      }
+      start += annotation.members[index]! * 2 / 3;
+    }
+  }
+}
+
 function splitVoicedWrittenDurations(
   events: readonly TimedEvent[],
   options: SlashScoreOptions,
@@ -4916,6 +5885,7 @@ function splitVoicedWrittenDurations(
         gracePitches: undefined,
         arpeggio: false,
         arpeggioPitches: undefined,
+        arpeggioGroups: undefined,
       };
       result.push(continuation);
       previous = continuation;
@@ -4952,6 +5922,8 @@ function addIndependentVoiceContinuations(
 ): TimedEvent[] {
   if (options.voiceCount <= 1) return [...events];
   const result = [...events];
+  const tripletRegions = sharedTripletRegions(events);
+  const sharedGroupEnds = new Map(tripletRegions.map((region) => [region.key, region.end]));
   const removed = new Set<TimedEvent>();
   const fallbackMeter: SlashMeasureMeter = {
     beats: options.beats,
@@ -5024,7 +5996,20 @@ function addIndependentVoiceContinuations(
       // long member into binary metrical pieces produces tiny MIDI notes
       // whose quantization can leak into a later ordinary attack. Only the
       // sustain beyond the member's explicit boundary uses binary spelling.
-      const ordinaryStart = Math.min(nextStart, Math.max(attack.start, memberEnd ?? attack.start));
+      // A held member can continue into another shared 3:2 group. Keep
+      // that boundary when its later fractional tail needs Tuplet spelling,
+      // while an ordinary binary accompaniment remains one complete value.
+      const sharedGroupEnd = attack.tripletBeatRuler && attack.tripletGroup
+        ? sharedGroupEnds.get(attack.tripletGroup)
+        : undefined;
+      const fractionalTailStart = sharedGroupEnd !== undefined
+        && tripletRegions.some((region) => {
+          if (region.start < sharedGroupEnd - 1e-8 || region.start >= nextStart - 1e-8) return false;
+          const span = Math.min(nextStart, region.end) - region.start;
+          return !isBinaryWrittenDuration(span) && isBinaryWrittenDuration(span * 1.5);
+        }) ? sharedGroupEnd : undefined;
+      const ordinaryStart = Math.min(nextStart, Math.max(attack.start,
+        fractionalTailStart ?? memberEnd ?? attack.start));
       const spanEdges = [ordinaryStart, nextStart];
       const requiredStarts: number[] = ordinaryStart > attack.start + 1e-8
         && ordinaryStart < nextStart - 1e-8 ? [ordinaryStart] : [];
@@ -5032,12 +6017,13 @@ function addIndependentVoiceContinuations(
         const spanStart = spanEdges[span];
         const spanEnd = spanEdges[span + 1];
         if (span > 0) requiredStarts.push(spanStart);
-        requiredStarts.push(...metricalContinuationStartsByMeasure(
+        requiredStarts.push(...metricalContinuationStartsWithTuplets(
           spanStart,
           spanEnd,
           options,
           measureStarts,
           measureMeters,
+          tripletRegions,
         ));
       }
       const requiredKey = new Set(requiredStarts.map((value) => Math.round(value * 192)));
@@ -5485,7 +6471,8 @@ function applySlashTuplets(
 ): void {
   const groups = new Map<string, TimedEvent[]>();
   for (const event of events) {
-    if (!event.tripletGroup || event.tripletIndex === undefined || event.continuationOf) continue;
+    if (!event.tripletGroup || event.tripletIndex === undefined
+      || event.continuationOf && !event.tripletSpelling) continue;
     const key = `${event.tripletGroup}:${event.voiceIndex ?? 0}`;
     const list = groups.get(key) ?? [];
     list.push(event);
@@ -5624,7 +6611,8 @@ function applySlashTuplets(
         ...returnContinuations.map((event) => event.end),
       )
       : groupEnd;
-    const preceding = ordered.length < 3 && ordered[0].pitches.length > 0
+    const preceding = Boolean(ordered[0].continuationOf)
+      && ordered[0].pitches.length > 0
       ? part.measures.flatMap((measure) => measure.entries)
         .filter((entry): entry is Chord => entry instanceof Chord && !entry.rest)
         .find((entry) => {
@@ -5747,6 +6735,17 @@ function applySlashTuplets(
           detachSlashChord(entry);
           return false;
         }
+        const end = absolute + (entry.duration?.toFloat() ?? 0);
+        if (entry.rest && absolute >= groupStart - 1e-8
+          && absolute < sustainEnd - 1e-8 && end > sustainEnd + 1e-8) {
+          // Exact source timing may store the inner tuplet rest and its
+          // ordinary tail as one fraction. Rebuild only the covered interval;
+          // retain the remaining silence after the tuplet boundary.
+          entry.position = slashFraction(sustainEnd - measure.position.toFloat());
+          entry.duration = slashFraction(end - sustainEnd);
+          setSlashWrittenDuration(entry, end - sustainEnd);
+          return true;
+        }
         return absolute < groupStart - 1e-8 || absolute >= sustainEnd - 1e-8;
       });
     }
@@ -5805,7 +6804,7 @@ function applySlashTuplets(
       memberSpans[index]!,
       event.pitches,
       memberSpans[index]! * 1.5,
-      false,
+      Boolean(event.continuationOf),
     )).filter((chord): chord is Chord => chord !== null);
     if (tripletChords.length !== ordered.length) continue;
     const first = tripletChords[0].notes[0];
@@ -5839,17 +6838,17 @@ function applySlashTuplets(
     }
 
     let previous = tripletChords[tripletChords.length - 1];
-    let cursor = groupEnd;
-    while (returnEvent.pitches.length > 0 && cursor < sustainEnd - 1e-8) {
-      const measure = measureAt(cursor);
-      if (!measure) break;
-      const measureStart = measure.position.toFloat();
-      const measureEnd = measureStart + measure.time.beats * 4 / measure.time.beatType;
-      const beat = 4 / measure.time.beatType;
-      const local = Math.max(0, cursor - measureStart);
-      const nextBeat = measureStart + (Math.floor((local + 1e-8) / beat) + 1) * beat;
-      const end = Math.min(sustainEnd, measureEnd, nextBeat);
-      if (end <= cursor + 1e-8) break;
+    const tailOptions = { beats: part.measures[0]?.time.beats ?? 4,
+      beatType: part.measures[0]?.time.beatType ?? 4 } as SlashScoreOptions;
+    const tailBoundaries = [groupEnd, ...metricalContinuationStartsByMeasure(
+      groupEnd, sustainEnd, tailOptions,
+      part.measures.map((measure) => measure.position.toFloat()),
+      part.measures.map((measure) => ({ beats: measure.time.beats,
+        beatType: measure.time.beatType as SlashMeasureMeter["beatType"] })),
+    ), sustainEnd];
+    for (let index = 0; returnEvent.pitches.length > 0 && index + 1 < tailBoundaries.length; index++) {
+      const cursor = tailBoundaries[index]!, end = tailBoundaries[index + 1]!;
+      if (end <= cursor + 1e-8) continue;
       const continuation = makeChord(
         cursor,
         end - cursor,
@@ -5860,7 +6859,6 @@ function applySlashTuplets(
       if (!continuation) break;
       linkContinuation(previous, continuation);
       previous = continuation;
-      cursor = end;
     }
     for (const measure of part.measures) {
       measure.entries.sort((left, right) => left.position.compareTo(right.position));
@@ -5959,7 +6957,9 @@ function linkSlashVariableTupletTails(score: Score): void {
         const last = tuplet.last.chord;
         const end = last.position.plus(last.duration ?? new Fraction(0));
         const next = chords.find((chord) => chord !== last && chord.position.equals(end));
-        if (!next) continue;
+        // A following Tuplet owns its attacks, including a repeated pitch.
+        // Only an ordinary outside tail can use this legacy inference.
+        if (!next || next.notes.some((note) => note.tuplet && note.tuplet !== tuplet)) continue;
         if (tuplet.scope === "voice"
           && !next.transparentContinuation
           && !next.generatedTimingContinuation) continue;
@@ -5989,6 +6989,16 @@ function slashGraceNote(chord: Chord, pitch: number): Note {
   return note;
 }
 
+function sameArpeggioMembers(
+  left: readonly { part: number; pitch: number }[],
+  right: readonly { part: number; pitch: number }[],
+): boolean {
+  const keys = (members: readonly { part: number; pitch: number }[]): string[] =>
+    members.map(item => `${item.part}:${item.pitch}`).sort();
+  const a = keys(left), b = keys(right);
+  return a.length === b.length && a.every((value, index) => value === b[index]);
+}
+
 /** Restore non-metrical slash-score decorations after MIDI quantization. */
 function applySlashOrnaments(score: Score, events: readonly TimedEvent[]): void {
   const chords: PositionedChord[] = [];
@@ -6010,8 +7020,41 @@ function applySlashOrnaments(score: Score, events: readonly TimedEvent[]): void 
     }
   }
 
+  const seenArpeggioGroups = new Set<SlashArpeggioGroup>();
   for (const event of events) {
-    if (!event.arpeggio && (!event.gracePitches || event.gracePitches.length === 0)
+    // A source group is shared by every voice clone. Resolve it exactly once
+    // against the completed score so an upper-only subset stays local while
+    // a genuinely cross-part subset becomes one spanning semantic mark.
+    for (const members of event.arpeggioGroups ?? []) {
+      if (seenArpeggioGroups.has(members)) continue;
+      seenArpeggioGroups.add(members);
+      const available = chords.filter(item => Math.abs(item.start - event.start) <= 1e-8)
+        .flatMap(item => item.chord.notes.filter(note => !note.rest)
+          .map(note => ({ item, note })));
+      const selected = members.flatMap(member => {
+        const index = available.findIndex(({ item, note }) =>
+          item.partIndex === member.part && note.pitch === member.pitch);
+        return index < 0 ? [] : [available.splice(index, 1)[0]];
+      });
+      if (selected.length < 2) continue;
+      const parts = [...new Set(selected.map(({ item }) => item.partIndex))].sort((a, b) => a - b);
+      if (parts.length === 1) {
+        const target = selected[0].item.chord;
+        setChordArpeggioPitchGroups(target, [
+          ...chordArpeggioPitchGroups(target), selected.map(({ note }) => note.pitch),
+        ]);
+      } else {
+        const first = selected[0].item.chord;
+        const mark = new CrossPartArpeggio();
+        mark.measure = first.measure.index;
+        mark.offset = first.position;
+        mark.parts = parts;
+        mark.pitches = selected.map(({ item, note }) => ({ part: item.partIndex, pitch: note.pitch }));
+        score.crossPartArpeggios.push(mark);
+      }
+    }
+    if ((!event.arpeggio || event.arpeggioGroups?.length)
+      && (!event.gracePitches || event.gracePitches.length === 0)
       && !event.ornamentKind) continue;
     const pitches = [...event.pitches].sort((left, right) => left - right);
     const rolledPitches = [...(event.arpeggioPitches ?? event.pitches)]
@@ -6028,9 +7071,8 @@ function applySlashOrnaments(score: Score, events: readonly TimedEvent[]): void 
       : undefined;
     const target = (exact ?? containing)?.chord;
     if (!target) continue;
-    if (event.arpeggio && rolledPitches.length >= 2) {
-      target.arpeggio = true;
-      target.arpeggioPitches = [...rolledPitches];
+    if (event.arpeggio && !event.arpeggioGroups?.length && rolledPitches.length >= 2) {
+      setChordArpeggioPitchGroups(target, [...chordArpeggioPitchGroups(target), rolledPitches]);
     }
     if (event.gracePitches?.length) {
       target.graceNotes = event.gracePitches
@@ -6198,14 +7240,18 @@ function applySlashAnnotations(score: Score, annotations: readonly NotationAnnot
       for (const partIndex of annotation.parts) {
         const chord = chordAt(partIndex, annotation.measure, annotation.offset);
         if (!chord) continue;
-        // The visible wave is owned by the cross-part mark. Parsing the same
-        // `{...}` text can also infer a local arpeggio on one participating
-        // voice; clear that duplicate so only the spanning wave is drawn.
-        chord.arpeggio = false;
-        chord.arpeggioPitches = null;
+        // Remove only a legacy local copy of these selected members. Other
+        // independent local braces at the same column remain independent.
+        const selectedPitches = annotation.pitches.filter(item => item.part === partIndex)
+          .map(item => item.pitch);
+        setChordArpeggioPitchGroups(chord, chordArpeggioPitchGroups(chord)
+          .filter(group => !containsPitchMultiplicity(selectedPitches, group)));
       }
-      if (!score.crossPartArpeggios.some((mark) => mark.measure === annotation.measure
-        && mark.offset.equals(new Fraction(Math.round(annotation.offset * 192), 192)))) {
+      const existing = score.crossPartArpeggios.find((mark) => mark.measure === annotation.measure
+        && mark.offset.equals(new Fraction(Math.round(annotation.offset * 192), 192))
+        && sameArpeggioMembers(mark.pitches, annotation.pitches));
+      if (existing) existing.direction = annotation.direction;
+      else {
         const mark = new CrossPartArpeggio();
         mark.measure = annotation.measure;
         mark.offset = new Fraction(Math.round(annotation.offset * 192), 192);
@@ -6227,6 +7273,9 @@ function applySlashAnnotations(score: Score, annotations: readonly NotationAnnot
       }
     }
   }
+  // Exact note ties refer to the final key spelling and absolute measure
+  // positions, after all structural annotations have been applied.
+  applyExplicitNoteTies(score, normalized.filter(annotation => annotation.type === "note-tie"));
 }
 
 function finestQuantize(options: SlashScoreOptions): MidiQuantizeDivision {
@@ -6412,6 +7461,16 @@ function applyOpeningPickup(
 
 export function parseSlashScore(text: string, baseOptions: SlashScoreOptions): SlashScoreResult {
   const options = optionsWithDirectives(text, baseOptions);
+  if (options.sourceTimedRows) {
+    const projected = projectSourceTimedRows(text, options);
+    const parsed = parseSlashScore(projected.text, projected.options);
+    const original = sourceLines(text, options.kind);
+    parsed.summary.comments = original.comments.length;
+    parsed.summary.ignoredTags = original.ignoredTags;
+    parsed.sources = mapProjectedSources(parsed.sources, projected.sourceOffsets);
+    parsed.summary.diagnostics = mapProjectedDiagnostics(parsed.summary.diagnostics, projected.sourceOffsets, text);
+    return parsed;
+  }
   const lines = sourceLines(text, options.kind);
   if (lines.score.length === 0) throw new Error("没有找到斜杠谱小节；每个有效小节需单独一行并包含 / 分隔");
   const measureLength = options.beats * 4 / options.beatType;
@@ -6645,6 +7704,8 @@ export function parseSlashScore(text: string, baseOptions: SlashScoreOptions): S
       }
     }
   }
+  restoreAnnotatedTripletContinuations(splitEvents, options, measureStarts);
+  const tripletSpellingRegions = sharedTripletRegions(splitEvents);
   const voicedEvents = addIndependentVoiceContinuations(
     splitVoicedWrittenDurations(
       splitEvents,
@@ -6654,6 +7715,7 @@ export function parseSlashScore(text: string, baseOptions: SlashScoreOptions): S
     measureStarts,
     measureMeters,
   );
+  adoptSharedTripletSpelling(voicedEvents, tripletSpellingRegions);
   const parsed = parsedMidiFromEvents(
     voicedEvents,
     logicalMeasures.length,
@@ -6702,6 +7764,7 @@ export function parseSlashScore(text: string, baseOptions: SlashScoreOptions): S
     preserveSourceRhythmSpelling: true,
   };
   const imported = midiToScore(parsed, midiOptions);
+  imported.score.headerTypography = normalizeHeaderTypography(options.headerTypography);
   // TXT meter rows and the score-settings meter are explicit notation, not
   // the legacy MIDI convention where a short opening time signature encodes
   // an anacrusis. Layout calls normalizeOpeningPickup() again, so preserve the
@@ -6856,7 +7919,7 @@ function slashPitch(pitch: number, fifths: number): { degree: number; octave: nu
 
 /** Apply a notation-only keyboard-key view. The numeric pitch spelling stays
  *  intact so ties, playback, source selection and JPW/MIDI export are unchanged. */
-function applyKeyboardKeyLabels(
+export function applyKeyboardKeyLabels(
   score: Score,
   tieAsZero: boolean,
   hideTieLabels: boolean,
@@ -6942,7 +8005,7 @@ interface OutputEvent {
   /** MIDI note-on pitches at this column, excluding split note-off continuations. */
   explicitPitches?: number[];
   /** One shared arpeggio selected across two or more rendered parts. */
-  crossArpeggioPitches?: Array<{ part: number; pitch: number }>;
+  crossArpeggioGroups?: Array<Array<{ part: number; pitch: number }>>;
 }
 
 /** Return the diatonic neighbour used by the compact TXT mordent spelling. */
@@ -7028,13 +8091,40 @@ function slashMordentToken(
   return token;
 }
 
-/**
- * Re-encode an explicitly marked score tuplet when exporting to TXT.  The
- * ordinary event serializer only knows about elapsed durations, so a tuplet
- * imported from JPW could previously come back as three unrelated notes.  A
- * bracket carries the fixed nominal value (3:2), while `embeddedDuration`
- * keeps the real two-cell duration on the common timeline.
- */
+/** The inverse of a bracket's intrinsic budget and relative member weights. */
+function intrinsicTupletSpelling(
+  chain: readonly Chord[],
+  noteUnit: number,
+  glyphUnit: number,
+): { weights: number[]; extra: number } | null {
+  if (noteUnit <= 1e-9 || chain.length === 0) return null;
+  const spans = chain.map((chord) => chord.duration ?? new Fraction(0));
+  const span = spans.reduce((sum, value) => sum + value.toFloat(), 0);
+  const extra = span - noteUnit;
+  const onGrid = (value: number): boolean => value >= -1e-8
+    && (Math.abs(value) < 1e-8 || Number.isFinite(glyphUnit)
+      && Math.abs(value / glyphUnit - Math.round(value / glyphUnit)) < 1e-7);
+  if (!onGrid(extra) || spans.some((value) => value.numerator <= 0)) return null;
+  const gcd = (left: number, right: number): number => {
+    while (right !== 0) [left, right] = [right, left % right];
+    return Math.abs(left);
+  };
+  let denominator = 1;
+  for (const value of spans) {
+    denominator = denominator / gcd(denominator, value.denominator) * value.denominator;
+    if (!Number.isSafeInteger(denominator)) return null;
+  }
+  const counts = spans.map((value) => value.numerator * denominator / value.denominator);
+  const divisor = counts.reduce((common, value) => gcd(common, value));
+  const weights = counts.map((value) => value / divisor * noteUnit);
+  if (weights.some((value) => !onGrid(value - noteUnit))) return null;
+  // Members express relative weights; only the complete bracket owns the
+  // intrinsic value. Keep ordinary ratios compact (ABC or A.BC), and put the
+  // remaining elapsed value outside the bracket exactly once.
+  return { weights, extra: Math.max(0, extra) };
+}
+
+/** Re-encode semantic tuplets and retain their real span on the TXT timeline. */
 function preserveScoreTuplets(
   events: OutputEvent[],
   measures: readonly (Measure | undefined)[],
@@ -7048,6 +8138,7 @@ function preserveScoreTuplets(
   groups: SlashExportGroupModes,
   preserveExplicitRests: boolean,
   beatDuration: number,
+  glyphUnit: number,
 ): OutputEvent[] {
   const delimiter = delimiterFor("triplet", groups);
   if (!delimiter) return events;
@@ -7168,6 +8259,7 @@ function preserveScoreTuplets(
           const nominal = noteUnit <= 1e-9 && remaining < baseUnit - 1e-8
             ? baseUnit / 2
             : Math.max(noteUnit, Math.floor((remaining + 1e-8) / baseUnit) * baseUnit);
+          if (index > 0 && !delimiterFor("chord", groups)) body += "\t";
           body += token + (noteUnit <= 1e-9 && nominal < baseUnit - 1e-8
             ? "" : durationText(Math.max(0, nominal - noteUnit)));
           written += nominal;
@@ -7201,7 +8293,7 @@ function preserveScoreTuplets(
         parallelVoiceTuplet: false,
         continuationVoiceAfterEmbedded: undefined,
         explicitPitches: undefined,
-        crossArpeggioPitches: sources.flatMap((event) => event.crossArpeggioPitches ?? []),
+        crossArpeggioGroups: sources.flatMap(event => event.crossArpeggioGroups ?? []),
       } : {
         start,
         end: start + 1 / 192,
@@ -7331,7 +8423,7 @@ function preserveScoreTuplets(
       };
       events.push(first);
     }
-    first.specialToken = `${delimiter[0]}${atoms.join("")}${delimiter[1]}`;
+    first.specialToken = `${delimiter[0]}${atoms.join(delimiterFor("chord", groups) ? "" : "\t")}${delimiter[1]}`;
     first.embeddedDuration = clusterEnd - clusterStart;
     first.end = Math.max(first.end, clusterEnd);
     first.parallelVoiceTuplet = false;
@@ -7374,6 +8466,19 @@ function preserveScoreTuplets(
       }
       if (!endsTuplet(chain[chain.length - 1])) continue;
       const tupletVoice = clamp(tuplet.voiceIndex ?? partIndex + 1, 1, voiceCount);
+      const chainEnd = chain[chain.length - 1].position
+        .plus(chain[chain.length - 1].duration ?? new Fraction(0)).toFloat();
+      if (tuplet.scope === "all" && events.some((event) => !hidden.has(event)
+        && event.specialToken?.startsWith(delimiter[0])
+        && event.embeddedDuration !== undefined
+        && event.start <= begin.position.toFloat() + 1e-8
+        && event.start + event.embeddedDuration >= chainEnd - 1e-8)) {
+        // The earlier voice already wrote this shared clock and its real
+        // attacks. A derived accompaniment Tuplet adds only notation; do not
+        // materialize its now-hidden atoms a second time after the bracket.
+        index += chain.length - 1;
+        continue;
+      }
       const matched = chain.map((chord) => events.find((event) =>
         // `measureEvents()` uses measure-local offsets; the current measure is
         // already selected by the caller, so do not add its absolute position.
@@ -7383,11 +8488,19 @@ function preserveScoreTuplets(
       const materialized = matched.map((event, chordIndex): OutputEvent => event ?? (() => {
         const chord = chain[chordIndex];
         const rest = chord.rest || chord.notes.every((note) => note.rest);
+        // A source-less tied member shares the original column with the
+        // other voice's real attack. Reuse that event so a second voice's
+        // readable Tuplet cannot emit another full bracket at the same beat.
+        if (chord.transparentContinuation && tuplet.scope === "all") {
+          const shared = events.find((candidate) => !hidden.has(candidate)
+            && Math.abs(candidate.start - chord.position.toFloat()) < 1 / 192);
+          if (shared) return shared;
+        }
         const synthetic: OutputEvent = {
           start: chord.position.toFloat(),
           end: chord.position.plus(chord.duration ?? new Fraction(1, 192)).toFloat(),
-          chords: rest ? [] : [chord],
-          voiceIndexes: rest ? [] : [tupletVoice],
+          chords: rest || chord.transparentContinuation ? [] : [chord],
+          voiceIndexes: rest || chord.transparentContinuation ? [] : [tupletVoice],
           restVoiceIndexes: rest ? [tupletVoice] : [],
           specialToken: rest && voiceCount <= 1 ? "0" : undefined,
         };
@@ -7409,6 +8522,11 @@ function preserveScoreTuplets(
         );
         return actual * 1.5;
       });
+      const intrinsic = tuplet.scope === "all" && !tuplet.ornamentProxy
+        && !chain.some((chord) => chord.transparentContinuation)
+        && !(tuplet.last.tieNext && !chain.includes(tuplet.last.tieNext.chord))
+        ? intrinsicTupletSpelling(chain, noteUnit, glyphUnit)
+        : null;
       // With marker-only rhythm, attached atoms are the one-level-finer grid.
       // A 32nd-note triplet on a 16th-note document is therefore `[ABC]`, not
       // the removed `<[ABC]>` subdivision wrapper. Intrinsic note values turn
@@ -7477,7 +8595,7 @@ function preserveScoreTuplets(
           durationText,
           undefined,
           true,
-        ) || "0";
+        ) || (chain[chordIndex].transparentContinuation ? "" : "0");
         if (splitParallelVoices && voiceCount > 1 && tupletVoice === voiceCount) {
           token = explicitDefaultTimedToken(token, voiceCount);
         }
@@ -7487,7 +8605,7 @@ function preserveScoreTuplets(
         // Without this subtraction `Q.` (eighth with a 16th intrinsic value)
         // became `Q..`, inflating every triplet atom on the next parse.
         const nominal = nominalDurations[chordIndex];
-        const containerNominal = nominal;
+        const containerNominal = intrinsic?.weights[chordIndex] ?? nominal;
         // A semantic ABA mordent deliberately uses the container's implicit
         // finest-grid members (`<[ASA]>`). Re-emitting explicit duration
         // glyphs after reload changes it to `<[A.S.A.]>` and makes subsequent
@@ -7504,8 +8622,9 @@ function preserveScoreTuplets(
         return token + (tuplet.ornamentProxy || attachedSubdivisionAtom
           ? ""
           : durationText(Math.max(0, containerNominal - noteUnit)));
-      }).join("");
-      const tripletToken = `${delimiter[0]}${atoms}${delimiter[1]}`;
+      }).join(!delimiterFor("chord", groups) && !tuplet.ornamentProxy ? "\t" : "");
+      const tripletToken = `${delimiter[0]}${atoms}${delimiter[1]}`
+        + (intrinsic ? durationText(intrinsic.extra) : "");
       first.specialToken = tripletToken;
       first.embeddedDuration = chain.reduce((sum, chord) =>
         sum + Math.max(1 / 192, chord.duration?.toFloat() ?? 0), 0);
@@ -7641,6 +8760,10 @@ function measureEvents(score: Score, measureIndex: number): OutputEvent[] {
     const part = score.parts[partIndex];
     const measure = part.measures[measureIndex];
     if (!measure) continue;
+    // A chord subset can stop while another member sustains. Keep its real
+    // written segments; explicit note-tie annotations reconnect only the
+    // continuing occurrences after parsing the normal visible TXT atoms.
+    const explicitMemberTies = partNeedsExplicitNoteTies(part);
     const chords = measure.entries.filter((entry): entry is Chord => entry instanceof Chord)
       .sort((left, right) => left.position.compareTo(right.position));
     for (const entry of chords) {
@@ -7648,11 +8771,11 @@ function measureEvents(score: Score, measureIndex: number): OutputEvent[] {
       const sounding = entry.notes.filter((note) => !note.rest);
       // A transparent slash continuation or an explicit JPW tie-stop advances
       // the common time axis but must not become a new keyboard/number attack.
-      const continuation = entry.transparentContinuation
+      const continuation = !explicitMemberTies && (entry.transparentContinuation
         || (entry.graceNotes.every((note) => note.rest)
           && !entry.arpeggio
           && sounding.length > 0
-          && sounding.every((note) => note.tieEnd));
+          && sounding.every((note) => note.tieEnd)));
       const start = entry.position.toFloat();
       const duration = entry.duration?.toFloat() ?? 0.25;
       const key = Math.round(start * 192);
@@ -7665,7 +8788,7 @@ function measureEvents(score: Score, measureIndex: number): OutputEvent[] {
         voiceIndexes: [],
         restVoiceIndexes: [],
       };
-      if (entry.generatedTimingContinuation || continuation) {
+      if ((!explicitMemberTies && entry.generatedTimingContinuation) || continuation) {
         // Split tie segments are one sounding attack. Keep their final end on
         // the original event so a later slash group sees active sound rather
         // than converting its continuation into a rest or empty beat.
@@ -7757,8 +8880,8 @@ function outputToken(
   let token = "";
   const chordTokenFromValues = (values: readonly string[]): string => {
     if (values.length <= 1) return values[0] ?? "";
-    const delimiter = delimiterFor("chord", groups) ?? (["(", ")"] as const);
-    return `${delimiter[0]}${values.join("")}${delimiter[1]}`;
+    const delimiter = delimiterFor("chord", groups);
+    return delimiter ? `${delimiter[0]}${values.join("")}${delimiter[1]}` : values.join("");
   };
   if (event.explicitPitches) {
     token = chordTokenFromValues(pitchValues(
@@ -7805,7 +8928,7 @@ function outputToken(
 
   const arpeggioDelimiter = delimiterFor("arpeggio", groups);
   const hasLocalArpeggio = event.chords.some((chord) => chord.arpeggio);
-  if ((hasLocalArpeggio || (event.crossArpeggioPitches?.length ?? 0) >= 2)
+  if ((hasLocalArpeggio || (event.crossArpeggioGroups?.length ?? 0) > 0)
     && arpeggioDelimiter) {
     type MainOccurrence = {
       pitch: number;
@@ -7829,10 +8952,12 @@ function outputToken(
       }));
     });
     const groupedIndexes: number[][] = [];
-    if ((event.crossArpeggioPitches?.length ?? 0) >= 2) {
-      const available = event.crossArpeggioPitches!.map((item) => ({ ...item }));
+    for (const crossMembers of event.crossArpeggioGroups ?? []) {
+      const available = crossMembers.map((item) => ({ ...item }));
       const indexes: number[] = [];
+      const used = new Set(groupedIndexes.flat());
       occurrences.forEach((occurrence, index) => {
+        if (used.has(index)) return;
         const match = available.findIndex((item) =>
           item.part === occurrence.voice - 1 && item.pitch === occurrence.pitch);
         if (match < 0) return;
@@ -7840,23 +8965,23 @@ function outputToken(
         indexes.push(index);
       });
       if (indexes.length >= 2) groupedIndexes.push(indexes);
-    } else {
-      event.chords.forEach((chord, chordIndex) => {
-        if (!chord.arpeggio) return;
-        const requested = chord.arpeggioPitches
-          ?? chord.notes.filter((note) => !note.rest).map((note) => note.pitch);
+    }
+    event.chords.forEach((chord, chordIndex) => {
+      const used = new Set(groupedIndexes.flat());
+      for (const requested of chordArpeggioPitchGroups(chord)) {
         const remaining = [...requested];
         const indexes: number[] = [];
         occurrences.forEach((occurrence, index) => {
-          if (occurrence.chordIndex !== chordIndex) return;
+          if (occurrence.chordIndex !== chordIndex || used.has(index)) return;
           const match = remaining.indexOf(occurrence.pitch);
           if (match < 0) return;
           remaining.splice(match, 1);
           indexes.push(index);
+          used.add(index);
         });
         if (indexes.length >= 2) groupedIndexes.push(indexes);
-      });
-    }
+      }
+    });
     const selected = new Set(groupedIndexes.flat());
     const pitchText = (occurrence: MainOccurrence): string => {
       const prefix = occurrence.voice === voiceCount
@@ -7892,10 +9017,11 @@ function outputToken(
     }
     components.sort((left, right) => compareOutputPitch(left, right, ordering));
     if (components.length > 0) {
-      const chordDelimiter = delimiterFor("chord", groups) ?? (["(", ")"] as const);
+      const chordDelimiter = delimiterFor("chord", groups);
       token = components.length === 1
         ? components[0].text
-        : `${chordDelimiter[0]}${components.map((component) => component.text).join("")}${chordDelimiter[1]}`;
+        : chordDelimiter ? `${chordDelimiter[0]}${components.map((component) => component.text).join("")}${chordDelimiter[1]}`
+          : components.map(component => component.text).join("");
     }
   }
 
@@ -8201,8 +9327,8 @@ function voicedPitchesToken(
       if (occurrenceIndex >= 0) usedOccurrences.add(occurrenceIndex);
     }
     const values = pitchValues(pitches, kind, fifths, ordering === "pitch-desc");
-    const delimiter = delimiterFor("chord", groups) ?? (["(", ")"] as const);
-    return values.length <= 1 ? values[0] ?? "" : `${delimiter[0]}${values.join("")}${delimiter[1]}`;
+    const delimiter = delimiterFor("chord", groups);
+    return values.length <= 1 ? values[0] ?? "" : delimiter ? `${delimiter[0]}${values.join("")}${delimiter[1]}` : values.join("");
   }
   const values = pitches.map((pitch, order) => {
     const occurrenceIndex = occurrences.findIndex((item, index) =>
@@ -8223,8 +9349,8 @@ function voicedPitchesToken(
         : numericPitchValue(pitch, fifths);
       return prefix + value;
     });
-  const delimiter = delimiterFor("chord", groups) ?? (["(", ")"] as const);
-  return values.length <= 1 ? values[0] ?? "" : `${delimiter[0]}${values.join("")}${delimiter[1]}`;
+  const delimiter = delimiterFor("chord", groups);
+  return values.length <= 1 ? values[0] ?? "" : delimiter ? `${delimiter[0]}${values.join("")}${delimiter[1]}` : values.join("");
 }
 
 function eventPitches(event: OutputEvent): number[] {
@@ -8246,10 +9372,17 @@ function midiOnsetPitchMap(
     for (const pitch of pitches) values.add(pitch);
     result.set(key, values);
   };
-  for (const note of parsed.notes) add(Math.round((note.startTick / parsed.ppq) / unit) * unit, [note.pitch]);
+  const exactStarts = new Map<ParsedMidiNote, number>();
   for (const gesture of gestures) {
     if (gesture.kind !== "triplet") continue;
-    for (const event of gesture.events) add(event.start, event.pitches);
+    for (const event of gesture.events) {
+      for (const source of event.sourceNotes ?? []) exactStarts.set(source, event.start);
+    }
+  }
+  for (const note of parsed.notes) {
+    // Register a source attack once. Keeping both its old binary position and
+    // its tuplet position copied that pitch into a neighbouring accompaniment.
+    add(exactStarts.get(note) ?? Math.round((note.startTick / parsed.ppq) / unit) * unit, [note.pitch]);
   }
   return result;
 }
@@ -8259,12 +9392,20 @@ function retainMidiOnsets(
   measureStart: number,
   onsetPitches: ReadonlyMap<number, Set<number>>,
   preserveVoices: boolean,
+  firstMidiOnsetKey: number,
 ): OutputEvent[] {
   const result: OutputEvent[] = [];
   for (const event of events) {
     const key = Math.round((measureStart + event.start) * 192);
     const pitches = onsetPitches.get(key);
-    if (!pitches || pitches.size === 0) continue;
+    if (!pitches || pitches.size === 0) {
+      // Before the first MIDI attack there is no earlier sound for a bare
+      // duration prefix to continue. Keep the source rest explicitly so the
+      // TXT parser cannot backdate the first note into that silent interval.
+      if (key < firstMidiOnsetKey && (event.specialToken === "0"
+        || (event.restVoiceIndexes?.length ?? 0) > 0)) result.push({ ...event });
+      continue;
+    }
     result.push(preserveVoices
       ? { ...event, explicitPitches: undefined }
       : { ...event, explicitPitches: [...pitches].sort((a, b) => a - b) });
@@ -8321,6 +9462,7 @@ function applyMidiSlashGestures(
   symbol: string,
   voiceCount: number,
   ordering: MidiSlashOrdering,
+  durationText: (duration: number) => string,
 ): OutputEvent[] {
   const unit = 4 / division;
   const measureEnd = measureStart + measureLength;
@@ -8415,8 +9557,79 @@ function applyMidiSlashGestures(
       const cell = nominal * 2 / 3;
       const matched = gesture.events.map((_source, index) =>
         nearestEvent(events, localAnchor + index * cell, Math.max(1 / 192, cell * 0.24)));
-      const first = matched[0] ?? nearestEvent(events, localAnchor, unit * 0.51);
-      if (!first) continue;
+      // An export group must consume the same three actual attack columns.
+      // Never invent missing members from the first column: doing so duplicates
+      // the still-visible notes and can assign them to the wrong part.
+      if (matched.some((event) => !event) || new Set(matched).size !== 3) continue;
+      const first = matched[0]!;
+      const groupEnd = Math.min(measureLength, localAnchor + nominal * 2);
+      const extraAttacks = events.filter((event) => !event.hidden
+        && event.start >= localAnchor - 1e-8 && event.start < groupEnd - 1e-8
+        && !matched.includes(event) && event.chords.some((chord) => !chord.rest));
+      if (extraAttacks.length > 0 && voiceCount > 1) {
+        // A straight accompaniment inside the tuplet span is a parallel lane,
+        // not additional time after the full 3:2 group. Only voices containing
+        // all three attacks can be taken out of the ordinary timeline.
+        const tripletVoices = [...new Set(first.voiceIndexes ?? [])].filter((voice) =>
+          matched.every((event) => event!.voiceIndexes?.includes(voice))
+          && !extraAttacks.some((event) => event.voiceIndexes?.includes(voice)));
+        if (tripletVoices.length > 0) {
+          const markerCount = Math.max(1, Math.round(nominal / unit));
+          const overlays: OutputEvent[] = [];
+          for (const voice of tripletVoices) {
+            const members = matched.map((event) => {
+              const chords = event!.chords.filter((_chord, index) => event!.voiceIndexes?.[index] === voice);
+              return { ...event!, chords, voiceIndexes: chords.map(() => voice),
+                restVoiceIndexes: [], explicitPitches: undefined, specialToken: undefined };
+            });
+            const atoms = members.map((member) => {
+              let token = voicedPitchesToken(eventPitches(member), member, kind, fifths,
+                voiceCount, ordering, options);
+              // The default (last) part also needs an explicit marker here;
+              // otherwise the parser correctly treats this as a global group.
+              if (voice === voiceCount) token = explicitDefaultTimedToken(token, voiceCount);
+              return token + symbol.repeat(markerCount);
+            }).join("");
+            overlays.push({ ...members[0], start: localAnchor, end: groupEnd,
+              specialToken: `${opening}${atoms}${closing}`,
+              embeddedDuration: groupEnd - localAnchor, parallelVoiceTuplet: true });
+          }
+          for (const event of matched) {
+            const retained = event!.chords.map((chord, index) => ({ chord, voice: event!.voiceIndexes?.[index] ?? voiceCount }))
+              .filter((item) => !tripletVoices.includes(item.voice));
+            event!.chords = retained.map((item) => item.chord);
+            event!.voiceIndexes = retained.map((item) => item.voice);
+            event!.restVoiceIndexes = event!.restVoiceIndexes?.filter((voice) => !tripletVoices.includes(voice));
+            event!.explicitPitches = undefined;
+            if (event!.chords.length === 0 && !event!.restVoiceIndexes?.length) event!.hidden = true;
+          }
+          const ordinary = events.filter((event) => !event.hidden && !event.parallelVoiceTuplet)
+            .sort((left, right) => left.start - right.start);
+          for (let index = 0; index < ordinary.length; index++) {
+            ordinary[index].end = ordinary[index + 1]?.start ?? measureLength;
+          }
+          events.push(...overlays);
+          continue;
+        }
+      }
+      if (extraAttacks.length > 0) {
+        // A deliberately flattened one-part score has no independent lane.
+        // Encode the union of attacks on the 3:2 clock, including the shorter
+        // member where the ordinary grid intersects it. Fine duration glyphs
+        // are declared by scoreToSlashScore before any rows are written.
+        const columns = [...matched.map((event) => event!), ...extraAttacks]
+          .sort((left, right) => left.start - right.start);
+        const atoms = columns.map((event, index) => {
+          const next = columns[index + 1]?.start ?? groupEnd;
+          return voicedPitchesToken(eventPitches(event), event, kind, fifths,
+            voiceCount, ordering, options) + durationText((next - event.start) * 1.5);
+        }).join("");
+        first.specialToken = `${opening}${atoms}${closing}`;
+        first.embeddedDuration = groupEnd - localAnchor;
+        first.end = groupEnd;
+        for (const event of columns) if (event !== first) event.hidden = true;
+        continue;
+      }
       const markerCount = Math.max(1, Math.round(nominal / unit));
       const usedByEvent = new Map<OutputEvent, Set<number>>();
       const atoms = gesture.events.map((source, index) => {
@@ -8424,17 +9637,25 @@ function applyMidiSlashGestures(
         const sounding = matched[index] ? eventPitches(matched[index]!) : source.pitches;
         const usedOccurrences = usedByEvent.get(matchedEvent) ?? new Set<number>();
         usedByEvent.set(matchedEvent, usedOccurrences);
-        return voicedPitchesToken(
-          sounding,
-          matchedEvent,
-          kind,
-          fifths,
-          voiceCount,
-          ordering,
-          options,
-          usedOccurrences,
-        ) +
-          symbol.repeat(markerCount);
+        const token = voiceCount > 1 && (matchedEvent.restVoiceIndexes?.length ?? 0) > 0
+          && delimiterFor("chord", options) !== null
+          ? outputToken({ ...matchedEvent, specialToken: undefined }, kind, fifths,
+            voiceCount, ordering, options)
+          : voicedPitchesToken(
+            sounding,
+            matchedEvent,
+            kind,
+            fifths,
+            voiceCount,
+            ordering,
+            options,
+            usedOccurrences,
+          );
+        // A rest at a cross-hand member ends the previous note in that voice.
+        // Omitting it makes the earlier note sustain until this voice's next
+        // pitched member, even though the shared clock already reached here.
+        // The chord delimiter keeps this rest simultaneous with the attack.
+        return token + symbol.repeat(markerCount);
       }).join("");
       first.specialToken = `${opening}${atoms}${closing}`;
       first.embeddedDuration = nominal * 2;
@@ -8442,7 +9663,8 @@ function applyMidiSlashGestures(
       for (const event of matched.slice(1)) if (event && event !== first) event.hidden = true;
     }
   }
-  return events.filter((event) => !event.hidden).sort((a, b) => a.start - b.start);
+  return events.filter((event) => !event.hidden).sort((a, b) =>
+    a.start - b.start || Number(!!b.parallelVoiceTuplet) - Number(!!a.parallelVoiceTuplet));
 }
 
 function keyName(fifths: number): string {
@@ -8599,9 +9821,20 @@ export function scoreToSlashScore(
     angleMode,
     parenMode,
   };
+  if (!delimiterFor("chord", exportGroups)) {
+    // An implicit fine-cell run is ambiguous with a bare chord. Require a
+    // real duration spelling before separating preserved tuplet members.
+    for (const part of score.parts) for (const measure of part.measures) for (const entry of measure.entries) {
+      if (!(entry instanceof Chord) || !entry.notes.some(note => note.tuplet && !note.tuplet.ornamentProxy)) continue;
+      let remaining = Math.max(0, (entry.duration?.toFloat() ?? 0) * 1.5 - noteUnit);
+      for (const glyph of durationGlyphs) remaining -= Math.floor((remaining + 1e-8) / glyph.quarterNotes) * glyph.quarterNotes;
+      if (remaining > 1e-8) throw new Error("没有和弦括号时，三连音成员需要可精确表示的显式时值；请先设置所需更细单位。");
+    }
+  }
   const ordering = midiExport?.ordering ?? "pitch-asc";
   const detectedGestures = midiExport?.sourceMidi
-    ? detectMidiSlashGestures(midiExport.sourceMidi, division)
+    ? importedMidiSlashGestures(score, midiExport.sourceMidi)
+      ?? detectMidiSlashGestures(midiExport.sourceMidi, division)
     : null;
   const midiGestures = detectedGestures
     ? [...detectedGestures.grace, ...detectedGestures.arpeggio, ...detectedGestures.triplet]
@@ -8609,6 +9842,46 @@ export function scoreToSlashScore(
   const midiOnsets = midiExport?.sourceMidi
     ? midiOnsetPitchMap(midiExport.sourceMidi, division, midiGestures)
     : null;
+  // MIDI onset keys use a 1/192-quarter clock. Calculate the leading-silence
+  // boundary once, shared by every measure and the triplet precision probe.
+  let firstMidiOnsetKey = Infinity;
+  if (midiOnsets) {
+    for (const key of midiOnsets.keys()) firstMidiOnsetKey = Math.min(firstMidiOnsetKey, key);
+  }
+  const additionalDurationDirectives: string[] = [];
+  if (midiExport?.sourceMidi && midiOnsets && detectedGestures) {
+    const needsFinerValue = detectedGestures.triplet.some((gesture) => {
+      const measureIndex = score.parts[0]?.measures.findIndex((measure) =>
+        measure.position.toFloat() <= gesture.anchor + 1e-8
+        && measure.position.toFloat() + measure.time.beats * 4 / measure.time.beatType > gesture.anchor + 1e-8) ?? -1;
+      if (measureIndex < 0) return false;
+      const start = score.parts[0].measures[measureIndex].position.toFloat();
+      const columns = retainMidiOnsets(measureEvents(score, measureIndex), start, midiOnsets, voiceCount > 1, firstMidiOnsetKey)
+        .filter((event) => event.chords.length > 0 && event.start >= gesture.anchor - start - 1e-8
+          && event.start < gesture.end - start - 1e-8);
+      const members = gesture.events.map((member) => columns.find((event) =>
+        Math.abs(event.start + start - member.start) < 1 / 192));
+      const extras = columns.filter((event) => !members.includes(event));
+      if (extras.length === 0) return false;
+      const commonVoices = [...new Set(members[0]?.voiceIndexes ?? [])].filter((voice) =>
+        members.every((event) => event?.voiceIndexes?.includes(voice))
+        && extras.every((event) => !event.voiceIndexes?.includes(voice)));
+      if (voiceCount > 1 && commonVoices.length > 0) return false;
+      return columns.some((event, index) => {
+        const next = columns[index + 1]?.start ?? gesture.end - start;
+        const cells = (next - event.start) * 1.5 / unit;
+        return Math.abs(cells - Math.round(cells)) > 1e-8;
+      });
+    });
+    if (needsFinerValue && !durationGlyphs.some((glyph) => glyph.quarterNotes <= unit / 2 + 1e-8)) {
+      if (division >= 128) throw new Error("混合三连音需要比 128 分音符更细的时值，当前文本谱无法精确表示。");
+      const fineSymbol = ["=", ":", "_", "*", "~", "·", "+", "-"].find((glyph) => !durationGlyphs.some((item) => item.glyph === glyph));
+      if (!fineSymbol) throw new Error("混合三连音需要一个未占用的更细时值符号，请减少自定义时值符号后重试。");
+      durationGlyphs.push({ glyph: fineSymbol, quarterNotes: unit / 2, order: durationGlyphs.length });
+      durationGlyphs.sort((left, right) => right.quarterNotes - left.quarterNotes || left.order - right.order);
+      additionalDurationDirectives.push(`${fineSymbol} = ${division * 2}分音符`);
+    }
+  }
   const lines: string[] = [
     kind === "keyboard" ? "键盘谱" : "数字谱",
     "// 每行一小节，/ 分隔拍组；未识别的其他文字作为注释保留。",
@@ -8636,6 +9909,7 @@ export function scoreToSlashScore(
       return `速度 = 每分钟${bpm}${unit}(${bpm} BPM)`;
     })(),
     symbol === " " ? `空格 = ${division}分音符` : `${symbol || "符号"} = ${division}分音符`,
+    ...additionalDurationDirectives,
     ...groupDirectives,
     "",
   );
@@ -8658,7 +9932,9 @@ export function scoreToSlashScore(
     let events = measureEvents(score, measureIndex);
     for (const mark of score.crossPartArpeggios.filter((item) => item.measure === measureIndex)) {
       const event = events.find((item) => Math.abs(item.start - mark.offset.toFloat()) < 1 / 192);
-      if (event) event.crossArpeggioPitches = mark.pitches.map((pitch) => ({ ...pitch }));
+      if (event) {
+        (event.crossArpeggioGroups ??= []).push(mark.pitches.map(pitch => ({ ...pitch })));
+      }
     }
     const explicitRestPreference = midiExport?.showExplicitRests
       ?? durationNotation?.showExplicitRests;
@@ -8667,7 +9943,7 @@ export function scoreToSlashScore(
     const preserveLeadingSilence = explicitRestPreference === false;
     if (!keepExplicitRests) events = collapseInternalRestEvents(events);
     if (midiExport?.sourceMidi) {
-      events = retainMidiOnsets(events, measureStart, midiOnsets!, voiceCount > 1);
+      events = retainMidiOnsets(events, measureStart, midiOnsets!, voiceCount > 1, firstMidiOnsetKey);
       // Slash scores express sustain with their own adjacent rhythm symbols.
       // Ignore MIDI note-off/pedal length and hold each onset until the next
       // onset (or the end of the measure) before serializing.
@@ -8686,6 +9962,7 @@ export function scoreToSlashScore(
         symbol,
         voiceCount,
         ordering,
+        durationText,
       );
     }
     // JPW/text conversion can contain explicit tuplets even when no source
@@ -8705,6 +9982,9 @@ export function scoreToSlashScore(
         exportGroups,
         keepExplicitRests,
         groupDuration,
+        durationNotation
+          ? Math.min(...Object.values(effectiveMappings(durationNotation)).map((value) => 4 / value))
+          : Math.min(...durationGlyphs.map((glyph) => glyph.quarterNotes)),
       );
     }
     // A tie entering this measure has no attack event in measureEvents():
@@ -8881,9 +10161,10 @@ export function scoreToSlashScore(
           ? ""
           : outputToken(event, kind, fifthsAt(eventStart), voiceCount, ordering, {
             ...exportGroups,
-          }, durationText, unit, false, noteUnit <= 1e-9);
+          }, durationText, unit, false, noteUnit <= 1e-9 && delimiterFor("chord", exportGroups) !== null);
         if (token) {
           continuationMarkerVoice = null;
+          if (out && !delimiterFor("chord", exportGroups)) out += durationNotation?.spaceDivision ? "\t" : " ";
           out += token;
         }
         if (event.embeddedDuration !== undefined) {
@@ -8982,11 +10263,17 @@ export function embedSlashScoreOptions(text: string, options: SlashScoreOptions)
     o: options.ordering ?? "pitch-asc",
   };
   if (options.wholeMeasureGroups) stored.wg = true;
+  if (options.sourceTimedRows) {
+    stored.st = true;
+    stored.ac = options.adjacentAsChord ?? true;
+  }
   if (options.instrumentName?.trim()) stored.i = options.instrumentName.trim();
   if (options.subtitle) stored.u = options.subtitle;
   if (options.composer) stored.c = options.composer;
   if (options.arranger) stored.a = options.arranger;
   if (options.lyricist) stored.l = options.lyricist;
+  const headerTypography = normalizeHeaderTypography(options.headerTypography);
+  if (headerTypography) stored.ht = headerTypography;
   if (options.tempoMarks?.length) {
     stored.tm = options.tempoMarks.map((mark) => ({ ...mark }));
   }
@@ -9013,8 +10300,14 @@ export function embedSlashScoreOptions(text: string, options: SlashScoreOptions)
 }
 
 /** Convert Score-level input annotations into the compact TXT metadata union. */
-export function notationAnnotationsFromScore(score: Score): NotationAnnotationData[] {
-  const result: NotationAnnotationData[] = [];
+export function notationAnnotationsFromScore(
+  score: Score,
+  intrinsicNotation?: SlashScoreOptions,
+): NotationAnnotationData[] {
+  const result: NotationAnnotationData[] = noteTieAnnotations(score).map(tie => ({
+    ...tie, type: "note-tie", measure: tie.from.measure,
+    offset: Fraction.fromString(tie.from.offset).toFloat(),
+  }));
   for (const measure of score.parts[0]?.measures ?? []) {
     if (measure.index > 0 && measure.timeChange) {
       result.push({
@@ -9078,11 +10371,26 @@ export function notationAnnotationsFromScore(score: Score): NotationAnnotationDa
       if (!(entry instanceof Chord)) return;
       for (const note of entry.notes) {
         const tuplet = note.tuplet;
-        if (!tuplet || tuplet.ornamentProxy
-          || tuplet.scope !== "voice" || persistedTuplets.has(tuplet)) continue;
-        persistedTuplets.add(tuplet);
+        if (!tuplet || tuplet.ornamentProxy || persistedTuplets.has(tuplet)) continue;
         const first = tuplet.first.chord;
         const members = tuplet.memberChords();
+        const intrinsicUnit = intrinsicNotation?.noteDivision
+          ? 4 / intrinsicNotation.noteDivision : 0;
+        const intrinsicGlyphUnit = intrinsicNotation
+          ? Math.min(...Object.values(effectiveMappings(intrinsicNotation)).map((division) => 4 / division))
+          : Infinity;
+        // A bracket shorter than the chosen intrinsic value, or a member
+        // ratio unavailable on the configured glyph grid, needs explicit
+        // timing metadata. Ordinary representable all-voice groups use the
+        // visible bracket budget and must not also receive a timing override.
+        const needsIntrinsicTiming = intrinsicUnit > 1e-9 && !intrinsicTupletSpelling(
+          members, intrinsicUnit, intrinsicGlyphUnit,
+        );
+        const hasOutsideContinuation = intrinsicUnit > 1e-9
+          && tuplet.last.tieNext !== null && !members.includes(tuplet.last.tieNext.chord);
+        if (tuplet.scope !== "voice" && !members.some((chord) => chord.transparentContinuation)
+          && !needsIntrinsicTiming && !hasOutsideContinuation) continue;
+        persistedTuplets.add(tuplet);
         const actualEnd = tuplet.actualEnd
           ?? members.reduce((latest, chord) => {
             const end = chord.position.plus(chord.duration ?? new Fraction(0));
@@ -9102,12 +10410,14 @@ export function notationAnnotationsFromScore(score: Score): NotationAnnotationDa
           voice: tuplet.voiceIndex ?? part.voiceIndex ?? partIndex + 1,
           measure: first.measure.index,
           offset: first.position.toFloat(),
-          scope: "voice",
+          scope: tuplet.scope,
           end: actualEnd.toFloat(),
           members: members.map((chord) => tuplet.writtenMemberDuration(
             chord.duration ?? new Fraction(0),
           ).toFloat()),
           memberRests: members.map((chord) => chord.rest),
+          ...(members.some((chord) => chord.transparentContinuation)
+            ? { memberContinuations: members.map((chord) => chord.transparentContinuation) } : {}),
           restoreUnit: (tuplet.binaryRestoreUnit ?? tuplet.writtenUnit ?? new Fraction(0)).toFloat(),
           ordinary: score.parts.flatMap((parallelPart, parallelIndex) =>
             (parallelPart.measures[measure.index]?.entries ?? []).flatMap((entry): SlashOrdinaryTiming[] => {
@@ -9169,7 +10479,7 @@ export function embedSlashScoreOptionsFromScore(
   score: Score,
   options: SlashScoreOptions,
 ): string {
-  const annotations = notationAnnotationsFromScore(score);
+  const annotations = notationAnnotationsFromScore(score, options);
   const rows = sourceLines(text, options.kind).score;
   for (const annotation of annotations) {
     if (annotation.type !== "triplet" || annotation.end === undefined
@@ -9207,6 +10517,7 @@ export function embedSlashScoreOptionsFromScore(
   }
   const embedded = embedSlashScoreOptions(text, {
     ...options,
+    headerTypography: normalizeHeaderTypography(score.headerTypography),
     annotations,
   });
   // Keep all machine directives together with the metadata header.  Older

@@ -36,6 +36,7 @@ import {
   removeEmptyInputMeasures,
 } from "./src/score/input-edit";
 import { scoreToJpwabc } from "./src/score/jpscore";
+import { buildTimeline } from "./src/score/timeline";
 import { JpwFile } from "./src/jpword/jpwfile";
 import { fromJpw } from "./src/score/jpwimport";
 import {
@@ -252,6 +253,57 @@ const pickupCount = pickupMeasure.entries.length;
 completeInputMeasure(pickupScore, { partIndex: 0, measureIndex: 0 }, false);
 check(pickupMeasure.entries.length === pickupCount, "implicit completion should be idempotent");
 check(pickupNote.chord.duration?.equals(3), "the pickup attack should extend to the barline");
+
+// Closing hidden-rest input visits every voice/measure, even after an unrelated
+// pitch edit. Incoming generated ties occupy their partial or complete bar:
+// inserting a rest over them only becomes audible after TXT serialization.
+for (const fullMeasure of [false, true]) {
+  const heldScore = new Score();
+  heldScore.parts.push(new Part(), new Part());
+  for (const partIndex of [0, 1]) for (const measureIndex of [0, 1]) {
+    restMeasure(heldScore, partIndex, measureIndex);
+  }
+  for (const measureIndex of [0, 1]) {
+    inputNoteAtCursor(heldScore, cursor(0, measureIndex, 0, 4),
+      { pitch: 72 + measureIndex * 2, number: String(measureIndex + 1), jpOctave: 1 }, new Fraction(4));
+  }
+  const root = inputNoteAtCursor(heldScore, cursor(1, 0, fullMeasure ? 0 : 3.5, 8),
+    { pitch: 55, number: "5", jpOctave: -1 }, new Fraction(fullMeasure ? 4 : 1, fullMeasure ? 1 : 2)).note!;
+  const continued = inputNoteAtCursor(heldScore, cursor(1, 1, 0, 8),
+    { pitch: 55, number: "5", jpOctave: -1 }, new Fraction(fullMeasure ? 4 : 1, fullMeasure ? 1 : 2)).note!;
+  root.tieStart = true;
+  root.tieNext = continued;
+  continued.tiePrev = root;
+  continued.tieEnd = true;
+  continued.chord.transparentContinuation = true;
+  continued.chord.generatedTimingContinuation = true;
+  if (!fullMeasure) {
+    inputNoteAtCursor(heldScore, cursor(1, 1, 0.5, 8),
+      { pitch: 57, number: "6", jpOctave: -1 }, new Fraction(1, 2));
+    inputNoteAtCursor(heldScore, cursor(1, 1, 1, 4),
+      { pitch: 59, number: "7", jpOctave: -1 }, new Fraction(3));
+  }
+  const heldSounds = (score: Score) => buildTimeline(score).notes
+    .map(note => [note.part, note.pitch, note.t0, note.t1])
+    .sort((left, right) => left[2] - right[2] || left[0] - right[0] || left[1] - right[1]);
+  const expected = heldSounds(heldScore);
+  for (let pass = 0; pass < 2; pass++) {
+    for (const partIndex of [0, 1]) for (const measureIndex of [0, 1]) {
+      completeInputMeasure(heldScore, { partIndex, measureIndex }, false);
+    }
+    check(!heldScore.parts[1].measures[1].entries.some(entry => entry instanceof Chord
+      && entry.rest && entry.position.compareTo(continued.chord.duration!) < 0),
+    `hidden completion placed a rest over an incoming ${fullMeasure ? "full-bar" : "partial-bar"} tie`);
+    assert.deepEqual(heldSounds(heldScore), expected, "hidden completion changed the held timeline");
+  }
+  for (const kind of ["keyboard", "number"] as const) {
+    const text = scoreToSlashScore(heldScore, kind, 16, ".", { showExplicitRests: false }, 2);
+    const options = { ...defaultSlashScoreOptions(kind, analyzeSlashScore(text)),
+      voiceCount: 2, showExplicitRests: false };
+    assert.deepEqual(heldSounds(parseSlashScore(text, options).score), expected,
+      `hidden ${kind} round-trip truncated an incoming ${fullMeasure ? "full-bar" : "partial-bar"} tie`);
+  }
+}
 
 // Inserting into a sustained chord cuts it and leaves a non-overlapping continuation.
 const interiorScore = new Score();

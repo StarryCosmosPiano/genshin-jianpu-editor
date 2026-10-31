@@ -1,6 +1,7 @@
 import { JpwFile, LayoutSection } from "../jpword/jpwfile";
 import { fromJpw } from "../score/jpwimport";
 import type { Score } from "../score/score";
+import { normalizeHeaderTypography } from "../score/header-typography";
 import {
   analyzeSlashScore,
   normalizeNotationAnnotations,
@@ -10,6 +11,7 @@ import {
   type SlashScoreOptions,
   type SlashPitchSource,
 } from "../slashscore";
+import { scanSlashTextSyntax } from "../slashscore/text-syntax";
 
 export type EditableDocumentFormat = "jpw" | SlashScoreKind;
 
@@ -51,9 +53,28 @@ export function parseEditableDocument(
   }
 
   if (!slashOptions) return null;
+  const options = editableSlashOptions(text, slashOptions);
+  if (!scanSlashTextSyntax(text, options).complete) return null;
+  const parsed = parseSlashScore(text, options);
+  return {
+    score: parsed.score,
+    breakDescription: null,
+    slashTimingDiagnostics: parsed.summary.diagnostics,
+    slashSources: parsed.sources,
+    slashOptions: options,
+  };
+}
+
+/** Use undoable source annotations together with the user's chosen rules. */
+export function editableSlashOptions(text: string, slashOptions: SlashScoreOptions): SlashScoreOptions {
   const analysis = analyzeSlashScore(text);
-  const options: SlashScoreOptions = {
+  const hasStoredOptions = /^\s*\/\/\s*@jpeditor\b/m.test(text);
+  return {
     ...slashOptions,
+    // Undo can cross between original-symbol text and generated slash grammar.
+    sourceTimedRows: hasStoredOptions ? analysis.sourceTimedRows ?? false : slashOptions.sourceTimedRows,
+    adjacentAsChord: hasStoredOptions ? analysis.adjacentAsChord : slashOptions.adjacentAsChord,
+    headerTypography: normalizeHeaderTypography(analysis.headerTypography),
     symbolDurations: { ...slashOptions.symbolDurations },
     wholeMeasureGroups: slashOptions.wholeMeasureGroups
       ?? (analysis.wholeMeasureGroups ? true : undefined),
@@ -66,13 +87,5 @@ export function parseEditableDocument(
     keyChanges: analysis.keyChanges.map((change) => ({ ...change })),
     annotations: normalizeNotationAnnotations(analysis.annotations),
     noteTimingEdits: analysis.noteTimingEdits.map((edit) => ({ ...edit })),
-  };
-  const parsed = parseSlashScore(text, options);
-  return {
-    score: parsed.score,
-    breakDescription: null,
-    slashTimingDiagnostics: parsed.summary.diagnostics,
-    slashSources: parsed.sources,
-    slashOptions: options,
   };
 }

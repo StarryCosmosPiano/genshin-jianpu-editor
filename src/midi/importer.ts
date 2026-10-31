@@ -26,6 +26,7 @@ import type {
 } from "./types";
 import {
   detectMidiSlashGestures,
+  rememberMidiSlashGestures,
   type MidiSlashGesture,
   type MidiSlashGestureAnalysis,
 } from "./gestures";
@@ -75,6 +76,7 @@ interface QuantizedChord {
 
 interface HandEvents {
   events: QuantizedChord[];
+  tripletGestures: MidiSlashGesture[];
   tripletGroups: number;
   simplifiedOverlaps: number;
 }
@@ -382,28 +384,76 @@ function splitHands(parsed: ParsedMidi, notes: WorkNote[], mode: "single" | "dou
   return [right, left];
 }
 
-function quantizeHand(notes: WorkNote[], division: MidiQuantizeDivision, detectTriplets: boolean): HandEvents {
-  const groups = onsetGroups(notes);
-  const tripletGroups = detectTriplets ? markTriplets(groups, division) : 0;
+function quantizeHand(
+  notes: WorkNote[],
+  division: MidiQuantizeDivision,
+  detectTriplets: boolean,
+  sourceTriplets: readonly MidiSlashGesture[] = [],
+  preserveSourceRhythmSpelling = false,
+): HandEvents {
+  const groups = onsetGroups(notes, preserveSourceRhythmSpelling ? 1e-8 : 1 / 64);
+  const tripletGroups = detectTriplets && !preserveSourceRhythmSpelling ? markTriplets(groups, division) : 0;
+  // A local group can remain complete even when another hand has an ordinary
+  // attack between its members. Register the exact decisions used below, so
+  // export never drops those attacks after consulting only the global stream.
+  const tripletGestures: MidiSlashGesture[] = groups.flatMap((group, index) => {
+    if (!group.triplet || group.tripletIndex !== 0) return [];
+    const mark = group.triplet;
+    return [{
+      kind: "triplet", anchor: mark.anchor, end: mark.anchor + 3 * mark.cell,
+      division: mark.division,
+      events: groups.slice(index, index + 3).map((member, memberIndex) => ({
+        start: mark.anchor + memberIndex * mark.cell,
+        pitches: [...new Set(member.notes.map((note) => note.pitch))],
+        sourceNotes: member.notes.map((note) => note.source),
+      })),
+    }];
+  });
   const step = 4 / division;
   const snap = (value: number, grid: number, origin = 0): number =>
     origin + Math.round((value - origin) / grid) * grid;
+  // Detect once before splitting hands/tracks. A tuplet can alternate between
+  // parts, so no individual stream necessarily contains all three attacks.
+  // Keep the source identity rather than re-matching an already rounded onset.
+  const sourceStarts = new Map<ParsedMidiNote, number>();
+  const tripletBoundaries: number[] = [];
+  for (const gesture of sourceTriplets) {
+    for (const event of gesture.events) {
+      for (const source of event.sourceNotes ?? []) sourceStarts.set(source, event.start);
+      tripletBoundaries.push(event.start);
+    }
+    tripletBoundaries.push(gesture.end);
+  }
+  const snapRelease = (value: number): number => {
+    const binary = snap(value, step);
+    const exact = tripletBoundaries.find((boundary) =>
+      Math.abs(boundary - value) <= 1 / 192 + 1e-8
+      && Math.abs(boundary - value) < Math.abs(binary - value) - 1e-8);
+    return exact ?? binary;
+  };
   const quantized: QuantizedNote[] = [];
   for (const group of groups) {
     for (const note of group.notes) {
       let start: number, end: number, triplet: TripletMark | null = null;
-      if (group.triplet && group.tripletIndex !== undefined) {
+      if (preserveSourceRhythmSpelling) {
+        // The TXT bridge already supplied exact per-voice timing. Rounding it
+        // again creates binary-grid attacks alongside restored tuplet members.
+        start = note.start;
+        end = note.end;
+      } else if (group.triplet && group.tripletIndex !== undefined) {
         start = group.triplet.anchor + group.tripletIndex * group.triplet.cell;
-        // Current JPW tuplets are a three-token 3:2 group. Keep each member to
-        // one triplet cell so serialization never needs a mixed '_' + '-' duration.
-        end = start + group.triplet.cell;
+        // One triplet member still has one notated cell, but its MIDI release
+        // can extend beyond that cell. Keep that sounding endpoint here;
+        // makePart writes the excess as an ordinary tied tail outside the
+        // tuplet. Later attacks in this hand still clip overlaps below.
+        end = Math.max(start + group.triplet.cell, snapRelease(note.end));
         triplet = { ...group.triplet, index: group.tripletIndex };
       } else {
         // Quantize the attack and the release independently.  In particular,
         // the right-hand end of a MIDI note must land on a rhythm grid line;
         // it is not inferred later from the next attack.
-        start = snap(note.start, step);
-        end = snap(note.end, step);
+        start = sourceStarts.get(note.source) ?? snap(note.start, step);
+        end = snapRelease(note.end);
         if (end <= start) end = start + step;
       }
       quantized.push({ start: Math.max(0, start), end, pitch: note.pitch, triplet });
@@ -422,11 +472,19 @@ function quantizeHand(notes: WorkNote[], division: MidiQuantizeDivision, detectT
       // itself produce a half-grid value (for example 1 and 1.25 -> 1.125).
       // Re-snap the common tail so the finished vertical chord remains on the
       // selected binary/triplet grid.
-      const commonGrid = last.triplet?.cell ?? step;
-      const commonOrigin = last.triplet?.anchor ?? 0;
-      const common = snap(median(last.sourceEnds), commonGrid, commonOrigin);
+      const medianRelease = median(last.sourceEnds);
+      // Beyond a tuplet member, the tied tail uses ordinary written values.
+      // Re-snapping unequal chord releases to the old triplet ruler creates
+      // an unmarked fractional tail that changes duration after JPW saving.
+      const ordinaryTail = last.triplet !== null
+        && medianRelease > last.start + last.triplet.cell + 1e-8;
+      const commonGrid = ordinaryTail ? step : last.triplet?.cell ?? step;
+      const commonOrigin = ordinaryTail ? 0 : last.triplet?.anchor ?? 0;
+      const sameRelease = last.sourceEnds.every((end) => Math.abs(end - last.sourceEnds[0]) < 1e-8);
+      const common = sameRelease ? last.sourceEnds[0] : preserveSourceRhythmSpelling
+        ? medianRelease : snap(medianRelease, commonGrid, commonOrigin);
       if (Math.abs(note.end - last.end) > 1e-8) simplifiedOverlaps++;
-      last.end = Math.max(last.start + commonGrid, common);
+      last.end = Math.max(last.start + (sameRelease || preserveSourceRhythmSpelling ? 1 / 384 : commonGrid), common);
       if (!last.triplet && note.triplet) last.triplet = note.triplet;
     } else {
       chords.push({ start: note.start, end: note.end, sourceEnds: [note.end], pitches: [note.pitch], triplet: note.triplet });
@@ -440,7 +498,7 @@ function quantizeHand(notes: WorkNote[], division: MidiQuantizeDivision, detectT
     if (chords[i].end <= chords[i].start) chords[i].end = chords[i].start + step;
   }
   for (const chord of chords) chord.pitches.sort((a, b) => b - a);
-  return { events: chords, tripletGroups, simplifiedOverlaps };
+  return { events: chords, tripletGestures, tripletGroups, simplifiedOverlaps };
 }
 
 function buildMeasureBounds(parsed: ParsedMidi, options: MidiImportOptions, end: number, warnings: string[]): MeasureBound[] {
@@ -506,6 +564,13 @@ function durationShape(duration: number, triplet: TripletMark | null): { beats: 
     let cells = Math.max(1, Math.round(duration / triplet.cell));
     while (beams > 0 && cells % 2 === 0) { cells /= 2; beams--; }
     return { beats: cells, beams, dot: 0, fraction: new Fraction(cells * 2, 3 * (1 << beams)) };
+  }
+  // Cross-part tuplets can leave a fractional note/rest in a stream which
+  // does not itself contain all three onsets. Preserve its exact rational
+  // duration even before a complete visual Tuplet can be attached.
+  if (Math.abs(duration * 32 - Math.round(duration * 32)) > 1e-8) {
+    const written = durationShape(Math.max(1 / 32, Math.round(duration * 1.5 * 32) / 32), null);
+    return { ...written, fraction: new Fraction(Math.round(duration * 384), 384) };
   }
   // A user-facing MIDI import stops at 64th notes, but the TXT bridge may
   // explicitly subdivide that grid once. Keep a fifth beam level internally
@@ -643,7 +708,9 @@ function addSegment(
   preserveSourceRhythmSpelling = false,
   beatDuration = 1,
 ): Chord[] {
-  if (triplet) return [addChord(measure, start, duration, pitches, fifths, triplet)];
+  if (triplet || Math.abs(duration * 32 - Math.round(duration * 32)) > 1e-8) {
+    return [addChord(measure, start, duration, pitches, fifths, triplet)];
+  }
   const pieces = preserveSourceRhythmSpelling
     ? splitNormalDuration(duration)
     : splitMetricalDuration(duration, start, beatDuration);
@@ -811,22 +878,44 @@ function makePart(
           beatDuration,
         );
       }
-      const eventChords = addSegment(
-        measure,
-        start - bound.start,
-        end - start,
-        event.pitches,
-        fifths,
-        event.triplet,
-        preserveSourceRhythmSpelling,
-        beatDuration,
-      );
+      // A source release may outlast the last member of a local tuplet.
+      // Only that member belongs inside the 3:2 bracket; its remaining sound
+      // uses normal metrical values and the same tie chain across barlines.
+      const memberEnd = event.triplet ? event.start + event.triplet.cell : start;
+      const tripletEnd = Math.min(end, memberEnd);
+      const tripletChords = event.triplet && tripletEnd > start + 1e-8
+        ? addSegment(
+          measure,
+          start - bound.start,
+          tripletEnd - start,
+          event.pitches,
+          fifths,
+          event.triplet,
+          preserveSourceRhythmSpelling,
+          beatDuration,
+        ) : [];
+      const ordinaryStart = event.triplet ? Math.max(start, memberEnd) : start;
+      const ordinaryChords = end > ordinaryStart + 1e-8
+        ? addSegment(
+          measure,
+          ordinaryStart - bound.start,
+          end - ordinaryStart,
+          event.pitches,
+          fifths,
+          null,
+          preserveSourceRhythmSpelling,
+          beatDuration,
+        ) : [];
+      if (tripletChords.length > 0 && ordinaryChords.length > 0) {
+        linkTiedChords(tripletChords[tripletChords.length - 1], ordinaryChords[0]);
+      }
+      const eventChords = [...tripletChords, ...ordinaryChords];
       const previous = eventLastChord.get(event);
       if (previous && eventChords[0]) linkTiedChords(previous, eventChords[0]);
       if (eventChords.length > 0) eventLastChord.set(event, eventChords[eventChords.length - 1]);
       if (event.triplet) {
         const list = tuplets.get(event.triplet.id) ?? [];
-        list.push(...eventChords);
+        list.push(...tripletChords);
         tuplets.set(event.triplet.id, list);
       }
       cursor = Math.max(cursor, end);
@@ -852,8 +941,9 @@ function makePart(
     first.tupletBegin = true;
     last.tupletEnd = true;
     const tuplet = new Tuplet(first, last);
-    first.tuplet = tuplet;
-    last.tuplet = tuplet;
+    // Every member belongs to the group. Attaching only the endpoints made
+    // subsequent Score→TXT conversions emit the middle note twice/outside it.
+    for (const chord of chords) for (const note of chord.notes) note.tuplet = tuplet;
   }
   return part;
 }
@@ -928,7 +1018,56 @@ export function midiToScore(parsed: ParsedMidi, options: MidiImportOptions): Mid
   const streams = ensembleMode
     ? assignments.map((assignment) => sourceNotes.filter((note) => note.source.track === assignment.track))
     : splitHands(parsed, sourceNotes, resolvedMode, options.splitPitch);
-  const quantized = streams.map((notes) => quantizeHand(notes, options.quantize, options.detectTriplets));
+  let quantized = streams.map((notes) => quantizeHand(
+    notes, options.quantize, options.detectTriplets, [],
+    options.preserveSourceRhythmSpelling,
+  ));
+  // Local quantization is authoritative: an interleaved global candidate can
+  // accidentally reuse a humanized member of a different local tuplet. Never
+  // remember two different attack positions for the same source note.
+  const localSourceStarts = new Map<ParsedMidiNote, number>();
+  for (const local of quantized.flatMap((part) => part.tripletGestures)) {
+    for (const event of local.events) {
+      for (const source of event.sourceNotes ?? []) localSourceStarts.set(source, event.start);
+    }
+  }
+  gestures.triplet = gestures.triplet.filter((gesture) => gesture.events.every((event) =>
+    (event.sourceNotes ?? []).every((source) => {
+      const localStart = localSourceStarts.get(source);
+      return localStart === undefined || Math.abs(localStart - event.start) < 1e-8;
+    })));
+  // The TXT serializer can restore a shared, cross-hand tuplet bracket. JPW
+  // needs a complete tuplet in each voice, so keep its existing local,
+  // representable quantization when the output is JPW (also the default).
+  const sourceTriplets = options.outputFormat === "keyboard" || options.outputFormat === "number"
+    ? gestures.triplet : [];
+  if (sourceTriplets.length > 0) {
+    quantized = streams.map((notes) => quantizeHand(
+      notes, options.quantize, options.detectTriplets, sourceTriplets,
+      options.preserveSourceRhythmSpelling,
+    ));
+  }
+  // The cache records adopted decisions, including an explicit empty list.
+  // JPW/default import did not apply global candidates; a later TXT export
+  // must not infer that those candidates supplied the score's attack clock.
+  gestures.triplet = sourceTriplets;
+  // Merge only groups actually adopted by hand/track quantization. Do not
+  // rerun a detector here: disabled triplet recognition must stay disabled.
+  for (const local of quantized.flatMap((part) => part.tripletGestures)) {
+    const existing = gestures.triplet.find((gesture) =>
+      gesture.division === local.division && Math.abs(gesture.anchor - local.anchor) < 1e-8);
+    if (!existing) {
+      gestures.triplet.push(local);
+      continue;
+    }
+    existing.events.forEach((event, index) => {
+      const member = local.events[index];
+      if (!member) return;
+      event.pitches = [...new Set([...event.pitches, ...member.pitches])];
+      event.sourceNotes = [...new Set([...(event.sourceNotes ?? []), ...(member.sourceNotes ?? [])])];
+    });
+  }
+  gestures.triplet.sort((left, right) => left.anchor - right.anchor);
   const openingSignature = options.preserveSourceRhythmSpelling
     ? [...parsed.timeSignatures]
       .filter((signature) => signature.tick === 0
@@ -1012,6 +1151,7 @@ export function midiToScore(parsed: ParsedMidi, options: MidiImportOptions): Mid
       : `检测到 ${analysis.tempoChangeCount} 次速度变化，但没有形成可读的速度标记`);
   }
   score.parseRepeatInf();
+  rememberMidiSlashGestures(score, parsed, gestures);
   const layoutMode = ensembleMode ? "ensemble" : resolvedMode === "double" ? "piano" : "single";
   const instrumentCount = ensembleMode
     ? new Set(score.parts.map((part) => part.instrumentName)).size

@@ -60,6 +60,9 @@ async function selectTheme(page, preference) {
 try {
   for (const [name, width, height] of [["desktop", 1440, 960], ["standard", 1280, 900], ["compact", 900, 800], ["phone", 390, 844]]) {
     const context = await browser.newContext({ viewport: { width, height }, colorScheme: "light" });
+    // Keep the existing compact desktop workspace in this theme suite.
+    // Phone/tablet mode geometry is covered by mobile-workspace-browser-check.
+    await context.addInitScript(() => localStorage.setItem('jpeditor:workspace-mode:v1', 'desktop'));
     const page = await context.newPage();
     const pageErrors = [];
     page.on("pageerror", (error) => pageErrors.push(error.message));
@@ -72,7 +75,28 @@ try {
     assert.equal(light.viewportOverflow, false, `${name}: horizontal viewport overflow`);
     assert.ok(light.pageCount > 0, `${name}: score rendered`);
     assert.equal(light.drawerVisible, true, `${name}: source should start expanded`);
-    assert.ok(light.header?.height < 90, `${name}: oversized header`);
+    // Narrow desktop mode keeps the brand row and two rows of 44px menus.
+    // The phone/tablet workspace has its own header and layout regression.
+    assert.ok(name === "phone" ? light.header?.height <= 144 : light.header?.height < 90, `${name}: oversized header`);
+    const headerActions = await page.locator(".header-actions").evaluate((container) =>
+      [...container.children].map((element) => {
+        const rect = element.getBoundingClientRect();
+        return { id: element.id || element.querySelector("button")?.id, x: rect.x, y: rect.y,
+          right: rect.right, bottom: rect.bottom, width: rect.width, height: rect.height };
+      }));
+    for (const action of headerActions) {
+      assert.ok(action.width > 0 && action.height > 0, `${name}: ${action.id} header action hidden`);
+      assert.ok(action.x >= 0 && action.right <= width + 1 && action.y >= light.header.y
+        && action.bottom <= light.header.bottom + 1, `${name}: ${action.id} header action clipped`);
+    }
+    for (let i = 0; i < headerActions.length; i++) {
+      for (const other of headerActions.slice(i + 1)) {
+        const action = headerActions[i];
+        const intersectionWidth = Math.min(action.right, other.right) - Math.max(action.x, other.x);
+        const intersectionHeight = Math.min(action.bottom, other.bottom) - Math.max(action.y, other.y);
+        assert.ok(intersectionWidth <= 1 || intersectionHeight <= 1, `${name}: ${action.id} overlaps ${other.id}`);
+      }
+    }
     const controlsFit = await page.evaluate(() => ["btn-select-mode", "btn-input-mode", "btn-undo", "btn-redo", "btn-play", "btn-score-settings", "btn-layout-style"]
       .every((id) => {
         const rect = document.getElementById(id)?.getBoundingClientRect();

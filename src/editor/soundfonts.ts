@@ -2,6 +2,14 @@ import { SoundFont2 } from "soundfont2";
 import { isTauriRuntime } from "./fileio";
 
 const SOUNDFONT_DIR = "soundfonts";
+const parsedSoundfonts = new WeakMap<Uint8Array, SoundFont2>();
+
+/** Catalog inspection and playback share the parsed bytes for this session. */
+export function parseSoundfont(bytes: Uint8Array): SoundFont2 {
+  let parsed = parsedSoundfonts.get(bytes);
+  if (!parsed) { parsed = new SoundFont2(bytes); parsedSoundfonts.set(bytes, parsed); }
+  return parsed;
+}
 
 const bundledSoundfontUrls = import.meta.glob<string>(
   "../assets/soundfonts/*.sf2",
@@ -34,7 +42,7 @@ function bundledEntries(): { fileName: string; url: string }[] {
 async function fetchBundledSoundfonts(): Promise<SoundfontBytes[]> {
   const result: SoundfontBytes[] = [];
   for (const entry of bundledEntries()) {
-    const response = await fetch(entry.url, { cache: "no-store" });
+    const response = await fetch(entry.url);
     if (!response.ok) throw new Error(`${entry.fileName}: HTTP ${response.status}`);
     result.push({
       fileName: entry.fileName,
@@ -81,7 +89,7 @@ async function readDesktopSoundfonts(): Promise<SoundfontBytes[]> {
 
 function parseCatalogEntry(source: SoundfontBytes): SoundfontCatalogEntry {
   try {
-    const parsed = new SoundFont2(source.bytes);
+    const parsed = parseSoundfont(source.bytes);
     const instruments = [...new Set(
       parsed.instruments
         .map((instrument) => instrument.header.name.trim())
@@ -107,7 +115,7 @@ function parseCatalogEntry(source: SoundfontBytes): SoundfontCatalogEntry {
 
 /**
  * Read and parse the SF2 catalog once. Callers decide when to invoke this;
- * the app intentionally calls it only on startup and on manual refresh.
+ * the app loads it on first audio use, or on an explicit catalog refresh.
  */
 export async function readSoundfontCatalog(): Promise<SoundfontCatalogEntry[]> {
   let sources: SoundfontBytes[];

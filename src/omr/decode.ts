@@ -8,9 +8,43 @@ const MAX_W = 2200; // 过大图先缩小，兼顾速度与连通域稳定性
 const PDF_W = 2000; // PDF 光栅化目标宽度（矢量图放大到此宽度取墨迹）
 
 /** 是否 PDF 字节（mime 或 %PDF- 魔数）。 */
-function isPdf(bytes: Uint8Array, mime?: string): boolean {
+export function isPdf(bytes: Uint8Array, mime?: string): boolean {
   if (mime === "application/pdf") return true;
   return bytes.length >= 5 && bytes[0] === 0x25 && bytes[1] === 0x50 && bytes[2] === 0x44 && bytes[3] === 0x46; // "%PDF"
+}
+
+export interface RecognitionPdf {
+  pageCount: number;
+  decodePage: (pageNumber: number) => Promise<Binary>;
+  dispose: () => Promise<void>;
+}
+
+/** Mobile recognition consumes one page and releases its RGBA buffers before the next. */
+export async function openRecognitionPdf(bytes: Uint8Array): Promise<RecognitionPdf> {
+  const pdfjs = await import("pdfjs-dist");
+  const { default: workerUrl } = await import("pdfjs-dist/build/pdf.worker.min.mjs?url");
+  pdfjs.GlobalWorkerOptions.workerSrc = workerUrl;
+  const loading = pdfjs.getDocument({ data: bytes.slice(), wasmUrl: `${import.meta.env.BASE_URL}redist/pdfjs/` });
+  const pdf = await loading.promise;
+  return {
+    pageCount: pdf.numPages,
+    decodePage: async pageNumber => {
+      if (!Number.isInteger(pageNumber) || pageNumber < 1 || pageNumber > pdf.numPages) throw new Error("PDF 页码超出范围");
+      const page = await pdf.getPage(pageNumber);
+      let canvas: OffscreenCanvas | null = null;
+      try {
+        canvas = await pdfPageToCanvas(page, pdfjs.OPS);
+        const ctx = canvas.getContext("2d");
+        if (!ctx) throw new Error("无法读取 PDF 页面");
+        const image = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        return rgbaToBinary(image.data, image.width, image.height);
+      } finally {
+        if (canvas) { canvas.width = 1; canvas.height = 1; }
+        page.cleanup();
+      }
+    },
+    dispose: () => loading.destroy(),
+  };
 }
 
 /** 图片字节 → ImageData（缩放到 MAX_W 以内）。 */
@@ -35,11 +69,17 @@ function newCanvas(w: number, h: number): { canvas: OffscreenCanvas; ctx: Offscr
   return { canvas, ctx };
 }
 
-/** 取本页最大的一张内嵌位图（其解码后的 ImageBitmap）。多为扫描版乐谱整页图；无则返回 null。 */
+interface PageBitmap {
+  source: CanvasImageSource;
+  width: number;
+  height: number;
+}
+
+/** 取本页最大的一张内嵌位图。pdf.js 可能返回 ImageBitmap 或 VideoFrame；尺寸以解码对象为准。 */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-async function largestPageBitmap(page: any, OPS: any): Promise<ImageBitmap | null> {
+async function largestPageBitmap(page: any, OPS: any): Promise<PageBitmap | null> {
   const list = await page.getOperatorList();
-  let best: { bmp: ImageBitmap; area: number } | null = null;
+  let best: { bitmap: PageBitmap; area: number } | null = null;
   for (let i = 0; i < list.fnArray.length; i++) {
     const fn = list.fnArray[i];
     if (fn !== OPS.paintImageXObject && fn !== OPS.paintImageMaskXObject) continue;
@@ -49,12 +89,13 @@ async function largestPageBitmap(page: any, OPS: any): Promise<ImageBitmap | nul
     if (typeof id !== "string") continue;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const obj: any = await new Promise((r) => page.objs.get(id, r)).catch(() => null);
-    const bmp: ImageBitmap | undefined = obj?.bitmap;
-    if (!bmp) continue; // 非位图（少见的按 kind 打包的数据）留给整页渲染兜底
-    const area = bmp.width * bmp.height;
-    if (!best || area > best.area) best = { bmp, area };
+    const source: CanvasImageSource | undefined = obj?.bitmap;
+    const width = Number(obj?.width), height = Number(obj?.height);
+    if (!source || !Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) continue;
+    const area = width * height;
+    if (!best || area > best.area) best = { bitmap: { source, width, height }, area };
   }
-  return best?.bmp ?? null;
+  return best?.bitmap ?? null;
 }
 
 /** 单页 → 白底画布：优先直接抽取内嵌位图（源本就是 1-bit 扫描图，避免整页矢量合成重画、
@@ -69,7 +110,7 @@ async function pdfPageToCanvas(page: any, OPS: any): Promise<OffscreenCanvas> {
     const { canvas, ctx } = newCanvas(w, h);
     ctx.fillStyle = "#fff"; // ImageMask 只有墨迹为不透明黑、其余透明 → 铺白底
     ctx.fillRect(0, 0, w, h);
-    ctx.drawImage(bmp, 0, 0, w, h);
+    ctx.drawImage(bmp.source, 0, 0, w, h);
     return canvas;
   }
   const viewport = page.getViewport({ scale: PDF_W / page.getViewport({ scale: 1 }).width });

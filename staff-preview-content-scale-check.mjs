@@ -94,16 +94,17 @@ try {
   const near = (actual, expected, tolerance = .02) => actual !== null && Math.abs(actual - expected) <= tolerance * Math.max(1, expected);
   for (const row of rows) {
     const scale = row.contentScale;
+    assert(row.firstSystemBars <= 4, "staff exceeded four measures per system");
     assert.equal(row.paper, "0 0 794 1123");
     assert(row.widths.every(value => value === "794") && row.heights.every(value => value === "1123"));
     assert.equal(row.sourceNotes, 160);
     assert.equal(row.renderedNotes, 160);
     assert.equal(row.sourceUnchanged, true);
-    assert(near(row.staffGap, 10 * scale));
-    assert(near(row.lineWidth, scale));
-    assert(near(row.stemWidth, 1.5 * scale));
+    assert(near(row.staffGap, 10 * scale * 0.75));
+    assert(near(row.lineWidth, scale * 0.75));
+    assert(near(row.stemWidth, 1.5 * scale * 0.75));
     for (const [name, base] of Object.entries({ title: 23, subtitle: 13, credit: 12, instrument: 13,
-      tempo: 14, lyric: 10, footer: 11, clef: 30, time: 30 }))
+      tempo: 14, lyric: 10, footer: 11, clef: 22.5, time: 22.5 }))
       assert(near(row.sizes[name], base * scale), `${name} did not scale at ${scale}: ${row.sizes[name]}`);
     assert(row.titleBox && row.subtitleBox && row.creditBox && row.firstSystemBox && row.firstStaveBox);
     assert(row.titleBox.y + row.titleBox.h < row.subtitleBox.y + 2);
@@ -111,9 +112,9 @@ try {
       `credit collided with first system at ${scale}`);
     assert(row.proseBoxes.every(box => box && box.x >= -1 && box.x + box.w <= 795));
   }
-  assert(rows[0].firstSystemBars > rows[1].firstSystemBars && rows[1].firstSystemBars >= rows[2].firstSystemBars,
-    "music did not reflow into fewer bars per system as content grew");
-  assert(rows[0].pageCount < rows[1].pageCount && rows[1].pageCount < rows[2].pageCount,
+  assert(rows[0].firstSystemBars >= rows[1].firstSystemBars && rows[1].firstSystemBars >= rows[2].firstSystemBars,
+    "music violated the four-bar cap or reflowed into more bars as content grew");
+  assert(rows[0].pageCount <= rows[1].pageCount && rows[1].pageCount <= rows[2].pageCount && rows[0].pageCount < rows[2].pageCount,
     "music did not repaginate as content grew");
   const edgeRows = await page.evaluate(async () => {
     const { Score, Part, Measure, Chord, Note, Fraction, createStaffNoteRegistry, prepareStaffPreview } =
@@ -161,8 +162,10 @@ try {
   for (const row of edgeRows) {
     assert(row.pages.every(page => page.paper === "0 0 794 1123"));
     assert.equal(row.pages.reduce((sum, page) => sum + page.noteCount, 0), row.piano ? 96 : 48);
-    for (const page of row.pages) {
-      assert(page.labels.length > 0 && page.systems.length > 0);
+    for (const [pageIndex, page] of row.pages.entries()) {
+      assert(page.systems.length > 0);
+      assert(pageIndex === 0 ? page.labels.length > 0 : page.labels.length === 0,
+        'instrument name must appear only on the first system of the document');
       for (const label of page.labels) {
         assert(label.left >= -0.5 && label.right < 64, `label clipped or touching stave at ${row.contentScale}, piano=${row.piano}`);
         assert(label.top >= 0 && label.bottom <= 1123, `label above or below paper at ${row.contentScale}`);

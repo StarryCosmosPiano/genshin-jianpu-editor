@@ -11,7 +11,7 @@ import {
 // separator fixes each pitch's voice assignment inside shared chord columns.
 const z = "\u2063";
 const source = `(V${z}D${z}G).${z}A.${z}N.(${z}D${z}G)./.${z}A.${z}N.${z}A./(B${z}D${z}G).${z}A.${z}N.(${z}D${z}G)./.${z}N.${z}A.${z}N./`;
-const header = `键盘谱\n4/4拍：\n点=16分音符\n`;
+const header = `键盘谱\n4/4拍：\n点=16分音符\n方括号=三连音\n`;
 const options: SlashScoreOptions = {
   ...defaultSlashScoreOptions("keyboard", analyzeSlashScore(header + source)),
   voiceCount: 2, beats: 4, beatType: 4,

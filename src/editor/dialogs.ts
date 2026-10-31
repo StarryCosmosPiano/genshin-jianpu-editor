@@ -67,6 +67,9 @@ function modal(title: string, body: HTMLElement, onOk: () => void, options: Moda
     } finally { confirming = false; }
   };
   ok.onclick = () => {
+    for (const field of body.querySelectorAll<HTMLInputElement>("input")) {
+      if (!field.reportValidity()) return;
+    }
     onOk();
     close();
   };
@@ -139,6 +142,35 @@ export function showOptionsDialog(app: App): void {
   const restoreLastFileOnStartup = document.createElement("input");
   restoreLastFileOnStartup.type = "checkbox";
   restoreLastFileOnStartup.checked = app.restoreLastFileOnStartup;
+  const autoBackupEnabled = document.createElement("input");
+  autoBackupEnabled.type = "checkbox";
+  autoBackupEnabled.checked = app.autoBackupPreferences.enabled;
+  const autoBackupInterval = document.createElement("input");
+  autoBackupInterval.type = "number";
+  autoBackupInterval.min = "1";
+  autoBackupInterval.step = "1";
+  autoBackupInterval.value = String(app.autoBackupPreferences.intervalMinutes);
+  const autoBackupCount = document.createElement("input");
+  autoBackupCount.type = "number";
+  autoBackupCount.min = "1";
+  autoBackupCount.step = "1";
+  autoBackupCount.value = String(app.autoBackupPreferences.maxVersions);
+  for (const field of [autoBackupInterval, autoBackupCount]) {
+    field.required = true;
+    field.addEventListener("input", () => field.setCustomValidity(
+      Number.isSafeInteger(Number(field.value)) && Number(field.value) > 0 ? "" : "请输入正整数"));
+  }
+  const autoBackup = document.createElement("details");
+  const autoBackupTitle = document.createElement("summary");
+  autoBackupTitle.textContent = "自动保存与恢复历史";
+  const autoBackupNote = document.createElement("p");
+  autoBackupNote.className = "modal-note";
+  autoBackupNote.textContent = isTauriRuntime()
+    ? "首次正式保存后，在项目所在文件夹创建同名 .autosave 文件夹，只写恢复副本。较近版本更密集，较早版本近似等比保留；只在新副本保存成功后整理最近一天的历史。未编辑或保存失败时保留现有历史。"
+    : "自动保存与恢复历史仅用于桌面版。网页版会在存在未保存修改、关闭或刷新页面时提示。";
+  autoBackup.append(autoBackupTitle, labeled("开启自动保存", autoBackupEnabled),
+    labeled("自动保存间隔（分钟）", autoBackupInterval), labeled("最多保留历史份数", autoBackupCount), autoBackupNote);
+  if (!isTauriRuntime()) for (const field of [autoBackupEnabled, autoBackupInterval, autoBackupCount]) field.disabled = true;
   const shortcuts = document.createElement("button");
   shortcuts.type = "button";
   shortcuts.textContent = "设置快捷键…";
@@ -160,6 +192,7 @@ export function showOptionsDialog(app: App): void {
     labeled("连接跨行小节线", connectBarlines),
     labeled("快捷键", shortcuts),
     startup,
+    autoBackup,
   );
   const voiceCount = document.createElement("input");
   voiceCount.type = "number";
@@ -323,18 +356,19 @@ export function showOptionsDialog(app: App): void {
     if (playable.length === 0) {
       const empty = document.createElement("option");
       empty.value = "";
-      empty.textContent = "未找到可用的 .sf2 文件";
+      empty.textContent = app.soundfontsLoaded ? "未找到可用的 .sf2 文件" : "音源将在首次使用时加载";
       soundfontFile.replaceChildren(empty);
     }
     const selected = playable.find((entry) => entry.id === preferredId)
       ?? playable.find((entry) => entry.id === app.selectedSoundfontId)
       ?? playable[0];
     soundfontFile.value = selected?.id ?? "";
-    sf2SourceOption.disabled = playable.length === 0;
+    sf2SourceOption.disabled = app.soundfontsLoaded && playable.length === 0;
     if (sf2SourceOption.disabled && soundSource.value === "sf2") soundSource.value = "default";
     soundfontStatus.textContent = playable.length > 0
-      ? `已读取 ${playable.length} 个 SF2 音源；列表只在程序启动或手动刷新时更新。`
-      : "未找到可用音源。桌面版可打开音源文件夹放入 .sf2 后手动刷新。";
+      ? `已读取 ${playable.length} 个 SF2 音源；可手动刷新列表。`
+      : app.soundfontsLoaded ? "未找到可用音源。桌面版可打开音源文件夹放入 .sf2 后手动刷新。"
+      : "展开此项后按需加载音源，不影响打谱。";
     renderAssignments();
   };
 
@@ -382,6 +416,18 @@ export function showOptionsDialog(app: App): void {
 
   populateSoundfontFiles(app.selectedSoundfontId);
   syncSoundfontControls();
+  const loadCatalogWhenOpen = (): void => {
+    if (!playback.open || app.soundfontsLoaded || refreshSoundfonts.disabled) return;
+    refreshSoundfonts.disabled = true;
+    soundfontStatus.textContent = "正在加载音源…";
+    void app.ensureSoundfonts().then(() => {
+      populateSoundfontFiles(app.selectedSoundfontId);
+      syncSoundfontControls();
+    }).catch(error => { soundfontStatus.textContent = `音源加载失败：${error instanceof Error ? error.message : String(error)}`; })
+      .finally(() => { refreshSoundfonts.disabled = false; });
+  };
+  playback.addEventListener("toggle", loadCatalogWhenOpen);
+  loadCatalogWhenOpen();
   playback.append(
     playbackSummary,
     labeled("播放方式", soundSource),
@@ -451,6 +497,8 @@ export function showOptionsDialog(app: App): void {
       app.setBarlineConnectionsEnabled(connectBarlines.checked);
     }
     app.setStartupPreferences(showTextOnStartup.checked, restoreLastFileOnStartup.checked);
+    if (isTauriRuntime()) app.setAutoBackupPreferences({ enabled: autoBackupEnabled.checked,
+      intervalMinutes: Number(autoBackupInterval.value), maxVersions: Number(autoBackupCount.value) });
     if (documentFormat.value !== app.documentFormat) {
       void app.changeDocumentFormat(documentFormat.value as "jpw" | "keyboard" | "number");
     }

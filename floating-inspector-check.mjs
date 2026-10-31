@@ -26,6 +26,8 @@ const server = createServer(async (request, response) => {
 await new Promise((resolve) => server.listen(0, resolve));
 const browser = await chromium.launch({ channel: "msedge", headless: true });
 const page = await browser.newPage({ viewport: { width: 1500, height: 950 } });
+// This suite keeps the desktop floating-window behavior at narrow widths.
+await page.addInitScript(() => localStorage.setItem('jpeditor:workspace-mode:v1', 'desktop'));
 const errors = [];
 page.on("pageerror", (error) => errors.push(error.message));
 page.on("console", (message) => {

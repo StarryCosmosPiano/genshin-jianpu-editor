@@ -2,6 +2,8 @@
 // Builds a Score from a parsed .jpwabc JpwFile (the .jpwabc edit path).
 
 import { Fraction } from "../common/fraction";
+import { setChordArpeggioPitchGroups } from "./arpeggio";
+import { parseHeaderTypography } from "./header-typography";
 import {
   JpwFile,
   RepeatSection,
@@ -36,6 +38,7 @@ import {
 } from "./score";
 import {
   applyNoteTimingEdits,
+  applyExplicitNoteTies,
   normalizeScoreRhythmicSpelling,
   parseJpwNoteTimingEdits,
 } from "./note-timing";
@@ -435,6 +438,7 @@ function applyTitleAnnotations(
   try { payload = JSON.parse(annotationsText); } catch { return; }
   if (!payload || typeof payload !== "object") return;
   const value = payload as Record<string, unknown>;
+  applyExplicitNoteTies(score, value.noteTies);
   const number = (v: unknown): number | null => {
     const n = Number(v);
     return Number.isFinite(n) ? n : null;
@@ -474,6 +478,23 @@ function applyTitleAnnotations(
       mark.placement = item.placement;
     }
     score.textMarks.push(mark);
+  }
+  const arpeggioGroups = Array.isArray(value.arpeggioGroups) ? value.arpeggioGroups : [];
+  for (const raw of arpeggioGroups) {
+    if (!raw || typeof raw !== "object") continue;
+    const item = raw as Record<string, unknown>;
+    const part = number(item.part), measure = number(item.measure);
+    const offset = fraction(item.offset);
+    if (part === null || measure === null || offset === null || !Array.isArray(item.groups)) continue;
+    const chord = score.parts[Math.round(part)]?.measures[Math.round(measure)]?.entries
+      .find((entry): entry is Chord => entry instanceof Chord && entry.position.equals(offset));
+    if (!chord) continue;
+    const groups = item.groups.flatMap(group => Array.isArray(group)
+      ? [group.flatMap(value => {
+        const pitch = number(value);
+        return pitch !== null && Number.isInteger(pitch) && pitch >= 0 && pitch <= 127 ? [pitch] : [];
+      })] : []);
+    setChordArpeggioPitchGroups(chord, groups);
   }
   const cross = Array.isArray(value.crossPartArpeggios) ? value.crossPartArpeggios : [];
   for (const raw of cross) {
@@ -528,6 +549,7 @@ export function fromJpw(f: JpwFile): Score | null {
   const title = f.getTitle();
   res.title = unescape(title?.title ?? "");
   res.subtitle = unescape(title?.subtitle ?? "");
+  res.headerTypography = parseHeaderTypography(title?.headerTypography);
   res.composer = unescape(title?.composer ?? "");
   res.arranger = unescape(title?.arranger ?? "");
   res.lyricist = unescape(title?.lyricist ?? "");

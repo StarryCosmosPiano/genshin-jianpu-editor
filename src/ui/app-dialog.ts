@@ -8,6 +8,9 @@ export interface DialogField {
   value?: string;
   multiline?: boolean;
   inputMode?: "text" | "decimal" | "numeric";
+  placeholder?: string;
+  /** Place a companion control beside the immediately preceding field. */
+  inlineWithPrevious?: boolean;
   choices?: ReadonlyArray<{ value: string; label: string }>;
   validate?: (value: string) => string | null;
 }
@@ -15,7 +18,9 @@ export interface DialogField {
 interface DialogConfig {
   title: string;
   message?: string;
+  height?: number;
   fields?: readonly DialogField[];
+  initialFocusField?: string;
   actions: ReadonlyArray<{ value: string; label: string; primary?: boolean }>;
   dismiss: string | null;
 }
@@ -85,13 +90,22 @@ function openDialog(config: DialogConfig): Promise<DialogResult> {
           option.textContent = choice.label;
           input.append(option);
         }
-      } else input.inputMode = field.inputMode ?? "text";
+      } else {
+        input.inputMode = field.inputMode ?? "text";
+        input.placeholder = field.placeholder ?? "";
+      }
       input.name = field.name;
       input.value = field.value ?? "";
       input.autocomplete = "off";
       inputs.set(field.name, input);
       label.append(caption, input);
-      content.append(label);
+      if (field.inlineWithPrevious && content.lastElementChild) {
+        const preceding = content.lastElementChild;
+        const row = document.createElement("div");
+        row.className = "app-dialog-field-pair";
+        preceding.replaceWith(row);
+        row.append(preceding, label);
+      } else content.append(label);
     }
     const error = document.createElement("p");
     error.className = "app-dialog-error";
@@ -114,14 +128,16 @@ function openDialog(config: DialogConfig): Promise<DialogResult> {
       .map((node) => ({ node, inert: node.inert }));
     for (const { node } of backgrounds) node.inert = true;
     document.body.append(layer);
-    const fieldCount = config.fields?.length ?? 0;
-    const height = fieldCount > 2 ? Math.min(700, 160 + fieldCount * 82)
+    const fieldCount = config.fields?.filter(field => !field.inlineWithPrevious).length ?? 0;
+    const height = config.height ?? (fieldCount > 2 ? Math.min(700, 160 + fieldCount * 82)
       : config.fields?.some((field) => field.multiline) ? 380
-        : fieldCount > 1 ? 360 : fieldCount ? 300 : 240;
+        : fieldCount > 1 ? 360 : fieldCount ? 300 : 240);
     const floating = new FloatingWindow(pane, "prompt", header, grip, reset,
       { width: 500, height, minWidth: 300, minHeight: 210, centered: true, persist: false });
     const focusInput = (): void => {
-      const input = inputs.values().next().value;
+      const input = (config.initialFocusField ? inputs.get(config.initialFocusField) : undefined)
+        ?? inputs.values().next().value;
+      input?.scrollIntoView({ block: "nearest" });
       (input ?? footer.querySelector<HTMLButtonElement>(".primary") ?? close).focus({ preventScroll: true });
     };
     let settled = false;
@@ -199,13 +215,14 @@ function openDialog(config: DialogConfig): Promise<DialogResult> {
       event.stopPropagation();
     });
     focusInput();
-    const first = inputs.values().next().value;
+    const first = (config.initialFocusField ? inputs.get(config.initialFocusField) : undefined)
+      ?? inputs.values().next().value;
     if (first instanceof HTMLInputElement || first instanceof HTMLTextAreaElement) first.select();
   });
 }
 
 export async function showInputDialog(options: {
-  title: string; message?: string; fields: readonly DialogField[]; confirmText?: string;
+  title: string; message?: string; height?: number; fields: readonly DialogField[]; confirmText?: string; initialFocusField?: string;
 }): Promise<Record<string, string> | null> {
   const result = await openDialog({ ...options, dismiss: null,
     actions: [{ value: "cancel", label: "取消" }, { value: "apply", label: options.confirmText ?? "确定", primary: true }] });
@@ -236,6 +253,13 @@ export async function showUnsavedSettingsDialog(): Promise<"apply" | "cancel" | 
     actions: [{ value: "stay", label: "继续编辑" }, { value: "cancel", label: "放弃修改" },
       { value: "apply", label: "应用并关闭", primary: true }] });
   return result.action === "apply" ? "apply" : result.action === "cancel" ? "cancel" : "stay";
+}
+
+export async function showUnsavedDocumentDialog(action: string): Promise<"save" | "discard" | "cancel"> {
+  const result = await openDialog({ title: "乐谱尚未保存", message: `当前乐谱有未保存的修改。${action}前要保存吗？自动保存的恢复副本不会替代正式保存。`, dismiss: "cancel",
+    actions: [{ value: "cancel", label: "取消" }, { value: "discard", label: "不保存" },
+      { value: "save", label: "保存", primary: true }] });
+  return result.action === "save" ? "save" : result.action === "discard" ? "discard" : "cancel";
 }
 
 export async function showMessageDialog(title: string, message: string): Promise<void> {

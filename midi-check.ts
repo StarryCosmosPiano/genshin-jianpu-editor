@@ -2,6 +2,7 @@ import {
   analyzeMidi,
   detectMidiSlashGestures,
   detectMidiTempoMarks,
+  importedMidiSlashGestures,
   midiToScore,
   parseMidi,
   type MidiImportOptions,
@@ -528,6 +529,8 @@ const tripletAnalysis = analyzeMidi(tripletParsed);
 check(tripletAnalysis.recommendedQuantize === 8, "eighth-note triplets chose the wrong base division");
 const tripletResult = midiToScore(tripletParsed, options(8, "single"));
 check(tripletResult.summary.tripletGroups === 1, "triplet group was not detected");
+check(importedMidiSlashGestures(tripletResult.score, tripletParsed)?.triplet.length === 1,
+  "default import must remember its adopted local triplet");
 const tripletText = scoreToJpwabc(tripletResult.score);
 check(tripletText.includes("{(3}"), "triplet syntax was not emitted");
 const tripletFile = JpwFile.fromString(tripletText);
@@ -542,6 +545,46 @@ const tripletTimeline = buildTimeline(tripletRoundTrip);
 check(tripletTimeline.notes.length === 3 &&
   tripletTimeline.notes.every((note, index) => Math.abs(note.t0 - index / 3) < 1e-9),
 "triplet playback attacks are not evenly spaced");
+
+// A global triplet whose attacks alternate between hands is not a complete
+// JPW tuplet in either voice. Preserve the prior, representable binary import
+// unless the caller explicitly chooses a TXT output that can restore it.
+const crossHandJpwParsed = parseMidi(midi([
+  noteTrack("Right Hand", [
+    { start: 0, end: 160, pitch: 72 },
+    { start: 320, end: 480, pitch: 74 },
+  ]),
+  noteTrack("Left Hand", [{ start: 160, end: 320, pitch: 48 }]),
+]));
+for (const outputFormat of [undefined, "jpw"] as const) {
+  let crossHandScore = midiToScore(crossHandJpwParsed, {
+    ...options(8, "double"), outputFormat,
+  }).score;
+  check(importedMidiSlashGestures(crossHandScore, crossHandJpwParsed)?.triplet.length === 0,
+    `${outputFormat ?? "default"} JPW cache must omit unadopted global triplets`);
+  const laterTxt = scoreToSlashScore(crossHandScore, "keyboard", 8, ".", {
+    sourceMidi: crossHandJpwParsed,
+  }, 2);
+  const laterTxtOptions = defaultSlashScoreOptions("keyboard", analyzeSlashScore(laterTxt));
+  laterTxtOptions.voiceCount = 2;
+  const laterTxtAttacks = buildTimeline(parseSlashScore(laterTxt, laterTxtOptions).score).notes
+    .map(note => [note.part, note.pitch, Math.round(note.t0 * 384)])
+    .sort((left, right) => left[0]! - right[0]! || left[1]! - right[1]!);
+  check(JSON.stringify(laterTxtAttacks) === JSON.stringify([[0, 72, 0], [0, 74, 192], [1, 48, 192]]),
+    `${outputFormat ?? "default"} JPW score exported later as TXT must retain its adopted binary attacks`);
+  // Frozen quarter-note timing from the established binary JPW import.
+  const expected = [[0, 72, 0, 192], [0, 74, 192, 384], [1, 48, 192, 384]];
+  for (let cycle = 0; cycle < 3; cycle++) {
+    const actual = buildTimeline(crossHandScore).notes.map(note => [
+      note.part, note.pitch, Math.round(note.t0 * 384), Math.round(note.t1 * 384),
+    ]).sort((left, right) => left[0]! - right[0]! || left[1]! - right[1]!);
+    check(JSON.stringify(actual) === JSON.stringify(expected),
+      `cross-hand ${outputFormat ?? "default"} JPW import/save ${cycle} changed attacks or sustains`);
+    const file = JpwFile.fromString(scoreToJpwabc(crossHandScore));
+    check(file, "cross-hand JPW output must parse");
+    crossHandScore = fromJpw(file);
+  }
+}
 
 const rolledBytes = midi([noteTrack("Rolled chord", [
   { start: 0, end: 480, pitch: 60 },

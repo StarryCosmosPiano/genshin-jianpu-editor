@@ -1,4 +1,4 @@
-// Read-only staff preview integration regression; run after npm run build.
+// Shared staff selection and editing integration regression; run after npm run build.
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
@@ -72,7 +72,7 @@ try {
     registry: window.__app._staffRegistry, mode: document.getElementById("score-surfaces").dataset.staffView }));
   check("default jianpu view", unopened.mode === "jianpu");
   check("closed preview leaves registry lazy", unopened.registry === null);
-  check("renderer is not requested before opening", !requests.some(url => /\/renderer[-.]/.test(url)));
+  check("renderer is not requested before opening", !requests.some(url => /\/renderer\.ts(?:\?|$)|\/renderer-[\w-]+\.js(?:\?|$)/.test(url)));
   await install(piano);
   const closedPick = (await targets()).find(target => target.part === 0 && target.pitch === 64 && !target.grace);
   await clickJianpu(closedPick.id);
@@ -109,7 +109,7 @@ try {
     const app = window.__app;
     app._player = { state: "stopped", stop() { this.state = "stopped"; app.onPlayChord(null, 0); app.onPlayState("stopped"); },
       async play(score, options, start) { window.__staffPlayStart = { chord: start?.chord, pass: start?.pass }; },
-      stopAudition() {}, audition() {} };
+      stopAudition() {}, async audition() {} };
   });
   await page.evaluate(() => window.__app.playScore());
   check("toolbar playback starts from clicked visual chord", await page.evaluate(id => {
@@ -139,17 +139,17 @@ try {
   await page.evaluate(id => { const app = window.__app, source = app.getStaffPreviewSnapshot().registry.targets.find(target => target.ref.id === id).source; app.view.focus(); app.view.dispatch({ selection: { anchor: source.from, head: source.to } }); }, unisons[1].id);
   check("text range mirrors its exact source note", (await state()).selected.includes(unisons[1].id));
   await clickStaff(grace.id);
-  const readonly = await state();
-  for (const key of ["n", "a", "z", "1", "Delete", "Backspace", "ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"]) await page.keyboard.press(key);
-  selected = await state();
-  check("read-only staff keys preserve text and input cursor", selected.text === readonly.text && JSON.stringify(selected.cursor) === JSON.stringify(readonly.cursor) && selected.input === readonly.input);
-  await page.evaluate(() => window.__app.setInputMode(true));
+  const beforeInput = await state();
+  await page.keyboard.press("n");
   await ready();
-  await clickStaff((await targets()).find(target => target.grace).id);
-  const inputReadonly = await state();
-  await page.keyboard.press("Space");
-  for (const key of ["n", "a", "z", "5", "Delete", "ArrowDown"]) await page.keyboard.press(key);
-  check("input mode remains read-only under staff focus", (await state()).text === inputReadonly.text && JSON.stringify((await state()).cursor) === JSON.stringify(inputReadonly.cursor));
+  check("N enables staff input without rewriting the source", (await state()).input && (await state()).text === beforeInput.text);
+  const hoverBefore = await state();
+  await page.mouse.move(5, 5);
+  await page.locator("#staff-pages [data-staff-ref]").first().hover();
+  check("hover displays dashed staff preview", await page.locator('[data-staff-input-overlay="hover"]').count() === 1);
+  check("hover keeps source and source selection unchanged", (await state()).text === hoverBefore.text && (await state()).selected.join() === hoverBefore.selected.join());
+  await page.keyboard.press("Escape");
+  check("Escape exits staff input", !(await state()).input);
   await page.evaluate(() => window.__app.setInputMode(false)); await ready();
 
   const lockedRef = (await targets())[0];
@@ -193,10 +193,14 @@ try {
   await page.waitForFunction(() => window.__app.workspaceSummary().page === 1);
   check("active staff page navigation returns to first page", (await page.evaluate(() => window.__app.workspaceSummary().page)) === 1);
   await page.keyboard.press("Control+End");
-  await page.evaluate(async text => {
+  await page.evaluate(text => {
     window.__oldStaffSvgs = [...document.querySelectorAll("#staff-pages svg")];
-    await window.__app.importBytes(new TextEncoder().encode(text), "new-staff-document.jpwabc");
+    window.__newStaffImported = false;
+    void window.__app.importBytes(new TextEncoder().encode(text), "new-staff-document.jpwabc")
+      .then(() => { window.__newStaffImported = true; });
   }, long.replace("分页五线谱回归", "新文档五线谱回归"));
+  await page.getByRole("button", { name: "不保存", exact: true }).click();
+  await page.waitForFunction(() => window.__newStaffImported);
   await ready();
   check("opening another file clears old SVG maps and viewport anchor", await page.evaluate(() =>
     window.__oldStaffSvgs.every(svg => !svg.isConnected) && document.getElementById("staff-pane").scrollTop < 48

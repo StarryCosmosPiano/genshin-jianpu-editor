@@ -5,6 +5,7 @@
 // two stay in lockstep. Times are in quarter-note units.
 
 import { Chord, Note, Score, TempoMarkKind } from "./score";
+import { chordArpeggioNoteGroups } from "./arpeggio";
 
 export const TEMPO = 90; // BPM, shared by MIDI export and playback
 
@@ -27,6 +28,15 @@ export interface TimedNote {
   pitch: number;
   part: number;
   chord: Chord;
+  /** The exact written tone, including generated ornament pitches. */
+  sourceNote: Note;
+  /** Written pieces merged into one attack by a tie. */
+  sourceSegments: Array<{ note: Note; t0: number; t1: number }>;
+}
+
+export interface TimelineOptions {
+  /** Selection playback performs the written passage once, without repeats. */
+  writtenOrder?: boolean;
 }
 
 export interface Anchor {
@@ -81,9 +91,9 @@ function measureLen(score: Score, mid: number): number {
 }
 
 /** Expanded play order as [mid, end) measure ranges with a start offset + pass. */
-function playRanges(score: Score): { mid: number; end: number; offset: number; pass: number }[] {
+function playRanges(score: Score, options?: TimelineOptions): { mid: number; end: number; offset: number; pass: number }[] {
   const items = score.playData.measures;
-  if (items.length > 0) {
+  if (!options?.writtenOrder && items.length > 0) {
     return items.map((p) => ({ mid: p.mid, end: p.end, offset: p.offset.toFloat(), pass: p.pass }));
   }
   // No expansion computed: linear single pass over all measures.
@@ -122,7 +132,7 @@ function tempoSpanSeconds(
   return quarters * 60 * Math.log(to / from) / delta;
 }
 
-function performedTempoMarks(score: Score): PerformedTempoMark[] {
+function performedTempoMarks(score: Score, options?: TimelineOptions): PerformedTempoMark[] {
   const byMeasure = new Map<number, Array<{
     kind: TempoMarkKind;
     bpm: number | null;
@@ -141,7 +151,7 @@ function performedTempoMarks(score: Score): PerformedTempoMark[] {
   const result: PerformedTempoMark[] = [];
   let performanceQuarter = 0;
   let order = 0;
-  for (const range of playRanges(score)) {
+  for (const range of playRanges(score, options)) {
     for (let mid = range.mid; mid < range.end; mid++) {
       const startOffset = mid === range.mid ? range.offset : 0;
       const length = measureLen(score, mid);
@@ -166,7 +176,7 @@ function performedTempoMarks(score: Score): PerformedTempoMark[] {
  * concrete metronome mark. Without a following concrete tempo, an instruction
  * remains visual only because it has no numeric endpoint.
  */
-export function buildTempoTimeline(score: Score, durationQuarter: number): TempoTimeline {
+export function buildTempoTimeline(score: Score, durationQuarter: number, options?: TimelineOptions): TempoTimeline {
   const duration = Math.max(0, durationQuarter);
   const initialBpm = safeBpm(score.tempoBpm);
   const drafts: Array<{
@@ -192,7 +202,7 @@ export function buildTempoTimeline(score: Score, durationQuarter: number): Tempo
     cursor = end;
   };
 
-  for (const mark of performedTempoMarks(score)) {
+  for (const mark of performedTempoMarks(score, options)) {
     const quarter = Math.max(0, Math.min(duration, mark.quarter));
     if (quarter + 1e-9 < cursor) continue;
     if (mark.kind === "accel" || mark.kind === "rit") {
@@ -320,6 +330,8 @@ function ornamentPerformance(
         pitch: index % 2 === 0 ? note.pitch : neighbor,
         part,
         chord,
+        sourceNote: note,
+        sourceSegments: [{ note, t0: cursor, t1: stop }],
       });
       cursor = stop;
       index++;
@@ -333,15 +345,16 @@ function ornamentPerformance(
     { t0: start, t1: second, pitch: note.pitch, part, chord },
     { t0: second, t1: third, pitch: neighbor, part, chord },
     { t0: third, t1: end, pitch: note.pitch, part, chord },
-  ].filter((item) => item.t1 > item.t0 + 1 / 1024);
+  ].filter((item) => item.t1 > item.t0 + 1 / 1024)
+    .map(item => ({ ...item, sourceNote: note, sourceSegments: [{ note, t0: item.t0, t1: item.t1 }] }));
 }
 
-export function buildTimeline(score: Score): Timeline {
+export function buildTimeline(score: Score, options?: TimelineOptions): Timeline {
   const notes: TimedNote[] = [];
   const anchorMap = new Map<string, Anchor & { primaryPart: number }>();
   let pos = 0; // running timeline position in quarter notes
 
-  for (const range of playRanges(score)) {
+  for (const range of playRanges(score, options)) {
     // A repeated range is a fresh performance pass. Ties may merge notes
     // inside that pass, but must never inherit a sounding note from the end of
     // the previous pass.
@@ -379,6 +392,8 @@ export function buildTimeline(score: Score): Timeline {
                 pitch: note.pitch,
                 part: pi,
                 chord: ent,
+                sourceNote: note,
+                sourceSegments: [{ note, t0: noteStart, t1: noteStart + graceUnit }],
               });
             });
           }
@@ -403,19 +418,15 @@ export function buildTimeline(score: Score): Timeline {
               primaryPart: pi,
             });
           }
-          const pitchRange = ent.arpeggioPitches?.length
-            ? new Set(ent.arpeggioPitches)
-            : null;
-          const rolledNotes = pitchRange
-            ? soundingNotes.filter((note) => pitchRange.has(note.pitch))
-            : soundingNotes;
-          if (ent.arpeggio && rolledNotes.length > 1) {
+          const rolledGroups = chordArpeggioNoteGroups(ent);
+          const rolledNoteSet = new Set(rolledGroups.flat());
+          for (const rolledNotes of rolledGroups) {
             const ordered = [...rolledNotes].sort((left, right) =>
               left.pitch - right.pitch);
             const rollSpan = Math.max(0, Math.min(1 / 8, (t1 - mainAttack) * 0.2));
             // For a partial arpeggio, strike the notes outside the wave on the
             // beat first, then begin the rolled subset on the next roll step.
-            const leadingStep = rolledNotes.length < soundingNotes.length ? 1 : 0;
+            const leadingStep = soundingNotes.some(note => !rolledNoteSet.has(note)) ? 1 : 0;
             const rollUnit = rollSpan / (ordered.length - 1 + leadingStep);
             ordered.forEach((note, index) => {
               arpeggioDelay.set(note, (index + leadingStep) * rollUnit);
@@ -427,9 +438,10 @@ export function buildTimeline(score: Score): Timeline {
           // arpeggio, but only to the explicitly selected part/pitch pairs.
           // The marker is deliberately looked up in the source measure and
           // local position, so repeats still get a fresh roll on every pass.
-          const cross = score.crossPartArpeggios.find((mark) =>
+          const crossGroups = score.crossPartArpeggios.filter((mark) =>
             mark.measure === mid && mark.offset.equals(ent.position));
-          if (cross) {
+          const usedCrossNotes = new Set<Note>();
+          for (const cross of crossGroups) {
             // Rank the complete cross-part pitch list, not just the notes in
             // this Chord. A common case is one note per voice; ranking each
             // Chord independently would produce one-element rolls and hence
@@ -439,11 +451,31 @@ export function buildTimeline(score: Score): Timeline {
               .sort((left, right) => left.pitch - right.pitch || left.part - right.part || left.index - right.index);
             if (cross.direction === "down") ordered.reverse();
             if (ordered.length > 1) {
-              const rollSpan = Math.max(0, Math.min(1 / 8, (t1 - mainAttack) * 0.2));
+              // Every participating part must use the same roll clock. A
+              // per-chord span makes a short high note precede a longer
+              // middle note even though their global ranks are increasing.
+              const durations = cross.pitches.flatMap(item => {
+                const measure = score.parts[item.part]?.measures[mid];
+                return (measure?.entries ?? []).flatMap(entry => {
+                  if (!(entry instanceof Chord) || entry.rest
+                    || !entry.position.equals(cross.offset)
+                    || !entry.notes.some(note => note.pitch === item.pitch
+                      && !note.rest && !note.softDeleted)) return [];
+                  const duration = entry.duration?.toFloat() ?? 0;
+                  return duration > 0 ? [duration] : [];
+                });
+              });
+              const shortest = durations.length ? Math.min(...durations) : 0;
+              const rollSpan = Math.max(0, Math.min(1 / 8, shortest * 0.2));
               const rollUnit = rollSpan / (ordered.length - 1);
-              soundingNotes.forEach((note) => {
-                const rank = ordered.findIndex((item) => item.part === pi && item.pitch === note.pitch);
-                if (rank >= 0) arpeggioDelay.set(note, rank * rollUnit);
+              const remaining = soundingNotes.filter(note => !usedCrossNotes.has(note));
+              ordered.forEach((item, rank) => {
+                if (item.part !== pi) return;
+                const index = remaining.findIndex(note => note.pitch === item.pitch);
+                if (index < 0) return;
+                const note = remaining.splice(index, 1)[0];
+                usedCrossNotes.add(note);
+                arpeggioDelay.set(note, rank * rollUnit);
               });
             }
           }
@@ -451,6 +483,7 @@ export function buildTimeline(score: Score): Timeline {
             const tied = nt.tieEnd && nt.tiePrev ? tiedNotes.get(nt.tiePrev) : undefined;
             if (tied) {
               tied.t1 = Math.max(tied.t1, t1);
+              tied.sourceSegments.push({ note: nt, t0, t1 });
               tiedNotes.set(nt, tied);
               continue;
             }
@@ -467,6 +500,8 @@ export function buildTimeline(score: Score): Timeline {
               pitch: nt.pitch,
               part: pi,
               chord: ent,
+              sourceNote: nt,
+              sourceSegments: [{ note: nt, t0: attack, t1: Math.max(attack + 1 / 128, t1) }],
             };
             notes.push(timed);
             tiedNotes.set(nt, timed);
@@ -484,6 +519,43 @@ export function buildTimeline(score: Score): Timeline {
     notes,
     anchors,
     duration: pos,
-    tempo: buildTempoTimeline(score, pos),
+    tempo: buildTempoTimeline(score, pos, options),
   };
+}
+
+/** Filter by tone identity and written tie segments, never by pitch. Keeping
+ * absolute timeline times also keeps tempo ramps and gaps between selections. */
+export function buildSelectionTimeline(score: Score, selected: ReadonlySet<Note>): Timeline {
+  const full = buildTimeline(score, { writtenOrder: true });
+  const notes: TimedNote[] = [];
+  for (const event of full.notes) {
+    let active: TimedNote | null = null;
+    for (const segment of event.sourceSegments) {
+      if (!selected.has(segment.note)) { active = null; continue; }
+      const t0 = Math.max(event.t0, segment.t0);
+      const t1 = Math.min(event.t1, segment.t1);
+      if (t1 <= t0) continue;
+      if (active && t0 <= active.t1 + 1e-9) {
+        active.t1 = Math.max(active.t1, t1);
+        active.sourceSegments.push(segment);
+      } else {
+        active = { ...event, t0, t1, chord: segment.note.chord,
+          sourceNote: segment.note, sourceSegments: [segment] };
+        notes.push(active);
+      }
+    }
+  }
+  const selectedChords = new Set([...selected].map(note => note.chord));
+  const anchors = full.anchors.flatMap(anchor => {
+    const chords = anchor.chords.filter(chord => selectedChords.has(chord));
+    return chords.length ? [{ ...anchor, chord: chords[0], chords }] : [];
+  });
+  // A grace-only selection can start before its owning main chord's anchor.
+  for (const event of notes) {
+    if (!anchors.some(anchor => anchor.chords.includes(event.chord) && anchor.t0 <= event.t0)) {
+      anchors.push({ t0: event.t0, chord: event.chord, chords: [event.chord], pass: 1 });
+    }
+  }
+  anchors.sort((a, b) => a.t0 - b.t0);
+  return { ...full, notes, anchors, duration: notes.reduce((end, note) => Math.max(end, note.t1), 0) };
 }

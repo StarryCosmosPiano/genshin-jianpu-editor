@@ -14,8 +14,9 @@ import {
   Score,
 } from "./score";
 import { Fraction } from "../common/fraction";
+import { chordArpeggioPitchGroups } from "./arpeggio";
 import { computePhraseBreaks, type PhraseBreaks } from "./phrase";
-import { serializeJpwNoteTimingEdits } from "./note-timing";
+import { noteTieAnnotations, partNeedsExplicitNoteTies, serializeJpwNoteTimingEdits } from "./note-timing";
 
 function escape(s: string): string {
   return s.replace(/\n/g, "\\n");
@@ -44,6 +45,18 @@ function annotationPayload(scr: Score): Record<string, unknown> {
   });
   return {
     ornaments,
+    noteTies: noteTieAnnotations(scr),
+    arpeggioGroups: scr.parts.flatMap((part, partIndex) => part.measures.flatMap(measure =>
+      measure.entries.flatMap(entry => {
+        if (!(entry instanceof Chord) || !entry.arpeggio) return [];
+        const groups = chordArpeggioPitchGroups(entry);
+        return groups.length > 0 ? [{
+          part: partIndex,
+          measure: measure.index,
+          offset: serializationPosition(entry).toString(),
+          groups,
+        }] : [];
+      }))),
     crossPartArpeggios: scr.crossPartArpeggios.map((mark) => ({
       measure: mark.measure,
       offset: mark.offset.toString(),
@@ -319,6 +332,9 @@ class JpScore {
     this.lines.push(`Composer = {${escape(scr.composer)}}`);
     this.lines.push(`Arranger = {${escape(scr.arranger)}}`);
     this.lines.push(`Lyricist = {${escape(scr.lyricist)}}`);
+    if (scr.headerTypography && Object.keys(scr.headerTypography).length) {
+      this.lines.push(`HeaderTypography = {${JSON.stringify(scr.headerTypography)}}`);
+    }
     this.lines.push(`Instrument = {${escape(scr.instrumentName)}}`);
     const firstMea = scr.parts[0].measures[0];
     const tm = firstMea.time;
@@ -480,6 +496,7 @@ class JpScore {
   private makeVoiceData(part: Part, sectionName: string): void {
     this.lines.push(sectionName);
     const voiceStart = this.lines.length;
+    const explicitNoteTies = partNeedsExplicitNoteTies(part);
     // 乐句排版：忽略源自带换行，按乐句分析结果断行；否则保留原始 newSystem。
     const breaks = this._breaks;
     let l = "";
@@ -519,7 +536,7 @@ class JpScore {
           l = "";
         } else if (ch instanceof Chord) {
           const nt = ch.notes[0];
-          if (ch.timingOriginal?.tieStart ?? nt.tieStart) l += "(";
+          if (!explicitNoteTies && (ch.timingOriginal?.tieStart ?? nt.tieStart)) l += "(";
           if (ch.slurStart) l += "(";
           if (nt.tupletBegin) l += "{(3}";
           l += this.makeNotations(ch);
@@ -527,7 +544,7 @@ class JpScore {
           const colStart = l.length;
           l += this.chordVoice(ch);
           this.noteRecs.push({ line: this.lines.length, colStart, colEnd: l.length });
-          if (ch.timingOriginal?.tieEnd ?? nt.tieEnd) l += ")";
+          if (!explicitNoteTies && (ch.timingOriginal?.tieEnd ?? nt.tieEnd)) l += ")";
           if (nt.tupletEnd) l += ")";
           if (ch.slurEnd) l += ")";
           l += " ";

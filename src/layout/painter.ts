@@ -107,7 +107,7 @@ export class JinpuPainter {
   }
 
   /** Highlight every hand/part chord sounding at the same playback instant. */
-  highlightChords(chords: Chord[] | null, pass = 0): number | null {
+  highlightChords(chords: readonly Chord[] | null, pass = 0, notes?: ReadonlySet<Note>): number | null {
     for (const item of this.highlighted) this.nodeMap.get(item)?.classList.remove("playing");
     this.highlighted = [];
     if (!chords || chords.length === 0) return null;
@@ -115,9 +115,20 @@ export class JinpuPainter {
     for (const chord of chords) {
       const hit = this.hitFor(chord, pass);
       if (!hit) continue;
-      this.nodeMap.get(hit.item)?.classList.add("playing");
-      this.highlighted.push(hit.item);
-      if (page === null) page = hit.page;
+      const items: PageItem[] = [];
+      if (notes) {
+        const entry = hit.item.data;
+        if (!(entry instanceof NoteEntry)) continue;
+        chord.notes.forEach((note, index) => {
+          if (notes.has(note) && entry.numbers[index]) items.push(entry.numbers[index]);
+        });
+        entry.graceItems.forEach((item, note) => { if (notes.has(note)) items.push(item); });
+      } else items.push(hit.item);
+      for (const item of items) {
+        this.nodeMap.get(item)?.classList.add("playing");
+        this.highlighted.push(item);
+      }
+      if (page === null && items.length > 0) page = hit.page;
     }
     return page;
   }
@@ -250,6 +261,15 @@ export class JinpuPainter {
     return svg;
   }
 
+  /** Exporting an unmounted page must not replace interactive DOM bindings. */
+  renderDetachedPage(pageIndex: number): SVGSVGElement {
+    const svg = document.createElementNS(SVG_NS, "svg");
+    svg.setAttribute("class", "score-page");
+    svg.setAttribute("viewBox", `0 0 ${this.pageWidth} ${this.pageHeight}`);
+    svg.appendChild(renderPageItem(this.layout.pages[pageIndex], new WeakMap(), new WeakMap()));
+    return svg;
+  }
+
   /** Reconcile an interactive page with its previous SVG without detaching it. */
   renderCachedPage(pageIndex: number): SVGSVGElement {
     // Incremental layout can retain PageItem identities while changing their
@@ -275,6 +295,23 @@ export class JinpuPainter {
       cached.svg.insertBefore(cached.root.group, cached.svg.firstChild);
     }
     return cached.svg;
+  }
+
+  /** Release offscreen SVG trees without throwing away score/layout geometry. */
+  retainCachedPages(pages: ReadonlySet<number>): void {
+    const release = (node: CachedPageItem): void => {
+      this.nodeMap.delete(node.item);
+      node.children.forEach(release);
+    };
+    this.pageCache.forEach((cached, index) => {
+      if (!cached || pages.has(index)) return;
+      release(cached.root);
+      delete this.pageCache[index];
+    });
+  }
+
+  pageForChord(chord: Chord, pass = 0): number | null {
+    return this.hitFor(chord, pass)?.page ?? null;
   }
 
   private reconcilePageItem(item: PageItem, cached: CachedPageItem): CachedPageItem {

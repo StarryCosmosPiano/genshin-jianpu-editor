@@ -37,8 +37,79 @@ async function selectNote() {
   assert.ok(await page.evaluate(() => window.__app._selectedNotes.length > 0), "score note selected");
 }
 
+async function settleShortcutSurface(surface) {
+  await page.waitForFunction(() => window.__app.debounceTimer === undefined && !window.__app.previewDirty);
+  if (surface === "staff") await page.waitForFunction(() => {
+    const app = window.__app, pane = document.getElementById("staff-pane");
+    return app.isStaffPreviewCurrent() && pane.dataset.staffRevision === String(app.getStaffPreviewSnapshot().revision)
+      && pane.getAttribute("aria-busy") === "false";
+  });
+}
+
+async function resetArrowFixture(surface, input) {
+  await page.evaluate(() => {
+    const app = window.__app;
+    app.setInputMode(false); app.setInteractionMode("select");
+    app.documentFormat = "jpw"; app.slashOptions = null;
+    app.setText(".Title\nTitle = {方向键互换}\nKeyAndMeters = {1=C,4/4}\n.Voice.RH\n4 0 0 0 |]\n.Voice.LH\n1 0 0 0 |]\n");
+    app.setCodePaneCollapsed(true); app.resetDocumentUndo();
+    app._player = { state: "stopped", stop() {}, stopAudition() {}, async audition() {} };
+  });
+  await page.selectOption("#staff-view-select", surface);
+  await settleShortcutSurface(surface);
+  if (surface === "staff") {
+    const id = await page.evaluate(() => window.__app.getStaffPreviewSnapshot().registry.targets
+      .find(item => !item.grace && !item.note.rest && item.partIndex === 0).ref.id);
+    await page.locator(`#staff-pages [data-staff-ref="${id}"]`).first().click();
+  } else await selectNote();
+  if (input) await page.keyboard.press("n");
+  await settleShortcutSurface(surface);
+}
+
+async function arrowState() {
+  return page.evaluate(() => {
+    const app = window.__app;
+    return {
+      notes: app.painter.score.parts.flatMap((part, index) => part.measures.flatMap(measure =>
+        measure.entries.flatMap(chord => (chord.notes ?? []).filter(note => !note.rest).map(note => ({
+          part: index, pitch: note.pitch, at: chord.position.toString(), duration: chord.duration.toString(),
+        }))))).sort((a, b) => a.part - b.part || a.pitch - b.pitch),
+      selected: app._selectedNotes.map(item => ({ part: item.source.partIndex, pitch: item.visualNote.pitch })),
+    };
+  });
+}
+
+async function checkExchangedArrows(customized) {
+  for (const surface of ["jianpu", "staff"]) {
+    for (const input of [false, true]) {
+      await resetArrowFixture(surface, input);
+      const baseline = await arrowState();
+      const context = `${customized ? "saved" : "default"} ${surface}/${input ? "input" : "selection"}`;
+      const partDown = customized ? "F10" : "Control+Alt+ArrowDown";
+      const partUp = customized ? "F11" : "Control+Alt+ArrowUp";
+      const pitchUp = customized ? "F12" : "Alt+ArrowUp";
+      const pitchDown = customized ? "F8" : "Alt+ArrowDown";
+      await page.keyboard.press(pitchUp); await settleShortcutSurface(surface);
+      let actual = await arrowState();
+      if (input) {
+        assert.deepEqual(actual.selected, [{ part: 0, pitch: surface === "staff" ? 66 : 67 }],
+          `${context}: pitch key preserves its surface-specific meaning`);
+        await page.keyboard.press(pitchDown); await settleShortcutSurface(surface);
+      }
+      assert.deepEqual((await arrowState()).notes, baseline.notes, `${context}: selection does not edit pitch / input reverses`);
+      await page.keyboard.press(partDown); await settleShortcutSurface(surface);
+      actual = await arrowState();
+      assert.deepEqual(actual.selected, [{ part: 1, pitch: 65 }], `${context}: part key moves the note without transposing`);
+      assert.deepEqual(actual.notes, baseline.notes.map(note => note.pitch === 65 ? { ...note, part: 1 } : note)
+        .sort((a, b) => a.part - b.part || a.pitch - b.pitch), `${context}: movement preserves onset and duration`);
+      await page.keyboard.press(partUp); await settleShortcutSurface(surface);
+      assert.deepEqual((await arrowState()).notes, baseline.notes, `${context}: reverse part key restores both parts`);
+    }
+  }
+}
+
 try {
-  const origin = `http://127.0.0.1:${server.address().port}/`;
+  const origin = process.env.APP_TEST_URL || `http://127.0.0.1:${server.address().port}/`;
   await page.goto(origin, { waitUntil: "networkidle" });
   await page.locator("#btn-options").click();
   await page.locator(".modal-box button").filter({ hasText: "设置快捷键…" }).click();
@@ -67,7 +138,7 @@ try {
 
   await page.evaluate(() => {
     localStorage.setItem("jpeditor.ui.shortcuts.v1", JSON.stringify({
-      "score.octaveUp": ["w"], "input.degree1": ["F2"],
+      "score.toggleInput": ["F9"], "input.octaveUp": ["w"], "input.degree1": ["F2"],
       "voice.1": ["Alt+q"], "voice.2": ["Mod+/"], "page.zoomIn": ["Alt+g"],
       "text.command.17": ["F8"],
       "text.command.39": ["Mod+Shift+a", "Alt+2"],
@@ -92,14 +163,29 @@ try {
   await selectNote();
   const beforePitch = await page.evaluate(() => window.__app._selectedNotes.at(-1).source.note.pitch);
   await page.keyboard.press("w");
-  assert.equal(await page.evaluate(() => window.__app._selectedNotes.at(-1)?.source.note.pitch), beforePitch + 12,
-    "custom selection key changes octave");
+  assert.equal(await page.evaluate(() => window.__app._selectedNotes.at(-1)?.source.note.pitch), beforePitch,
+    "input shortcut cannot edit selection-mode pitch");
   await selectNote();
   await page.keyboard.press("Space");
   assert.equal(await page.evaluate(() => window.__shortcutPlayback.starts), 1,
     "selection Space starts playback");
+  await page.keyboard.press("F9");
+  assert.equal(await page.evaluate(() => window.__app.interactionMode), "input", "custom N action enters input");
+  await page.keyboard.press("F9");
+  assert.equal(await page.evaluate(() => window.__app.interactionMode), "select", "custom N action exits to selection");
+  await page.selectOption("#staff-view-select", "staff");
+  await page.waitForSelector("#staff-pages [data-staff-ref]");
+  await page.locator("#staff-pages [data-staff-ref]").first().click();
+  await page.keyboard.press("F9");
+  assert.equal(await page.evaluate(() => window.__app.interactionMode), "input", "custom staff N action enters input");
+  await page.keyboard.press("F9");
+  assert.equal(await page.evaluate(() => window.__app.interactionMode), "select", "custom staff N action exits to selection");
+  await page.selectOption("#staff-view-select", "jianpu"); await selectNote();
 
   await page.evaluate(() => { window.__app.setInputMode(true); window.__app.scorePane.focus(); });
+  await page.keyboard.press("w");
+  assert.equal(await page.evaluate(() => window.__app._selectedNotes.at(-1)?.source.note.pitch), beforePitch + 12,
+    "custom input shortcut changes octave in input mode");
   const beforeInput = await page.evaluate(() => window.__app.getText());
   await page.keyboard.press("F2");
   assert.notEqual(await page.evaluate(() => window.__app.getText()), beforeInput,
@@ -202,8 +288,8 @@ try {
   assert.match(await page.locator(".shortcut-recording").textContent(), /不能占用普通文字或符号/,
     "shifted symbol cannot replace text input");
   await page.keyboard.press("Escape");
-  await search.fill("所选音升八度");
-  const octaveRow = page.locator(".shortcut-row").filter({ hasText: "所选音升八度" });
+  await search.fill("当前音升八度");
+  const octaveRow = page.locator(".shortcut-row").filter({ hasText: "当前音升八度" });
   await octaveRow.locator(".shortcut-key button").first().click();
   await page.keyboard.press("Alt+ArrowDown");
   assert.equal(await page.getByRole("button", { name: "应用", exact: true }).isDisabled(), true,
@@ -211,8 +297,23 @@ try {
   await page.getByRole("button", { name: "取消", exact: true }).last().click();
   await page.locator(".modal-footer button").first().click();
 
+  await page.evaluate(() => localStorage.setItem("jpeditor.ui.shortcuts.v1", "{}"));
+  await page.reload({ waitUntil: "networkidle" });
+  await checkExchangedArrows(false);
+  // Old saved action IDs continue to dispatch their original operation even
+  // though each operation's canonical Alt/Mod+Alt event has changed.
+  await page.evaluate(() => localStorage.setItem("jpeditor.ui.shortcuts.v1", JSON.stringify({
+    "score.movePartDown": ["F10"], "score.movePartUp": ["F11"],
+    "input.partDown": ["F10"], "input.partUp": ["F11"],
+    "staff.partDown": ["F10"], "staff.partUp": ["F11"],
+    "input.degreeUp": ["F12"], "input.degreeDown": ["F8"],
+    "staff.semitoneUp": ["F12"], "staff.semitoneDown": ["F8"],
+  })));
+  await page.reload({ waitUntil: "networkidle" });
+  await checkExchangedArrows(true);
+
   assert.deepEqual(errors, []);
-  console.log("shortcut preferences browser: settings, apply/cancel/conflict, score/input/voice/text/page keys OK");
+  console.log("shortcut preferences browser: settings, apply/cancel/conflict, score/input/voice/text/page keys, exchanged arrows and saved overrides OK");
 } finally {
   await browser.close();
   await new Promise((resolve) => server.close(resolve));

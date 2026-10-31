@@ -5,7 +5,7 @@ import { createInputTriplet, inputNoteAtCursor } from "./src/score/input-edit";
 import { analyzeSlashScore, defaultSlashScoreOptions, embedSlashScoreOptionsFromScore, parseSlashScore, scoreToSlashScore } from "./src/slashscore";
 
 const z = "\u2063";
-const header = "键盘谱\n4/4拍：\n点=16分音符\n";
+const header = "键盘谱\n4/4拍：\n点=16分音符\n方括号=三连音\n";
 const halfSource = header + `(V${z}D${z}G).${z}A.${z}N.( ${z}D${z}G)./.${z}A.${z}N.${z}A./(B${z}D${z}G).${z}A.${z}N.( ${z}D${z}G)./.${z}N.${z}A.${z}N./\n`.replaceAll("( ", "(");
 const wholeSource = header + `(N${z}D${z}G).${z}A.${z}N.( ${z}D${z}G)./.${z}A.${z}N.${z}A./( ${z}D${z}G).${z}A.${z}N.( ${z}D${z}G)./.${z}A.${z}N../\n`.replaceAll("( ", "(");
 const oldHalf = `[( ${z}${z}V${z}D${z}G)....${z}A${z}N${z}${z}0....(${z}D${z}G)${z}A${z}${z}0....${z}N${z}A]/..../(B${z}D${z}G).${z}A.${z}N.(${z}D${z}G)./.${z}N.${z}A.${z}N./`.replaceAll("( ", "(");

@@ -2,6 +2,7 @@ import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
 import { extname, join, normalize } from "node:path";
 import { chromium } from "playwright";
+import { acceptFixtureImport } from "./browser-test-helpers.mjs";
 
 const ROOT = join(process.cwd(), "dist");
 const MIME = {
@@ -38,7 +39,7 @@ const createChoices = await page.locator(".create-score-choices button").allText
 if (createChoices.length !== 3) throw new Error("create dialog must offer three formats");
 await page.locator(".create-score-choices button", { hasText: "键盘谱" }).click();
 await page.locator(".slash-import-box").waitFor();
-await page.getByRole("button", { name: "导入为单行简谱" }).click();
+await acceptFixtureImport(page, page.getByRole("button", { name: "导入为单行简谱" }));
 await page.locator(".slash-import-box").waitFor({ state: "detached" });
 const created = await page.evaluate(() => ({
   format: window.__app.documentFormat,
@@ -72,7 +73,7 @@ const slashDialog = {
   mappingRows: await page.locator(".slash-symbol-row").count(),
 };
 if (!slashDialog.hasSpaceMapping || !slashDialog.hasNoteDuration) throw new Error("intrinsic note/space duration controls are missing");
-await page.getByRole("button", { name: "导入为单行简谱" }).click();
+await acceptFixtureImport(page, page.getByRole("button", { name: "导入为单行简谱" }));
 await page.locator(".slash-import-box").waitFor({ state: "detached" });
 await page.waitForTimeout(500);
 
@@ -119,7 +120,7 @@ await page.evaluate((text) => {
 await page.locator(".slash-import-box").waitFor();
 await page.locator('select[name="noteDivision"]').selectOption("4");
 await page.locator('select[name="spaceDivision"]').selectOption("4");
-await page.getByRole("button", { name: "导入为单行简谱" }).click();
+await acceptFixtureImport(page, page.getByRole("button", { name: "导入为单行简谱" }));
 await page.locator(".slash-import-box").waitFor({ state: "detached" });
 await page.waitForTimeout(300);
 const intrinsicImport = await page.evaluate(() => {
@@ -156,7 +157,7 @@ await page.evaluate((text) => {
   void window.__app.importBytes(new TextEncoder().encode(text), "所念皆星河 - 数字谱.txt");
 }, fullNumberText);
 await page.locator(".slash-import-box").waitFor();
-await page.getByRole("button", { name: "导入为单行简谱" }).click();
+await acceptFixtureImport(page, page.getByRole("button", { name: "导入为单行简谱" }));
 await page.locator(".slash-import-box").waitFor({ state: "detached" });
 await page.waitForTimeout(600);
 const fullExampleLayout = await page.evaluate(() => {
@@ -251,7 +252,7 @@ const rhythmDefaults = {
 };
 if (!rhythmDefaults.enabled || rhythmDefaults.mode !== "auto" || rhythmDefaults.division !== "4" ||
     !rhythmDefaults.manualDivisionDisabled || rhythmDefaults.systemGap !== "1" ||
-    rhythmDefaults.measuresPerSystem !== "4" || !rhythmDefaults.rhythmicSpacingEnabled ||
+    rhythmDefaults.measuresPerSystem !== "6" || !rhythmDefaults.rhythmicSpacingEnabled ||
     rhythmDefaults.rhythmicSpacingExponent !== "1" || !rhythmDefaults.justifyLastSystem ||
     rhythmDefaults.previewSource !== "actual-layout" || rhythmDefaults.previewSystems < 1 ||
     !rhythmDefaults.pianoOnlyLabeled) {
@@ -373,7 +374,7 @@ await page.evaluate((bytes) => {
 }, Array.from(midi));
 await page.locator(".midi-import-box").waitFor();
 await page.locator(".midi-import-box .modal-row", { hasText: "导入后格式" }).locator("select").selectOption("number");
-await page.getByRole("button", { name: "导入并转为简谱" }).click();
+await acceptFixtureImport(page, page.getByRole("button", { name: "导入并转为简谱" }));
 await page.locator(".midi-import-box").waitFor({ state: "detached" });
 await page.waitForTimeout(600);
 const midiNumber = await page.evaluate(() => ({

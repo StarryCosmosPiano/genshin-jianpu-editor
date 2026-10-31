@@ -2,7 +2,7 @@
 <html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
 
     <!-- 跨源隔离垫片：GitHub Pages 无法设响应头，用 SW 客户端补 COOP/COEP 以启用 SharedArrayBuffer
          （onnxruntime-web wasm 多线程，OMR 识别 ~2x）。相对路径以适配子路径部署；Tauri/dev 已原生发头
@@ -161,7 +161,9 @@
               <button id="btn-create" class="header-menu-item" type="button" role="menuitem">新建乐谱</button>
               <button id="btn-open" class="header-menu-item" type="button" role="menuitem">打开文件</button>
               <button id="btn-import" class="header-menu-item" type="button" role="menuitem">导入乐谱</button>
+              <button id="btn-add-slashes" class="header-menu-item" type="button" role="menuitem">添加斜杠…</button>
               <button id="btn-saveas" class="header-menu-item" type="button" role="menuitem">另存为</button>
+              <button id="btn-backup-history" class="header-menu-item" type="button" role="menuitem">恢复历史…</button>
               <div class="header-menu-separator" role="separator"></div>
               <button id="btn-mixed" class="header-menu-item" type="button" role="menuitem" disabled>混排</button>
               <button id="btn-recognize" class="header-menu-item" type="button" role="menuitem" disabled>识图</button>
@@ -176,6 +178,15 @@
           </div>
           <button id="btn-save" type="button" aria-label="保存"><span aria-hidden="true">▣</span><span>保存</span></button>
           <button id="btn-export" type="button" aria-label="导出"><span aria-hidden="true">↗</span><span>导出</span></button>
+          <button id="btn-midi-input" type="button" aria-label="连接 MIDI 输入设备" aria-pressed="false" title="连接 MIDI 键盘或其他 MIDI 输入设备"><span aria-hidden="true">♪</span><span>MIDI</span></button>
+          <button id="btn-score-settings" type="button" aria-label="乐谱设置" data-inspector-trigger="score" aria-controls="inspector-pane" aria-expanded="false" title="当前乐谱设置"><span aria-hidden="true">♭</span><span>乐谱</span></button>
+          <button id="btn-layout-style" type="button" aria-label="排版设置" data-inspector-trigger="layout" aria-controls="inspector-pane" aria-expanded="false" title="简谱排版设置"><span aria-hidden="true">▤</span><span>排版</span></button>
+          <div id="staff-view-toolbar">
+            <label for="staff-view-select">视图</label>
+            <select id="staff-view-select" aria-label="乐谱视图"><option value="jianpu">简谱</option><option value="staff">五线谱</option><option value="compare">对照</option></select>
+            <span id="staff-view-reason" role="status"></span>
+          </div>
+          <button id="btn-workspace-mode" type="button" aria-label="工作区模式" title="切换手机、平板或桌面工作区"><span aria-hidden="true">▣</span><span>工作区</span></button>
           <button id="btn-options" type="button" aria-label="设置" title="应用设置"><span aria-hidden="true">⚙</span><span>设置</span></button>
           <button id="btn-help" type="button" aria-label="帮助" title="帮助与记谱法"><span aria-hidden="true">?</span><span>帮助</span></button>
         </div>
@@ -186,6 +197,7 @@
           <button id="btn-select-mode" type="button" aria-label="选择" aria-pressed="true"><span aria-hidden="true">⌖</span><span>选择</span></button>
           <button id="btn-input-mode" type="button" aria-label="打谱" aria-pressed="false"><span aria-hidden="true">✎</span><span>打谱</span></button>
         </div>
+        <button id="btn-chord-mode" type="button" aria-label="和弦模式" aria-pressed="false" title="和弦模式：保留当前音符，继续添加和弦音"><span aria-hidden="true">＋</span><span>和弦</span></button>
         <span class="sep" aria-hidden="true"></span>
         <button id="btn-undo" type="button" title="撤销"><span aria-hidden="true">↶</span><span>撤销</span></button>
         <button id="btn-redo" type="button" title="重做"><span aria-hidden="true">↷</span><span>重做</span></button>
@@ -222,14 +234,6 @@
             <button id="input-duration-dot-toggle" type="button" data-dot-mode="duration" aria-label="书写附点" aria-pressed="false" title="书写附点">附点</button>
           </div>
         </div>
-        <span class="sep" aria-hidden="true"></span>
-        <button id="btn-score-settings" type="button" aria-label="乐谱设置" data-inspector-trigger="score" aria-controls="inspector-pane" aria-expanded="false" title="当前乐谱设置"><span aria-hidden="true">♭</span><span>乐谱</span></button>
-        <button id="btn-layout-style" type="button" aria-label="排版设置" data-inspector-trigger="layout" aria-controls="inspector-pane" aria-expanded="false" title="简谱排版设置"><span aria-hidden="true">▤</span><span>排版</span></button>
-        <div id="staff-view-toolbar">
-          <label for="staff-view-select">视图</label>
-          <select id="staff-view-select" aria-label="乐谱视图"><option value="jianpu">简谱</option><option value="compare">对照</option><option value="staff">五线谱</option></select>
-          <span id="staff-view-reason" role="status"></span>
-        </div>
       </div>
 
       <div id="body" data-code-pane-side="left">
@@ -246,7 +250,7 @@
           <div id="score-surfaces-content">
             <main id="score-pane" tabindex="0" aria-label="简谱预览"></main>
             <div id="staff-divider" role="separator" aria-label="调整对照宽度" aria-orientation="vertical" tabindex="0" hidden></div>
-            <section id="staff-pane" tabindex="0" aria-label="五线谱预览，只读" hidden><div id="staff-preview-status" role="status"></div><div id="staff-pages"></div></section>
+            <section id="staff-pane" tabindex="0" aria-label="五线谱编辑" hidden><div id="staff-preview-status" role="status"></div><div id="staff-pages"></div></section>
           </div>
         </section>
         <aside id="inspector-pane" hidden></aside>

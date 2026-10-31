@@ -2174,6 +2174,7 @@ dependencies = [
  "ort",
  "serde",
  "serde_json",
+ "sha2",
  "svg2pdf",
  "tauri",
  "tauri-build",

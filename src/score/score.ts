@@ -6,6 +6,7 @@
 
 import { Fraction } from "../common/fraction";
 import { BarStyle, StartStopDiscontinue } from "./enums";
+import type { HeaderTypography } from "./header-typography";
 
 export { BarStyle, StartStopDiscontinue };
 
@@ -357,6 +358,9 @@ export class Chord extends Entry {
    * where every sounding note in the written chord belongs to the roll.
    */
   arpeggioPitches: number[] | null = null;
+  /** Independent rolled subsets within this chord. Null keeps the legacy
+   * single group described by arpeggioPitches (or the complete chord). */
+  arpeggioPitchGroups: number[][] | null = null;
   dot = 0;
   beams = 0; // 减时线
   beats = 0; // 增时线
@@ -838,6 +842,7 @@ export class Score {
   credit: Credit[] = [];
   title = "";
   subtitle = "";
+  headerTypography?: HeaderTypography;
   arranger = "";
   /** Displayed before the first paired piano system. */
   instrumentName = "";

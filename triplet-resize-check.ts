@@ -8,7 +8,7 @@ import {
 } from "./src/slashscore";
 
 const z = "\u2063";
-const source = `键盘谱\n4/4拍：\n点=16分音符\n(V${z}G).${z}W.${z}Y.(A${z}W)./.(V${z}W).A.${z}W./B.${z}Q.${z}U.(M${z}J)./.(B${z}Q).M.${z}W./\n`;
+const source = `键盘谱\n4/4拍：\n点=16分音符\n方括号=三连音\n(V${z}G).${z}W.${z}Y.(A${z}W)./.(V${z}W).A.${z}W./B.${z}Q.${z}U.(M${z}J)./.(B${z}Q).M.${z}W./\n`;
 const options = {
   ...defaultSlashScoreOptions("keyboard", analyzeSlashScore(source)),
   voiceCount: 2, symbolDurations: { ".": 16 as const }, spaceDivision: null, noteDivision: null,

@@ -3,6 +3,7 @@ import { BarStyle, Chord, MusicCommon, tempoBpmForUnit, type Measure, type Note,
 import { clefForPart, spellPitch } from "../score/musicxml-export";
 import type { StaffNoteRef, StaffPreviewSnapshot } from "./types";
 import { staffNavigationDiagnostics, staffNavigationLabels } from "./renderer-navigation";
+import type { StaffHeaderField } from "./types";
 
 export interface StaffPitch {
   /** Unique drawing id; split notes retain the same semantic ref. */
@@ -59,7 +60,7 @@ export interface StaffModel {
   snapshot: StaffPreviewSnapshot;
   title: string;
   subtitle: string;
-  credits: string[];
+  credits: Array<{ field: StaffHeaderField; text: string }>;
   staves: Array<{ partIndex: number; clef: "treble" | "bass"; label: string }>;
   measures: StaffMeasure[];
   /** Endpoints are StaffPitch.id, including synthetic split segments. */
@@ -103,8 +104,9 @@ export function buildStaffModel(snapshot: StaffPreviewSnapshot): StaffModel {
   const model: StaffModel = {
     revision: snapshot.revision, score, snapshot,
     title: score.title, subtitle: score.subtitle,
-    credits: [score.lyricist && `作词：${score.lyricist}`, score.composer && `作曲：${score.composer}`,
-      score.arranger && `编曲：${score.arranger}`].filter((value): value is string => Boolean(value)),
+    credits: ([{ field: "lyricist", text: score.lyricist && `作词：${score.lyricist}` },
+      { field: "composer", text: score.composer && `作曲：${score.composer}` },
+      { field: "arranger", text: score.arranger && `编曲：${score.arranger}` }] as Array<{ field: StaffHeaderField; text: string }>).filter(value => Boolean(value.text)),
     staves: score.parts.map((part, partIndex) => ({ partIndex,
       clef: score.piano ? partIndex === 0 ? "treble" : "bass" : clefForPart(part).sign === "F" ? "bass" : "treble",
       label: part.instrumentName || (score.piano ? partIndex === 0 ? "右手" : "左手" : score.instrumentName),

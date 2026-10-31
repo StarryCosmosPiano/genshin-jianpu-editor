@@ -1,10 +1,10 @@
-// Browser regression for real-page watermark preview and downloaded PNG/PDF.
+// Browser regression for real-page watermark preview and saved PNG/PDF.
 // Run after npm run build: node watermark-export-check.mjs
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { extname, join, normalize } from "node:path";
-import { chromium } from "playwright";
+import { installSavePickerTestBridge, launchSaveCheckBrowser } from "./browser-save-test-helpers.mjs";
 import { unzipSync } from "fflate";
 
 const root = join(process.cwd(), "dist");
@@ -19,9 +19,18 @@ const server = createServer(async (req, res) => {
   } catch { res.writeHead(404); res.end(); }
 });
 await new Promise((resolve) => server.listen(0, resolve));
-const browser = await chromium.launch({ channel: "msedge", headless: true });
+const browser = await launchSaveCheckBrowser();
 const page = await browser.newPage({ viewport: { width: 1280, height: 900 }, acceptDownloads: true });
+const savedFiles = await installSavePickerTestBridge(page);
 const errors = [];
+const assertSymmetric = (positions) => {
+  for (const [x, y] of positions) {
+    assert.ok(positions.some(([px, py]) => Math.abs(px - (1 - x)) < 1e-9 && Math.abs(py - y) < 1e-9),
+      "watermark centers must reflect horizontally");
+    assert.ok(positions.some(([px, py]) => Math.abs(px - x) < 1e-9 && Math.abs(py - (1 - y)) < 1e-9),
+      "watermark centers must reflect vertically");
+  }
+};
 page.on("pageerror", (error) => errors.push(error.message));
 try {
   await page.goto(`http://localhost:${server.address().port}/`, { waitUntil: "networkidle" });
@@ -35,12 +44,16 @@ try {
   const marked = async (text = "原琴助手") => {
     const controls = page.locator(".watermark-controls");
     await controls.locator("input[type=checkbox]").first().check();
-    await controls.locator("input[type=text]").fill(text);
+    await controls.getByLabel("水印文字", { exact: true }).fill(text);
     const state = await page.locator(".watermark-preview svg").evaluate((svg) => {
       const marks = [...svg.querySelectorAll("g.export-watermark text")];
       const box = svg.viewBox.baseVal;
       return {
         count: marks.length,
+        positions: marks.map((mark) => [
+          (Number(mark.getAttribute("x")) - box.x) / box.width,
+          (Number(mark.getAttribute("y")) - box.y) / box.height,
+        ]),
         opacity: svg.querySelector("g.export-watermark")?.getAttribute("fill-opacity"),
         central: [Number(marks[0]?.getAttribute("x")), Number(marks[0]?.getAttribute("y"))],
         middle: [box.x + box.width / 2, box.y + box.height / 2],
@@ -54,7 +67,8 @@ try {
         })(),
       };
     });
-    assert.equal(state.count, 7);
+    assert.ok(state.count > 1, "default density tiles the page");
+    assertSymmetric(state.positions);
     assert.equal(state.opacity, "0.1");
     assert.deepEqual(state.central, state.middle);
     assert.ok(state.centerFits, "the central watermark must remain fully on the page");
@@ -76,7 +90,7 @@ try {
   await page.locator(".watermark-controls label", { hasText: "透明背景" }).locator("input").check();
   const zip = page.locator(".watermark-controls label", { hasText: "ZIP" }).locator("input");
   if (await zip.count()) await zip.uncheck();
-  const plainPngEvent = page.waitForEvent("download");
+  const plainPngEvent = savedFiles.nextExport();
   await page.locator(".watermark-dialog footer button.primary").click();
   const plainPng = await plainPngEvent;
   const plainPngBytes = await readFile(await plainPng.path());
@@ -84,8 +98,30 @@ try {
   await openExport("PNG（全部页面）");
   const escaped = await marked("<&水印>");
   assert.ok(escaped.xml.includes("&lt;&amp;水印&gt;"));
+  let previousDensityCount = 0;
+  let previousSpacing = Infinity;
+  for (let density = 1; density <= 15; density++) {
+    await page.locator(".watermark-controls input[type=range]").nth(1).fill(String(density));
+    const grid = await page.locator(".watermark-preview svg").evaluate((svg) => {
+      const box = svg.viewBox.baseVal;
+      const centers = [...svg.querySelectorAll(".export-watermark text")].map((mark) =>
+        [Number(mark.getAttribute("x")) - box.x, Number(mark.getAttribute("y")) - box.y]);
+      let spacing = Infinity;
+      for (let a = 0; a < centers.length; a++) for (let b = a + 1; b < centers.length; b++) {
+        spacing = Math.min(spacing, Math.hypot(centers[a][0] - centers[b][0], centers[a][1] - centers[b][1]));
+      }
+      return { positions: centers.map(([x, y]) => [x / box.width, y / box.height]), spacing };
+    });
+    assertSymmetric(grid.positions);
+    assert.ok(grid.positions.length >= previousDensityCount, "increasing density must keep complete reflected rows");
+    assert.ok(grid.spacing <= previousSpacing, "increasing density reduces physical grid spacing");
+    if (Number.isFinite(previousSpacing)) assert.ok(grid.spacing < previousSpacing, "density changes spacing even at the same mark count");
+    previousDensityCount = grid.positions.length;
+    previousSpacing = grid.spacing;
+  }
   await page.locator(".watermark-controls input[type=range]").nth(1).fill("9");
-  assert.equal(await page.locator(".watermark-preview .export-watermark text").count(), 9);
+  assert.ok(await page.locator(".watermark-preview .export-watermark text").count() > escaped.count,
+    "increasing density should add complete symmetric rows, rather than request nine individual marks");
   await page.locator(".watermark-controls input[type=range]").nth(1).fill("7");
   await page.locator(".watermark-controls input[type=range]").first().fill("23");
   assert.equal(await page.locator(".watermark-preview .export-watermark").getAttribute("fill-opacity"), "0.23");
@@ -94,7 +130,7 @@ try {
   await page.locator(".watermark-controls input[type=range]").first().fill("10");
   assert.equal(await page.locator("#score-pane svg.score-page").first().evaluate((svg) => svg.outerHTML), sourceBefore);
   if (await zip.count()) await zip.uncheck();
-  const pngDownload = page.waitForEvent("download");
+  const pngDownload = savedFiles.nextExport();
   await page.locator(".watermark-dialog footer button.primary").click();
   const png = await pngDownload;
   const pngBytes = await readFile(await png.path());
@@ -104,13 +140,13 @@ try {
 
   await openExport("PDF（全部页面）");
   await page.locator(".watermark-controls input[type=checkbox]").first().uncheck();
-  const plainPdfEvent = page.waitForEvent("download");
+  const plainPdfEvent = savedFiles.nextExport();
   await page.locator(".watermark-dialog footer button.primary").click();
   const plainPdf = await plainPdfEvent;
   const plainPdfBytes = await readFile(await plainPdf.path());
   await openExport("PDF（全部页面）");
   await marked("<&水印>");
-  const pdfDownload = page.waitForEvent("download");
+  const pdfDownload = savedFiles.nextExport();
   await page.locator(".watermark-dialog footer button.primary").click();
   const pdf = await pdfDownload;
   const pdfBytes = await readFile(await pdf.path());
@@ -119,13 +155,14 @@ try {
   assert.ok(pdfBytes.length > 10000);
   assert.notDeepEqual(pdfBytes, plainPdfBytes, "watermark must change the rasterized PDF page");
   await openExport("PPTX（矢量）");
-  await marked("<&水印>");
-  const pptxEvent = page.waitForEvent("download");
+  const pptxPreview = await marked("<&水印>");
+  const pptxEvent = savedFiles.nextExport();
   await page.locator(".watermark-dialog footer button.primary").click();
   const pptx = await pptxEvent;
   const pptxBytes = await readFile(await pptx.path());
   const slide = Buffer.from(unzipSync(pptxBytes)["ppt/slides/slide1.xml"]).toString("utf8");
-  assert.equal((slide.match(/<a:alpha val="10000"\/>/g) ?? []).length, 7);
+  assert.equal((slide.match(/<a:alpha val="10000"\/>/g) ?? []).length, pptxPreview.count,
+    "PPTX uses the same density grid as its preview");
   assert.ok(slide.includes("&lt;&amp;水印&gt;"));
   assert.equal(await page.locator("#score-pane svg.score-page").first().evaluate((svg) => svg.outerHTML), sourceBefore);
 
@@ -159,10 +196,10 @@ try {
     return [children[0]?.tagName, children[1]?.classList.contains("export-watermark")];
   });
   assert.deepEqual(staffPreview, ["rect", true], "opaque staff watermark must paint above its white background");
-  await page.locator(".watermark-controls input[type=text]").fill("原琴助手");
+  await page.locator(".watermark-controls").getByLabel("水印文字", { exact: true }).fill("原琴助手");
   const staffShot = join(shotRoot, "staff-watermark-preview.png");
   await page.locator(".watermark-dialog").screenshot({ path: staffShot });
-  await page.locator(".watermark-controls input[type=text]").fill("五线谱水印");
+  await page.locator(".watermark-controls").getByLabel("水印文字", { exact: true }).fill("五线谱水印");
   await backgroundOption.check();
   await page.locator(".watermark-controls input[type=range]").first().fill("42");
   await page.locator(".watermark-dialog footer button", { hasText: "取消" }).click();
@@ -170,7 +207,7 @@ try {
   assert.equal(await page.locator(".watermark-controls input[type=range]").first().inputValue(), "10",
     "cancel must not persist draft settings");
   await marked("五线谱水印");
-  const staffPngEvent = page.waitForEvent("download");
+  const staffPngEvent = savedFiles.nextExport();
   await page.locator(".watermark-dialog footer button.primary").click();
   const staffPng = await staffPngEvent;
   const staffPngBytes = await readFile(await staffPng.path());
@@ -193,7 +230,7 @@ try {
   assert.equal(cornerAlpha, 0, "transparent staff PNG must have a transparent page corner");
   await writeFile(join(shotRoot, "staff-export.png"), staffPngPage);
   await openExport("PDF（全部页面）");
-  const staffPdfEvent = page.waitForEvent("download");
+  const staffPdfEvent = savedFiles.nextExport();
   await page.locator(".watermark-dialog footer button.primary").click();
   const staffPdf = await staffPdfEvent;
   const staffPdfBytes = await readFile(await staffPdf.path());
@@ -207,6 +244,7 @@ try {
   const jpegLength = Number(/\/Length (\d+)/.exec(staffPdfBytes.subarray(imageAt, streamAt).toString("ascii"))?.[1]);
   assert.ok(jpegLength > 0);
   await writeFile(join(shotRoot, "staff-pdf-first-page.jpg"), staffPdfBytes.subarray(streamAt, streamAt + jpegLength));
+  savedFiles.assertNoDownloads();
   assert.deepEqual(errors, []);
   console.log("watermark export: preview, escape, density, source isolation, PNG, PDF, PPTX and staff pages passed");
   console.log(`screenshots: ${previewShot}; ${staffShot}`);

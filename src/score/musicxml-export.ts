@@ -11,8 +11,10 @@ import {
   type TempoBeatUnit,
 } from "./score";
 import { scorePartBaseName, scorePartTrackName } from "./part-label";
+import { chordArpeggioNoteGroups } from "./arpeggio";
 
 const DIVISIONS = 1920;
+const CROSS_PART_ARPEGGIO_FIELD = "jpeditor-cross-part-arpeggios";
 const STEP_PITCH: Record<string, number> = {
   C: 0,
   D: 2,
@@ -159,11 +161,125 @@ function lyricXml(note: Note): string {
   }).join("");
 }
 
+interface ArpeggiateXml {
+  number: number;
+  direction: "up" | "down";
+}
+
+interface ExportArpeggioGroup {
+  notes: Note[];
+  direction: "up" | "down";
+  crossPart: boolean;
+  numbers: Map<Note, number>;
+}
+
+function arpeggioExport(score: Score): {
+  notes: Map<Note, ArpeggiateXml[]>;
+  crossPartMetadata: string;
+} {
+  const locations = new Map<Note, { part: number; order: number }>();
+  const groups: ExportArpeggioGroup[] = [];
+  score.parts.forEach((part, partIndex) => {
+    for (const measure of part.measures) {
+      // Match the voice/position order used by measureContents. Number-level
+      // values may be reused only after the previous group ends in XML order.
+      const chords = measure.entries
+        .filter((entry): entry is Chord => entry instanceof Chord && entry.duration !== undefined)
+        .sort((left, right) => Math.max(1, left.voice || 1) - Math.max(1, right.voice || 1)
+          || left.position.compareTo(right.position));
+      let order = 0;
+      for (const chord of chords) {
+        if (chord.rest) continue;
+        for (const note of chord.notes) {
+          if (!note.rest && !note.softDeleted) locations.set(note, { part: partIndex, order: order++ });
+        }
+        for (const notes of chordArpeggioNoteGroups(chord)) {
+          groups.push({ notes, direction: "up", crossPart: false, numbers: new Map() });
+        }
+      }
+    }
+  });
+  for (const mark of score.crossPartArpeggios) {
+    const selected: Note[] = [];
+    for (const member of mark.pitches) {
+      const measure = score.parts[member.part]?.measures[mark.measure];
+      const note = measure?.entries.flatMap(entry =>
+        entry instanceof Chord && entry.position.equals(mark.offset) ? entry.notes : [])
+        .find(candidate => candidate.pitch === member.pitch && locations.has(candidate)
+          && !selected.includes(candidate));
+      if (note) selected.push(note);
+    }
+    if (new Set(selected.map(note => locations.get(note)!.part)).size < 2) continue;
+    groups.push({ notes: selected, direction: mark.direction, crossPart: true, numbers: new Map() });
+  }
+
+  interface GroupRange {
+    group: ExportArpeggioGroup;
+    notes: Note[];
+    first: number;
+    last: number;
+    offset: Fraction;
+    number: number;
+  }
+  const ranges = new Map<string, GroupRange[]>();
+  for (const group of groups) {
+    const byPart = new Map<number, Note[]>();
+    for (const note of group.notes) {
+      const part = locations.get(note)!.part;
+      const members = byPart.get(part) ?? [];
+      members.push(note);
+      byPart.set(part, members);
+    }
+    for (const [part, notes] of byPart) {
+      const key = `${part}:${notes[0].chord.measure.index}`;
+      const items = ranges.get(key) ?? [];
+      const orders = notes.map(note => locations.get(note)!.order);
+      items.push({ group, notes, first: Math.min(...orders), last: Math.max(...orders),
+        offset: notes[0].chord.position, number: 0 });
+      ranges.set(key, items);
+    }
+  }
+  const notes = new Map<Note, ArpeggiateXml[]>();
+  for (const items of ranges.values()) {
+    const assigned: GroupRange[] = [];
+    for (const item of items.sort((left, right) => left.first - right.first)) {
+      const unavailable = new Set(assigned.filter(previous => previous.last >= item.first
+        || previous.offset.equals(item.offset)).map(previous => previous.number));
+      let number = 1;
+      while (unavailable.has(number)) number++;
+      if (number > 16) throw new Error("同一谱行同时存在超过 16 组琶音，超出 MusicXML 组号范围");
+      item.number = number;
+      assigned.push(item);
+      for (const note of item.notes) {
+        item.group.numbers.set(note, number);
+        const values = notes.get(note) ?? [];
+        values.push({ number, direction: item.group.direction });
+        notes.set(note, values);
+      }
+    }
+  }
+  // Each Score.Part is currently a separate MusicXML <part>. Standard numbers
+  // are scoped to that part, so retain cross-part intent as explicit metadata;
+  // an external reader still receives legal per-note arpeggiate markers.
+  const crossPart = groups.filter(group => group.crossPart).map(group => ({
+    measure: group.notes[0].chord.measure.index,
+    offset: group.notes[0].chord.position.toString(),
+    direction: group.direction,
+    pitches: group.notes.map(note => ({
+      part: `P${locations.get(note)!.part + 1}`,
+      pitch: note.pitch,
+      number: group.numbers.get(note)!,
+    })),
+  }));
+  return { notes, crossPartMetadata: crossPart.length > 0 ? JSON.stringify(crossPart) : "" };
+}
+
 function notationXml(
   chord: Chord,
   note: Note,
   noteIndex: number,
   rhythm: WrittenRhythm,
+  arpeggios: Map<Note, ArpeggiateXml[]>,
 ): string {
   const values: string[] = [];
   if (note.tieEnd) values.push('<tied type="stop"/>');
@@ -173,10 +289,10 @@ function notationXml(
   if (note.tupletEnd) values.push('<tuplet type="stop" number="1"/>');
   if (note.tupletBegin) values.push('<tuplet type="start" number="1"/>');
   if (noteIndex === 0 && chord.fermata) values.push("<fermata/>");
-  const inArpeggio = chord.arpeggio && (
-    chord.arpeggioPitches === null || chord.arpeggioPitches.includes(note.pitch)
-  );
-  if (inArpeggio) values.push("<arpeggiate/>");
+  for (const arpeggio of arpeggios.get(note) ?? []) {
+    values.push(`<arpeggiate number="${arpeggio.number}"`
+      + `${arpeggio.direction === "down" ? ' direction="down"' : ""}/>`);
+  }
   if (noteIndex === 0 && chord.ornaments.length > 0) {
     const ornaments = chord.ornaments.map((ornament) =>
       ornament.kind === "upper-mordent" ? "<inverted-mordent/>"
@@ -198,6 +314,7 @@ function noteXml(
   noteIndex: number,
   voice: number,
   fifths: number,
+  arpeggios: Map<Note, ArpeggiateXml[]>,
 ): string {
   const rhythm = writtenRhythm(chord);
   const rest = note === null || chord.rest || note.rest;
@@ -228,7 +345,7 @@ function noteXml(
     + ties
     + `<voice>${voice}</voice>`
     + `<type>${rhythm.type}</type>${dots}${accidental}${timeModification}`
-    + `${rest || !note ? "" : notationXml(chord, note, noteIndex, rhythm)}`
+    + `${rest || !note ? "" : notationXml(chord, note, noteIndex, rhythm, arpeggios)}`
     + `${rest || !note ? "" : lyricXml(note)}`
     + "</note>";
 }
@@ -242,7 +359,7 @@ function graceNoteXml(note: Note, voice: number, fifths: number): string {
     + `<voice>${voice}</voice><type>16th</type></note>`;
 }
 
-function chordXml(chord: Chord, voice: number, fifths: number): string {
+function chordXml(chord: Chord, voice: number, fifths: number, arpeggios: Map<Note, ArpeggiateXml[]>): string {
   const notes = chord.notes.filter((note) => !note.softDeleted);
   const sounding = notes.filter((note) => !note.rest);
   const grace = chord.graceNotes
@@ -250,10 +367,10 @@ function chordXml(chord: Chord, voice: number, fifths: number): string {
     .map((note) => graceNoteXml(note, voice, fifths))
     .join("");
   if (chord.rest || sounding.length === 0) {
-    return grace + noteXml(chord, notes[0] ?? null, 0, voice, fifths);
+    return grace + noteXml(chord, notes[0] ?? null, 0, voice, fifths, arpeggios);
   }
   return grace + sounding
-    .map((note, index) => noteXml(chord, note, index, voice, fifths))
+    .map((note, index) => noteXml(chord, note, index, voice, fifths, arpeggios))
     .join("");
 }
 
@@ -358,7 +475,10 @@ function barlineXml(measure: Measure, location: "left" | "right"): string {
     + "</barline>";
 }
 
-function measureContents(score: Score, part: Part, measure: Measure, partIndex: number): string {
+function measureContents(
+  score: Score, part: Part, measure: Measure, partIndex: number,
+  arpeggios: Map<Note, ArpeggiateXml[]>,
+): string {
   const clef = clefForPart(part);
   let result = "";
   // Deliberately leave page and system breaks to the destination application.
@@ -404,7 +524,7 @@ function measureContents(score: Score, part: Part, measure: Measure, partIndex: 
         const keyMark = keyMarks[keyMarkIndex++];
         if (keyMark.offset.compareTo(new Fraction(0)) > 0) result += keyAttributes(keyMark.fifths);
       }
-      result += chordXml(chord, voice, measure.key.fifths);
+      result += chordXml(chord, voice, measure.key.fifths, arpeggios);
       cursor = position + ticks(chord.duration ?? new Fraction(0));
     }
     previousCursor = cursor;
@@ -472,18 +592,20 @@ function partListXml(score: Score): string {
   }).join("");
 }
 
-function identificationXml(score: Score): string {
+function identificationXml(score: Score, crossPartMetadata: string): string {
   const creators = new Map(score.creator);
   if (score.composer) creators.set("composer", score.composer);
   if (score.arranger) creators.set("arranger", score.arranger);
   if (score.lyricist) creators.set("lyricist", score.lyricist);
-  if (creators.size === 0) return "";
+  if (creators.size === 0 && !crossPartMetadata) return "";
   return "<identification>"
     + [...creators]
       .filter(([, value]) => value.trim().length > 0)
       .map(([type, value]) => `<creator type="${xml(type)}">${xml(value)}</creator>`)
       .join("")
     + "<encoding><software>JPEditor</software></encoding>"
+    + (crossPartMetadata ? `<miscellaneous><miscellaneous-field name="${CROSS_PART_ARPEGGIO_FIELD}">`
+      + xml(crossPartMetadata) + "</miscellaneous-field></miscellaneous>" : "")
     + "</identification>";
 }
 
@@ -502,6 +624,7 @@ function creditsXml(score: Score): string {
 /** Serialize the editable jianpu Score as standards-based MusicXML partwise. */
 export function scoreToMusicXml(score: Score): string {
   if (score.parts.length === 0) throw new Error("当前乐谱没有可导出的声部");
+  const arpeggios = arpeggioExport(score);
   const partList = partListXml(score);
   const parts = score.parts.map((part, partIndex) => {
     const measures = part.measures.map((measure, measureIndex) => {
@@ -510,7 +633,7 @@ export function scoreToMusicXml(score: Score): string {
         : String(measure.displayNumber ?? measureIndex + 1);
       const implicit = measure.pickup || measure.displayNumber === null ? ' implicit="yes"' : "";
       return `<measure number="${xml(number)}"${implicit}>`
-        + measureContents(score, part, measure, partIndex)
+        + measureContents(score, part, measure, partIndex, arpeggios.notes)
         + "</measure>";
     }).join("");
     return `<part id="P${partIndex + 1}">${measures}</part>`;
@@ -521,7 +644,7 @@ export function scoreToMusicXml(score: Score): string {
     + '<score-partwise version="4.0">'
     + `${score.title ? `<work><work-title>${xml(score.title)}</work-title></work>` : ""}`
     + `${score.subtitle ? `<movement-title>${xml(score.subtitle)}</movement-title>` : ""}`
-    + identificationXml(score)
+    + identificationXml(score, arpeggios.crossPartMetadata)
     + creditsXml(score)
     + `<part-list>${partList}</part-list>${parts}</score-partwise>`;
 }

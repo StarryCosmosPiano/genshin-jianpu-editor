@@ -10,6 +10,7 @@ import {
 import { Fraction } from "../common/fraction";
 import { scorePartBaseName, scorePartTrackName } from "../score/part-label";
 import { fileStem } from "./file-format";
+import { blockImportBackground } from "../ui/import-dialog";
 import type {
   MidiOutputFormat,
   MidiQuantizeDivision,
@@ -429,15 +430,14 @@ export function showMusicXmlImportDialog(
     );
     overlay.append(box);
     document.body.append(overlay);
+    const releaseBackground = blockImportBackground(overlay);
 
     const close = (value: MusicXmlImportOptions | null): void => {
       overlay.remove();
+      releaseBackground();
       resolve(value);
     };
     cancel.onclick = () => close(null);
-    overlay.onclick = (event) => {
-      if (event.target === overlay) close(null);
-    };
     confirm.onclick = () => {
       const textOutput = format.value === "keyboard" || format.value === "number";
       close({

@@ -1,5 +1,6 @@
 import { Fraction } from "../common/fraction";
 import { Chord, KeyMark, MusicCommon, Note, Score } from "./score";
+import { chordArpeggioNoteGroups, setChordArpeggioPitchGroups } from "./arpeggio";
 
 function anchorCompare(
   left: { measure: number; offset: Fraction },
@@ -85,6 +86,23 @@ export function applyKeyChangeKeepingDegrees(
   }
   if (delta === 0) return true;
 
+  // Capture written note identities before transposing any member. Pitch-only
+  // matching afterwards can attach a wave to a different, unselected unison.
+  const localGroups = score.parts.flatMap(scorePart => scorePart.measures.flatMap(measure =>
+    measure.entries.flatMap(entry => entry instanceof Chord && entry.arpeggio
+      ? [{ chord: entry, groups: chordArpeggioNoteGroups(entry) }] : [])));
+  const crossMembers = score.crossPartArpeggios.flatMap(mark => {
+    const available = new Map([...new Set(mark.pitches.map(member => member.part))].map(index => [index,
+      score.parts[index]?.measures[mark.measure]?.entries.flatMap(entry =>
+        entry instanceof Chord && entry.position.equals(mark.offset)
+          ? entry.notes.filter(note => !note.rest && !note.softDeleted) : []) ?? []]));
+    return mark.pitches.flatMap(member => {
+      const notes = available.get(member.part) ?? [];
+      const index = notes.findIndex(note => note.pitch === member.pitch);
+      return index < 0 ? [] : [{ member, note: notes.splice(index, 1)[0] }];
+    });
+  });
+
   for (const scorePart of score.parts) {
     for (const measure of scorePart.measures) {
       for (const entry of measure.entries) {
@@ -100,5 +118,9 @@ export function applyKeyChangeKeepingDegrees(
       }
     }
   }
+  for (const { chord, groups } of localGroups) {
+    setChordArpeggioPitchGroups(chord, groups.map(group => group.map(note => note.pitch)));
+  }
+  for (const { member, note } of crossMembers) member.pitch = note.pitch;
   return true;
 }

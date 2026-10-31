@@ -2181,7 +2181,7 @@ check(voicedRows.length === 1
 
 // A cursor-created triplet rest keeps the U+2063 voice immediately before 0;
 // the parser must not silently move it into the unmarked/default voice.
-const scopedTripletText = `键盘谱\n4/4拍：\n点=16分音符\n[(N${SLASH_VOICE_SEPARATOR}D${SLASH_VOICE_SEPARATOR}G).${SLASH_VOICE_SEPARATOR}A.${SLASH_VOICE_SEPARATOR}0.]${SLASH_VOICE_SEPARATOR}N.(${SLASH_VOICE_SEPARATOR}D${SLASH_VOICE_SEPARATOR}G)./..../..../..../\n`;
+const scopedTripletText = `键盘谱\n4/4拍：\n点=16分音符\n方括号=三连音\n[(N${SLASH_VOICE_SEPARATOR}D${SLASH_VOICE_SEPARATOR}G).${SLASH_VOICE_SEPARATOR}A.${SLASH_VOICE_SEPARATOR}0.]${SLASH_VOICE_SEPARATOR}N.(${SLASH_VOICE_SEPARATOR}D${SLASH_VOICE_SEPARATOR}G)./..../..../..../\n`;
 const scopedTripletOptions = {
   ...defaultSlashScoreOptions("keyboard", analyzeSlashScore(scopedTripletText)),
   voiceCount: 2,
@@ -2201,7 +2201,7 @@ check(scopedTupleRest !== undefined
 
 // Even if all three time columns also contain lower-voice attacks, the
 // metadata written by the input cursor limits the created bracket to V1.
-const simultaneousScopedTripletText = `键盘谱\n4/4拍：\n点=16分音符\n[(${SLASH_VOICE_SEPARATOR}AZ).(${SLASH_VOICE_SEPARATOR}SX).(${SLASH_VOICE_SEPARATOR}DC).]../..../..../..../\n`;
+const simultaneousScopedTripletText = `键盘谱\n4/4拍：\n点=16分音符\n方括号=三连音\n[(${SLASH_VOICE_SEPARATOR}AZ).(${SLASH_VOICE_SEPARATOR}SX).(${SLASH_VOICE_SEPARATOR}DC).]../..../..../..../\n`;
 const simultaneousScopedTripletOptions: SlashScoreOptions = {
   ...defaultSlashScoreOptions("keyboard", analyzeSlashScore(simultaneousScopedTripletText)),
   voiceCount: 2,
@@ -2232,6 +2232,7 @@ check(simultaneousScopedTriplet.parts[0].measures[0].entries.some((entry) =>
 const mergedScopedText = `键盘谱
 4/4拍：
 . = 16分音符
+方括号=三连音
 (V${SLASH_VOICE_SEPARATOR}G).(${SLASH_VOICE_SEPARATOR}C${SLASH_VOICE_SEPARATOR}A).${SLASH_VOICE_SEPARATOR}N.(${SLASH_VOICE_SEPARATOR}D${SLASH_VOICE_SEPARATOR}G)./.${SLASH_VOICE_SEPARATOR}A.${SLASH_VOICE_SEPARATOR}N.${SLASH_VOICE_SEPARATOR}A./[(${SLASH_VOICE_SEPARATOR}D${SLASH_VOICE_SEPARATOR}G)(${SLASH_VOICE_SEPARATOR}A${SLASH_VOICE_SEPARATOR}S)${SLASH_VOICE_SEPARATOR}0]B.(${SLASH_VOICE_SEPARATOR}A${SLASH_VOICE_SEPARATOR}S).${SLASH_VOICE_SEPARATOR}N.(${SLASH_VOICE_SEPARATOR}D${SLASH_VOICE_SEPARATOR}G)./.${SLASH_VOICE_SEPARATOR}N.${SLASH_VOICE_SEPARATOR}A.${SLASH_VOICE_SEPARATOR}N./
 `;
 const mergedScopedOptions: SlashScoreOptions = {
@@ -2371,6 +2372,7 @@ check(moveResult?.changed
 const unequalVoiceTupletText = `键盘谱
 4/4拍：
 . = 16分音符
+方括号=三连音
 [(${SLASH_VOICE_SEPARATOR}AE)${SLASH_VOICE_SEPARATOR}B(${SLASH_VOICE_SEPARATOR}CF)G.].../..../..../..../
 `;
 const unequalVoiceTupletOptions: SlashScoreOptions = {
@@ -2425,6 +2427,7 @@ check(unequalV1.map((entry) => entry.position.toString()).join(",") === "0,1/12,
 const offsetVoiceTupletText = `键盘谱
 4/4拍：
 . = 16分音符
+方括号=三连音
 [${SLASH_VOICE_SEPARATOR}A${SLASH_VOICE_SEPARATOR}B(${SLASH_VOICE_SEPARATOR}CE).F.G.].../..../..../..../
 `;
 const offsetVoiceTupletOptions: SlashScoreOptions = {
@@ -2894,8 +2897,13 @@ check(thirdMemberInput.changed
   && thirdMemberInput.fixedTupletCell
   && thirdMemberInput.note?.tuplet !== null
   && thirdMemberCompact.includes("[(AG).D.WA.]")
-  && thirdMemberCompact.includes("(GW)")
-  && !thirdMemberCompact.includes("{GW}")
+  && thirdMemberCompact.includes("{GW}")
+  && !thirdMemberCompact.includes("(GW)")
+  && thirdMemberReload.score.crossPartArpeggios.some(mark =>
+    mark.measure === 0 && mark.offset.equals(new Fraction(3, 4))
+      && mark.pitches.length === 2
+      && mark.pitches.some(member => member.part === 1 && member.pitch === 67)
+      && mark.pitches.some(member => member.part === 0 && member.pitch === 74))
   && !thirdMemberCompact.includes("A..]")
   && !thirdMemberCompact.includes("]..0")
   && thirdMemberReload.summary.diagnostics.every((item) => item.severity !== "error")
@@ -3818,11 +3826,11 @@ check(sourcesAfterMalformedTriplet.some((source) => source.voiceIndex === 1
     && malformedTripletText.slice(source.from, source.to) === "C"),
 "a malformed earlier triplet swallowed later U+2063 voice coloring");
 
-// New delimiter defaults: braces are arpeggios, brackets are triplets, angles
-// are grace notes and parentheses remain simultaneous chords. Settings
+// Legacy saved delimiter defaults: braces are arpeggios, brackets are triplets,
+// angles are grace notes and parentheses remain simultaneous chords. Settings
 // migration follows the old semantic role rather than blindly reinterpreting
 // the characters.
-const delimiterText = `键盘谱\n4/4拍：\n点=16分音符\n{ABC}D/<Q>W.../(GH).../D.../\n`;
+const delimiterText = `键盘谱\n// @jpeditor {"k":"k"}\n4/4拍：\n点=16分音符\n{ABC}D/<Q>W.../(GH).../D.../\n`;
 const delimiterOptions = defaultSlashScoreOptions("keyboard", analyzeSlashScore(delimiterText));
 delimiterOptions.noteDivision = 16;
 delimiterOptions.symbolDurations = { ".": 16 };
@@ -4047,6 +4055,9 @@ check(trillOptions.braceMode === "trill"
 const mordentSourceText = `键盘谱
 4/4拍：
 . = 16分音符
+花括号=琶音
+方括号=三连音
+尖括号=细分
 D.E.F.G./-/-/-/
 `;
 const mordentSourceOptions = defaultSlashScoreOptions("keyboard", analyzeSlashScore(mordentSourceText));

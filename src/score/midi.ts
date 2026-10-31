@@ -11,6 +11,7 @@ import {
   PlayOptions,
   TempoTimeline,
   TimedNote,
+  Timeline,
 } from "./timeline";
 
 const PPQ = 960;
@@ -105,7 +106,12 @@ function partTrack(notes: TimedNote[], partIdx: number, trackName: string, opts?
 }
 
 export function scoreToMidi(score: Score, opts?: PlayOptions): Uint8Array {
-  const { notes, tempo } = buildTimeline(score);
+  return timelineToMidi(score, buildTimeline(score), opts);
+}
+
+/** Native playback consumes the same filtered events as browser playback. */
+export function timelineToMidi(score: Score, timeline: Timeline, opts?: PlayOptions): Uint8Array {
+  const { notes, tempo } = timeline;
   const ntracks = 1 + score.parts.length;
   const header = [
     0x4d, 0x54, 0x68, 0x64, 0, 0, 0, 6, // MThd, len 6

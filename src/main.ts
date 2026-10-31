@@ -8,6 +8,9 @@ import { loadBuiltInSample } from "./bootstrap/sample";
 import { wireWorkspace } from "./bootstrap/workspace";
 import { initializeTheme } from "./ui/theme";
 import { wireStaffPreview } from "./staff-preview/controller";
+import { initializeWorkspaceMode, isTouchWorkspace } from "./bootstrap/device-mode";
+import { wireMobileWorkspace } from "./bootstrap/mobile-workspace";
+import { initializeMobileFiles } from "./bootstrap/mobile-files";
 
 // Use the same Bravura font for measurement and drawing.
 async function registerBravura(): Promise<void> {
@@ -19,6 +22,7 @@ async function registerBravura(): Promise<void> {
 
 async function boot(): Promise<void> {
   initializeTheme();
+  initializeWorkspaceMode();
   await registerBravura();
   await ensureFontsReady([
     { family: "Bravura", size: 40 },
@@ -29,11 +33,6 @@ async function boot(): Promise<void> {
   const scorePane = document.getElementById("score-pane")!;
   const app = new App(meta, scorePane);
   app.loadSettings();
-  try {
-    await app.refreshSoundfonts();
-  } catch (error) {
-    console.warn("启动时读取 SF2 音源失败", error);
-  }
   const sample = await loadBuiltInSample();
   app.documentFormat = "keyboard";
   app.slashOptions = sample.options;
@@ -56,6 +55,18 @@ async function boot(): Promise<void> {
 
   await wireWorkspace(app, scorePane);
   wireStaffPreview(app);
+  wireMobileWorkspace(app);
+  initializeMobileFiles(app);
+  document.addEventListener("editor:update-ready", () => {
+    app.reportFileStatus("新版本已就绪。当前编辑会保留，请保存后手动刷新。");
+  });
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden && (isTouchWorkspace() || navigator.maxTouchPoints > 0)) app.stopPlayback();
+  });
+  window.addEventListener("pagehide", () => app.stopPlayback());
+  // Desktop keeps its catalog ready for settings; touch devices fetch it only
+  // when the user opens audio settings or plays with an SF2 selected.
+  if (!isTouchWorkspace()) void app.ensureSoundfonts().catch(error => console.warn("读取 SF2 音源失败", error));
   if (app.restoreLastFileOnStartup) await app.tryRestoreLastFile();
 }
 

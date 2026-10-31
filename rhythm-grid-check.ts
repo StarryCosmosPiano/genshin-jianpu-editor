@@ -1,0 +1,25 @@
+import assert from "node:assert/strict";
+import { buildRhythmGrid } from "./src/layout/rhythm-grid";
+
+const source = [{ tick: 0, x: 10 }, { tick: 1, x: 110 }, { tick: 1 + 1e-10, x: 112 }, { tick: 4, x: 410 }];
+const before = JSON.stringify(source);
+const auto = buildRhythmGrid({ anchors: source, endTick: 4, beats: 4, beatType: 4, automaticDivisions: [4, 16] })!;
+assert.equal(JSON.stringify(source), before, "ruler math mutated the engraving anchors");
+assert.equal(auto.division, 16);
+assert.equal(auto.gridAnchors.length, 16);
+assert.equal(auto.anchors[1].x, 111, "same-tick voices were not averaged");
+assert.equal(auto.gridAnchors[4].x, 111);
+assert.equal(auto.gridAnchors[2].x, 60.5, "empty ruler positions do not interpolate the actual columns");
+assert.equal(auto.endX, 410);
+const manual = buildRhythmGrid({ anchors: source, endTick: 4, beats: 4, beatType: 4, mode: "manual", manualDivision: 8, automaticDivisions: [64] })!;
+assert.equal(manual.division, 8, "manual ruler unexpectedly follows note subdivision");
+const dotted = buildRhythmGrid({ anchors: source, endTick: 4, beats: 4, beatType: 4, mode: "manual", manualDivision: 8, dotted: true })!;
+assert.equal(dotted.gridAnchors.length, 16);
+assert.deepEqual(dotted.gridAnchors.slice(0, 7).filter(anchor => !anchor.muted).map(anchor => anchor.tick), [0, .75, 1.5]);
+const compound = buildRhythmGrid({ anchors: [{ tick: 0, x: 20 }, { tick: 3, x: 320 }], endTick: 3, beats: 6, beatType: 8 })!;
+assert.equal(compound.majorStep, 1.5, "6/8 compound beats lost their grouping");
+const otherRenderer = buildRhythmGrid({ anchors: source.map(anchor => ({ tick: anchor.tick, x: anchor.x * 2 + 30 })), endTick: 4, beats: 4, beatType: 4, automaticDivisions: [4, 16] })!;
+assert.deepEqual(otherRenderer.gridAnchors.map(anchor => [anchor.tick, anchor.muted]), auto.gridAnchors.map(anchor => [anchor.tick, anchor.muted]), "renderers disagree on musical ruler ticks");
+for (let index = 0; index < auto.gridAnchors.length; index++) assert(Math.abs(otherRenderer.gridAnchors[index].x - (auto.gridAnchors[index].x * 2 + 30)) < 1e-6);
+assert.equal(buildRhythmGrid({ anchors: source, endTick: 0, beats: 4, beatType: 4 }), null);
+console.log("Shared rhythm grid checks passed");

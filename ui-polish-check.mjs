@@ -24,7 +24,7 @@ const server = createServer(async (request, response) => {
 });
 await new Promise((resolve) => server.listen(0, resolve));
 const browser = await chromium.launch({ channel: "msedge", headless: true });
-const origin = `http://127.0.0.1:${server.address().port}/`;
+const origin = process.env.APP_TEST_URL || `http://127.0.0.1:${server.address().port}/`;
 
 async function assertReadable(page, selector, state, label) {
   const target = page.locator(selector);
@@ -134,7 +134,7 @@ async function checkTheme(page, theme) {
     await page.mouse.move(1, 900);
     for (const state of ["normal", "hover", "focus"]) await assertReadable(page, selector, state, `${theme} ${label}`);
   }
-  await page.locator("#btn-select-mode").click();
+  if (await page.evaluate(() => window.__app.interactionMode !== "select")) await page.locator("#btn-select-mode").click();
   await page.locator("#score-pane g.entry text").first().click();
   const selectionColors = await page.evaluate(() => {
     const note = document.querySelector("#score-pane g.selected text");

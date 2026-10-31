@@ -24,6 +24,7 @@ if (!origin) {
 }
 const browser = await chromium.launch({ channel: "msedge", headless: true });
 const context = await browser.newContext({ viewport: { width: 1600, height: 960 }, colorScheme: "light" });
+await context.addInitScript(() => localStorage.setItem('jpeditor:workspace-mode:v1', 'desktop'));
 const page = await context.newPage();
 const errors = [];
 const results = [];
@@ -64,14 +65,15 @@ try {
   check("starts in jianpu", await mode() === "jianpu");
   await screenshot("initial-light");
   // A genuine long source document supplies independent pages in both views.
-  await page.evaluate(async () => {
+  await page.evaluate(() => {
     const source = `.Title\nTitle = 五线谱对照界面回归\nKeyAndMeters = {1=C,4/4}\n.Voice\n${Array.from({ length: 96 }, (_, i) => `${i % 2 ? "5 6 7 1'" : "1 2 3 4"} |`).join("\n")} ]`;
-    await window.__app.importBytes(new TextEncoder().encode(source), "staff-ui-fixture.jpwabc");
+    window.__app.loadText(source, "staff-ui-fixture.jpwabc");
   });
   await page.waitForTimeout(500);
   const originalToolbar = (await metric()).toolbar.height;
   await view("staff"); await ready();
-  check("first open is compare", await mode() === "compare");
+  check("first open follows explicit staff choice", await mode() === "staff");
+  await view("compare"); await ready();
   let state = await metric();
   check("first preview fits its pane", state.staffPageWidth <= state.staffWidth - 30);
   check("opening preserves toolbar height", state.toolbar.height === originalToolbar);
@@ -120,7 +122,7 @@ try {
   check("closing single preserves jianpu position", Math.abs((await metric()).jianpuTop - jianpuTop) < 3);
   check("closing releases staff pages", await page.locator(".staff-page").count() === 0);
   await view("compare"); await ready();
-  check("reopen remembers staff preference", await mode() === "staff");
+  check("reopen follows explicit compare choice", await mode() === "compare");
   await view("compare"); await ready();
   const currentTop = (await metric()).jianpuTop;
   await view("jianpu");
@@ -136,7 +138,7 @@ try {
   check("reload still defaults to jianpu", await mode() === "jianpu");
   check("reload restores divider ratio", parseFloat((await metric()).ratio) === Number(keyRatio));
   await view("staff"); await ready();
-  check("reload restores remembered compare preview", await mode() === "compare");
+  check("reload follows explicit staff choice", await mode() === "staff");
   await view("jianpu");
   for (const [name, width, height] of [["standard", 1280, 900], ["compact", 900, 800], ["phone", 390, 844]]) {
     await page.setViewportSize({ width, height }); await page.waitForTimeout(150);

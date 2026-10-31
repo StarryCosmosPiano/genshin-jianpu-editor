@@ -1,6 +1,8 @@
 use svg2pdf::{usvg, ConversionOptions, PageOptions};
 use lopdf::{Document, Object, ObjectId};
 use tauri::Manager;
+mod autosave;
+mod midi_input;
 
 /// Build usvg options with system fonts + bundled Bravura.otf embedded.
 fn build_usvg_options(app_handle: &tauri::AppHandle) -> usvg::Options {
@@ -444,17 +446,25 @@ pub fn run() {
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_fs::init())
-        .plugin(tauri_plugin_dialog::init());
+        .plugin(tauri_plugin_dialog::init())
+        .manage(midi_input::MidiInputState::default());
     #[cfg(target_os = "macos")]
     let builder = builder.manage(MidiState::default());
     builder
         .invoke_handler(tauri::generate_handler![
+            autosave::autosave_write,
+            autosave::autosave_list,
+            autosave::autosave_read,
             export_pdf_cmd,
             omr_gemini_cmd,
             omr_onnx,
             omr_onnx_batch,
             midi_play_cmd,
-            midi_stop_cmd
+            midi_stop_cmd,
+            midi_input::midi_input_available,
+            midi_input::midi_input_list,
+            midi_input::midi_input_connect,
+            midi_input::midi_input_disconnect
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

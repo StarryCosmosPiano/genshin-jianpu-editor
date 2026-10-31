@@ -163,15 +163,15 @@ try {
     densityScore.parts = [new Part()];
     for (let m = 0; m < 48; m++) {
       const measure = new Measure(m); densityScore.parts[0].measures.push(measure);
-      for (let n = 0; n < 4; n++) {
-        const chord = new Chord(measure); chord.position = new Fraction(n); chord.duration = new Fraction(1);
-        const note = new Note(); note.pitch = 60 + n * 2; chord.add(note); measure.add(chord);
+      for (let n = 0; n < 8; n++) {
+        const chord = new Chord(measure); chord.position = new Fraction(n, 2); chord.duration = new Fraction(1, 2);
+        const note = new Note(); note.pitch = 60 + n % 4 * 2; chord.add(note); measure.add(chord);
       }
     }
     const densitySnapshot = scale => ({ score: densityScore, sources: [],
       registry: createStaffNoteRegistry(densityScore, [], 2), revision: 2, current: true,
       engravingStyle: { notationScale: scale } });
-    const normal = await prepareStaffPreview(densitySnapshot(1));
+    const normal = await prepareStaffPreview(densitySnapshot(1.5));
     const compact = await prepareStaffPreview(densitySnapshot(Math.SQRT1_2));
     window.__staffDensityPage = compact.renderPage(0).svg;
     const density = { normalPages: normal.pageCount, compactPages: compact.pageCount,

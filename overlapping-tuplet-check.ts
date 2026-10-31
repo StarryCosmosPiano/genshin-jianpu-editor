@@ -7,7 +7,7 @@ import {
   parseSlashScore, scoreToSlashScore, type SlashScoreOptions,
 } from "./src/slashscore";
 
-const seed = "键盘谱\n4/4拍：\n点=16分音符\n0.0.0.0./\n";
+const seed = "键盘谱\n4/4拍：\n点=16分音符\n方括号=三连音\n0.0.0.0./\n";
 const options: SlashScoreOptions = {
   ...defaultSlashScoreOptions("keyboard", analyzeSlashScore(seed)),
   voiceCount: 2, beats: 4, beatType: 4, symbolDurations: { ".": 16 }, noteDivision: null,

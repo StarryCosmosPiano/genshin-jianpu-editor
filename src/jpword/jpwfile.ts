@@ -294,6 +294,9 @@ export class TitleSection extends Section {
   get annotations(): string | null {
     return this.getValue("Annotations");
   }
+  get headerTypography(): string | null {
+    return this.getValue("HeaderTypography");
+  }
   get key(): string | null {
     const km = this.keyAndMeters;
     if (km === null) return null;

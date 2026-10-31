@@ -37,6 +37,8 @@ export interface BeatSlicedTupletAnnotation {
 }
 
 export interface BeatSlicedTimedEvent {
+  /** Original atom retained for non-rhythmic decorations on this attack. */
+  sourceAtom?: BeatSlicedAtom;
   start: number;
   end: number;
   pitches: number[];
@@ -156,6 +158,7 @@ export function sliceBeatTupletEvents(input: BeatSlicedTupletInput): BeatSlicedT
     const isRest = pitches.length === 0;
     const group = `${input.measureIndex}:beat-slices:v${request.annotation.part}:${request.annotation.offset}`;
     add({
+      sourceAtom: atom,
       start: input.absoluteStart + request.offset - input.groupOffset,
       end: input.absoluteStart + request.end - input.groupOffset,
       pitches,

@@ -6,8 +6,9 @@ import {
   type NotationCursor,
 } from "../score/input-edit";
 import { noteTimingStep, type NoteTimingDivision } from "../score/note-timing";
+import { rebindInputTargets, type InputTarget } from "./multi-input";
 
-export type ScoreInteractionMode = "select" | "input";
+export type ScoreInteractionMode = "view" | "select" | "input";
 
 export interface InputCursorSnapshot {
   partIndex: number;
@@ -17,6 +18,12 @@ export interface InputCursorSnapshot {
   lane: InputLane;
   focusPitch: number | null;
   verticalIndex?: number;
+  /** Exact written staff position for a pending input note. */
+  staffStep?: string;
+  staffOctave?: number;
+  /** Optional multi-input state; older single-cursor snapshots remain valid. */
+  targets?: InputTarget[];
+  primaryTargetIndex?: number;
 }
 
 const ZERO = new Fraction(0);
@@ -76,6 +83,32 @@ export function inputKeyAt(
   return Object.assign(new Key(), { fifths });
 }
 
+/** JPW accidentals persist by degree across octaves for the remainder of a
+ * bar. Recompute their minimal explicit resets in serialization order so an
+ * inserted chromatic pitch cannot silently retune an existing later note. */
+export function refreshInputAccidentals(score: Score, partIndex: number, measureIndices: ReadonlySet<number>): void {
+  for (const measureIndex of measureIndices) {
+    const measure = score.parts[partIndex].measures[measureIndex];
+    if (!measure) continue;
+    let fifths = measure.key.fifths;
+    const active = new Map<string, number>();
+    for (const chord of measure.entries.filter((entry): entry is Chord => entry instanceof Chord)
+      .sort((left, right) => left.position.compareTo(right.position))) {
+      const key = inputKeyAt(score, partIndex, measureIndex, chord.position);
+      if (key.fifths !== fifths) { active.clear(); fifths = key.fifths; }
+      for (const note of [...chord.graceNotes, ...[...chord.notes].sort((left, right) => left.pitch - right.pitch)]) {
+        if (note.rest) continue;
+        const natural = MusicCommon.getBasePitchOfKey(key) + MusicCommon.stepToPitch(note.number) + note.jpOctave * 12;
+        const alteration = note.pitch - natural;
+        if (![-1, 0, 1].includes(alteration)) throw new Error("Input pitch cannot be represented by one numbered accidental");
+        const previous = active.get(note.number) ?? 0;
+        note.jpAlter = previous === alteration ? " " : alteration === 0 ? "n" : alteration > 0 ? "#" : "b";
+        active.set(note.number, alteration);
+      }
+    }
+  }
+}
+
 /** Build a new numbered-notation pitch at the local tonic and octave. */
 export function inputDegreeSpec(
   score: Score,
@@ -97,6 +130,8 @@ export class ScoreInputSession {
   mode: ScoreInteractionMode = "select";
   cursor: NotationCursor | null = null;
   focusPitch: number | null = null;
+  targets: InputTarget[] = [];
+  primaryTargetIndex = 0;
 
   get enabled(): boolean {
     return this.mode === "input";
@@ -107,6 +142,8 @@ export class ScoreInputSession {
     if (!enabled || entry === null) {
       this.cursor = null;
       this.focusPitch = null;
+      this.targets = [];
+      this.primaryTargetIndex = 0;
       return;
     }
     if (entry) {
@@ -139,11 +176,39 @@ export class ScoreInputSession {
       division: cursor.division ?? this.cursor?.division ?? 16,
     };
     this.focusPitch = focusPitch;
+    this.targets = [];
+    this.primaryTargetIndex = 0;
     this.normalize(score);
+  }
+
+  /** Install exact targets after a click, navigation or verified transaction.
+   * Target snapshots carry no nested targets and are never saved in the file. */
+  setTargets(score: Score, targets: readonly InputTarget[], primaryTargetIndex = targets.length - 1): void {
+    this.targets = targets.map((target) => ({ ...target }));
+    this.primaryTargetIndex = Math.max(0, Math.min(this.targets.length - 1, primaryTargetIndex));
+    const primary = this.targets[this.primaryTargetIndex];
+    if (!primary) {
+      this.cursor = null;
+      this.focusPitch = null;
+      return;
+    }
+    this.cursor = {
+      partIndex: primary.partIndex, measureIndex: primary.measureIndex,
+      offset: Fraction.fromString(primary.offset), division: primary.division,
+      lane: primary.lane, verticalIndex: primary.verticalIndex,
+    };
+    this.focusPitch = primary.focusPitch;
+    this.mode = "input";
+    this.normalize(score);
+  }
+
+  targetsSnapshot(): InputTarget[] {
+    return this.targets.map((target) => ({ ...target }));
   }
 
   setDivision(division: NoteTimingDivision): void {
     if (this.cursor) this.cursor.division = division;
+    this.targets = this.targets.map((target) => ({ ...target, division }));
   }
 
   setLane(lane: InputLane): void {
@@ -227,11 +292,18 @@ export class ScoreInputSession {
       lane: this.cursor.lane,
       focusPitch: this.focusPitch,
       verticalIndex: this.cursor.verticalIndex,
+      ...(this.targets.length ? { targets: this.targetsSnapshot(), primaryTargetIndex: this.primaryTargetIndex } : {}),
     };
   }
 
   restore(score: Score, snapshot: InputCursorSnapshot | null): void {
     if (!snapshot) return;
+    if (snapshot.targets?.length) {
+      this.setTargets(score, rebindInputTargets(score, snapshot.targets), snapshot.primaryTargetIndex);
+      return;
+    }
+    this.targets = [];
+    this.primaryTargetIndex = 0;
     this.cursor = {
       partIndex: snapshot.partIndex,
       measureIndex: snapshot.measureIndex,

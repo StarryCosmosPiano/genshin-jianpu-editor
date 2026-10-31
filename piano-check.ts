@@ -1676,6 +1676,122 @@ partialArpeggioSvg.appendChild(
 const partialArpeggioSvgPath = join(tmpdir(), "partial-arpeggio.svg");
 await writeFile(partialArpeggioSvgPath, partialArpeggioSvg.outerHTML, "utf-8");
 
+// The brace-side entrance stays connected while the interior bars can be
+// disconnected. Test its outer endpoints after normalization, including
+// continuation systems, chord/lyric rows and temporarily incomplete voices.
+const incompletePiano = fromJpw(uniformFile);
+const incompleteEnsemble = fromJpw(ensembleFile);
+check(incompletePiano?.piano && incompleteEnsemble?.ensemble,
+  "left-edge incomplete-voice fixtures did not import");
+incompletePiano.parts[1].measures = [];
+incompleteEnsemble.parts[1].measures = [];
+const emptyThirdVoice = new scoreMod.Part();
+emptyThirdVoice.instrumentName = "钢琴";
+emptyThirdVoice.voiceIndex = 3;
+incompleteEnsemble.parts.splice(2, 0, emptyThirdVoice);
+let checkedLeftEdgeSystems = 0;
+let checkedAlignedLeftEdges = 0;
+let checkedConnectedLeftEdges = 0;
+for (const [fixtureName, fixtureScore, groupSizes] of [
+  ["piano chords and lyrics", score, [2]],
+  ["piano incomplete hand", incompletePiano, [2]],
+  ["ensemble", ensembleScore, [2, 1]],
+  ["ensemble incomplete voices", incompleteEnsemble, [3, 1]],
+] as const) {
+  for (const connectBarlines of [false, true]) {
+    for (const notationScale of [0.65, 1.25]) {
+      const target = new layoutMod.Layout(28);
+      target.options.smuflMeta = smuflMeta;
+      target.options.applyEngravingStyle({ connectBarlines, notationScale, measuresPerSystem: 4 });
+      target.fromScore(fixtureScore, null, 960, 840);
+      const isPiano = fixtureScore.piano;
+      const systemClass = isPiano ? "piano-system" : "ensemble-system";
+      const leftClass = isPiano ? "piano-system-left" : "ensemble-group-line";
+      const braceClass = isPiano ? "piano-brace-path" : "ensemble-instrument-brace-path";
+      const systems = target.pages.flatMap((page) => page.children)
+        .filter((item): item is InstanceType<typeof layoutMod.Group> =>
+          item instanceof layoutMod.Group && item.classes.has(systemClass));
+      check(systems.length >= 2, `${fixtureName} did not exercise continuation systems`);
+      for (const [systemIndex, system] of systems.entries()) {
+        const label = `${fixtureName}, connected=${connectBarlines}, scale=${notationScale}, system=${systemIndex}`;
+        const rows = system.children.filter((item): item is InstanceType<typeof layoutMod.Group> =>
+          item instanceof layoutMod.Group && item.children.some((child) => child.data instanceof layoutMod.Barline));
+        const leftLines = system.children.filter((item): item is InstanceType<typeof layoutMod.GraphicLine> =>
+          item instanceof layoutMod.GraphicLine && item.classes.has(leftClass));
+        const barsByRow = rows.map((row) => row.children
+          .filter((entryGroup) => entryGroup.data instanceof layoutMod.Barline)
+          .flatMap((entryGroup) => entryGroup.children)
+          .filter((item): item is InstanceType<typeof layoutMod.GraphicLine> => item instanceof layoutMod.GraphicLine));
+        const endpoints = (line: InstanceType<typeof layoutMod.GraphicLine>): [number, number] => {
+          const y = line.pos(system).y;
+          return [y + line.p0.y, y + line.p1.y];
+        };
+        check(rows.length === groupSizes.reduce((sum, size) => sum + size, 0), `${label}: lost a voice row`);
+        check(barsByRow.every((bars) => bars.length > 0), `${label}: row has no ordinary barline reference`);
+        if (!connectBarlines) {
+          check(leftLines.length === groupSizes.length, `${label}: left entrance must stay connected within each instrument`);
+          const braces = system.children.flatMap((item) => item.children)
+            .filter((item): item is InstanceType<typeof layoutMod.GraphicPath> =>
+              item instanceof layoutMod.GraphicPath && item.classes.has(braceClass));
+          let rowIndex = 0;
+          let braceIndex = 0;
+          groupSizes.forEach((size, groupIndex) => {
+            const [top, bottom] = endpoints(leftLines[groupIndex]);
+            const groupBars = barsByRow.slice(rowIndex, rowIndex + size).flat();
+            const expectedTop = Math.min(...groupBars.map((bar) => endpoints(bar)[0]));
+            const expectedBottom = Math.max(...groupBars.map((bar) => endpoints(bar)[1]));
+            check(Math.abs(top - expectedTop) < 1e-8 && Math.abs(bottom - expectedBottom) < 1e-8,
+              `${label}: joined entrance must match the outer ordinary barline endpoints`);
+            if (size > 1) {
+              const brace = braces[braceIndex++];
+              check(brace, `${label}: multi-voice group lost its brace`);
+              const braceY = brace.pos(system).y;
+              const tips = brace.segs.filter((seg) => seg.op === "M").map((seg) => braceY + seg.pts[1]);
+              check(Math.abs(top - Math.min(...tips)) < 1e-8 && Math.abs(bottom - Math.max(...tips)) < 1e-8,
+                `${label}: brace and joined entrance must have identical endpoints`);
+            }
+            if (groupIndex > 0) {
+              check(top > endpoints(leftLines[groupIndex - 1])[1], `${label}: left entrance crosses instrument groups`);
+            }
+            rowIndex += size;
+          });
+          checkedAlignedLeftEdges += leftLines.length;
+        } else {
+          check(leftLines.length === groupSizes.length, `${label}: connected left edge must have one stroke per instrument`);
+          const braces = system.children.flatMap((item) => item.children)
+            .filter((item): item is InstanceType<typeof layoutMod.GraphicPath> =>
+              item instanceof layoutMod.GraphicPath && item.classes.has(braceClass));
+          let rowIndex = 0;
+          let braceIndex = 0;
+          groupSizes.forEach((size, groupIndex) => {
+            const [top, bottom] = endpoints(leftLines[groupIndex]);
+            const groupBars = barsByRow.slice(rowIndex, rowIndex + size).flat();
+            check(groupBars.every((bar) => {
+              const [barTop, barBottom] = endpoints(bar);
+              return top <= barTop + 1e-8 && bottom >= barBottom - 1e-8;
+            }), `${label}: connected left stroke does not span every voice`);
+            if (size > 1) {
+              const brace = braces[braceIndex++];
+              check(brace, `${label}: multi-voice group lost its brace`);
+              const braceY = brace.pos(system).y;
+              const tips = brace.segs.filter((seg) => seg.op === "M").map((seg) => braceY + seg.pts[1]);
+              check(Math.abs(top - Math.min(...tips)) < 1e-8
+                && Math.abs(bottom - Math.max(...tips)) < 1e-8,
+              `${label}: connected left stroke does not reach the brace tips`);
+            }
+            if (groupIndex > 0) {
+              check(top > endpoints(leftLines[groupIndex - 1])[1], `${label}: left stroke crosses instrument groups`);
+            }
+            rowIndex += size;
+          });
+          checkedConnectedLeftEdges += leftLines.length;
+        }
+        checkedLeftEdgeSystems++;
+      }
+    }
+  }
+}
+
 console.log(JSON.stringify({
   parts: score.parts.length,
   measures: score.parts[0].measures.length,
@@ -1684,6 +1800,7 @@ console.log(JSON.stringify({
   customFinalSegments,
   customConnectorSegments,
   matchedFullHeightBarlines,
+  leftEdgeBarlines: { checkedLeftEdgeSystems, checkedAlignedLeftEdges, checkedConnectedLeftEdges },
   braceControls: { narrowBrace, wideBrace, thinBrace, thickBrace },
   uniformMeasureWidths,
   rhythmGuide: { guideLines, majorTicks, minorTicks, pianoGuideLines, manualQuarter, manualThirtySecond },

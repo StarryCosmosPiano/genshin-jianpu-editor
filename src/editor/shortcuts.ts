@@ -1,7 +1,8 @@
 import { defaultKeymap, historyKeymap } from "@codemirror/commands";
 import type { EditorView, KeyBinding } from "@codemirror/view";
+import { isReservedDocumentSaveChord } from "./document-save-shortcut";
 
-export type ShortcutContext = "selection" | "input" | "object" | "text" | "global";
+export type ShortcutContext = "selection" | "input" | "object" | "staff-selection" | "staff-input" | "text" | "global";
 export type ShortcutCategory = "谱面选择" | "打谱输入" | "声部" | "页面" | "文本编辑";
 
 export interface ShortcutAction {
@@ -14,9 +15,10 @@ export interface ShortcutAction {
 }
 
 const STORAGE_KEY = "jpeditor.ui.shortcuts.v1";
-const SCORE = ["selection", "input", "object"] as const;
+const SCORE = ["selection", "input", "object", "staff-selection", "staff-input"] as const;
 const INPUT = ["input", "object"] as const;
-const VOICE = ["selection", "input", "object", "text"] as const;
+const STAFF = ["staff-input"] as const;
+const VOICE = ["selection", "input", "object", "staff-selection", "staff-input", "text"] as const;
 const GLOBAL = ["global"] as const;
 const action = (id: string, label: string, category: ShortcutCategory,
   contexts: readonly ShortcutContext[], ...defaults: string[]): ShortcutAction =>
@@ -25,15 +27,13 @@ const action = (id: string, label: string, category: ShortcutCategory,
 const scoreActions: ShortcutAction[] = [
   { ...action("score.toggleInput", "进入／退出打谱", "打谱输入", SCORE, "n", "Shift+n"),
     description: "选音后进入打谱；显示键盘按键时，打谱中的 N 改音，使用 Esc 退出。" },
-  action("score.play", "从选中音播放／停止", "谱面选择", ["selection"], "Space"),
+  action("score.play", "从选中音播放／停止", "谱面选择", ["selection", "staff-selection"], "Space"),
   action("score.undo", "撤销", "谱面选择", SCORE, "Mod+z"),
   action("score.redo", "重做", "谱面选择", SCORE, "Mod+Shift+z", "Mod+y"),
-  action("score.delete", "删除所选音符／对象", "谱面选择", SCORE, "Delete", "Backspace"),
-  action("score.octaveUp", "所选音升八度", "谱面选择", ["selection"], "ArrowUp"),
-  action("score.octaveDown", "所选音降八度", "谱面选择", ["selection"], "ArrowDown"),
-  action("score.movePartUp", "所选音移到上一声部", "谱面选择", ["selection"], "Alt+ArrowUp"),
-  action("score.movePartDown", "所选音移到下一声部", "谱面选择", ["selection"], "Alt+ArrowDown"),
-  action("object.edit", "编辑所选记号", "谱面选择", ["object"], "Enter"),
+  action("score.delete", "删除所选音符／对象", "打谱输入", ["input", "object", "staff-input"], "Delete", "Backspace"),
+  action("score.movePartUp", "所选音移到上一声部", "谱面选择", ["selection"], "Mod+Alt+ArrowUp"),
+  action("score.movePartDown", "所选音移到下一声部", "谱面选择", ["selection"], "Mod+Alt+ArrowDown"),
+  action("object.edit", "编辑所选记号", "打谱输入", ["object"], "Enter"),
   action("input.exit", "退出打谱", "打谱输入", INPUT, "Escape"),
   ...Array.from({ length: 8 }, (_, n) => action(
     `input.degree${n}`, n === 0 ? "输入休止符 0" : `输入音级 ${n}`,
@@ -47,10 +47,32 @@ const scoreActions: ShortcutAction[] = [
   action("input.longer", "延长当前音时值", "打谱输入", INPUT, "Mod+ArrowRight"),
   action("input.octaveUp", "当前音升八度", "打谱输入", INPUT, "Mod+ArrowUp"),
   action("input.octaveDown", "当前音降八度", "打谱输入", INPUT, "Mod+ArrowDown"),
+  action("input.degreeUp", "所选音升一个音级", "打谱输入", INPUT, "Alt+ArrowUp"),
+  action("input.degreeDown", "所选音降一个音级", "打谱输入", INPUT, "Alt+ArrowDown"),
   action("input.earlier", "当前音向前移动", "打谱输入", INPUT, "Alt+ArrowLeft"),
   action("input.later", "当前音向后移动", "打谱输入", INPUT, "Alt+ArrowRight"),
-  action("input.partUp", "当前音移到上一声部", "打谱输入", INPUT, "Alt+ArrowUp"),
-  action("input.partDown", "当前音移到下一声部", "打谱输入", INPUT, "Alt+ArrowDown"),
+  action("input.partUp", "当前音移到上一声部", "打谱输入", INPUT, "Mod+Alt+ArrowUp"),
+  action("input.partDown", "当前音移到下一声部", "打谱输入", INPUT, "Mod+Alt+ArrowDown"),
+  action("staff.diatonicUp", "五线谱升一个调内位置", "打谱输入", STAFF, "ArrowUp"),
+  action("staff.diatonicDown", "五线谱降一个调内位置", "打谱输入", STAFF, "ArrowDown"),
+  action("staff.octaveUp", "五线谱升八度", "打谱输入", STAFF, "Mod+ArrowUp"),
+  action("staff.octaveDown", "五线谱降八度", "打谱输入", STAFF, "Mod+ArrowDown"),
+  action("staff.semitoneUp", "五线谱升半音", "打谱输入", STAFF, "Alt+ArrowUp"),
+  action("staff.semitoneDown", "五线谱降半音", "打谱输入", STAFF, "Alt+ArrowDown"),
+  action("staff.partUp", "五线谱移到上方谱表", "谱面选择", ["staff-selection", "staff-input"], "Mod+Alt+ArrowUp"),
+  action("staff.partDown", "五线谱移到下方谱表", "谱面选择", ["staff-selection", "staff-input"], "Mod+Alt+ArrowDown"),
+  ...([1, 2, 4, 8, 16, 32, 64] as const).map((division, index) => action(
+    `staff.duration${division}`, `五线谱${division === 1 ? "全音符" : `${division}分音符`}`,
+    "打谱输入", STAFF, String(index + 1))),
+  action("staff.dot", "五线谱切换附点", "打谱输入", STAFF, "."),
+  action("staff.left", "五线谱光标左移", "打谱输入", ["staff-input"], "ArrowLeft"),
+  action("staff.right", "五线谱光标右移", "打谱输入", ["staff-input"], "ArrowRight"),
+  action("staff.exit", "退出五线谱打谱", "打谱输入", ["staff-input"], "Escape"),
+  action("staff.advance", "五线谱按时值前进", "打谱输入", ["staff-input"], "Space"),
+  action("staff.insert", "五线谱输入当前预览音", "打谱输入", ["staff-input"], "Enter"),
+  ...["c", "d", "e", "f", "g", "a", "b"].map((letter) => action(
+    `staff.letter${letter.toUpperCase()}`, `五线谱输入 ${letter.toUpperCase()}`,
+    "打谱输入", ["staff-input"], letter, `Shift+${letter}`)),
   ...Array.from({ length: 9 }, (_, n) => action(
     `voice.${n + 1}`, `分配到声部 V${n + 1}`, "声部", VOICE, `Alt+${n + 1}`)),
   action("page.zoomIn", "放大", "页面", GLOBAL, "Mod+Plus", "Mod+Shift+Plus"),
@@ -174,6 +196,7 @@ export function shortcutBindingAllowed(actionId: string, chord: string): boolean
   const item = byId.get(actionId);
   const normalized = normalizeShortcutChord(chord);
   if (!item || !normalized) return false;
+  if (isReservedDocumentSaveChord(normalized)) return false;
   if (!item.contexts.includes("text")) return true;
   const parts = normalized.split("+");
   const key = parts.pop()!;
@@ -208,11 +231,20 @@ export function defaultShortcutBindings(): ShortcutBindings {
 function validBindings(value: unknown): ShortcutBindings {
   const defaults = defaultShortcutBindings();
   if (!value || typeof value !== "object") return defaults;
+  const explicit = new Set<string>();
   for (const [id, chords] of Object.entries(value)) {
     if (!byId.has(id) || !Array.isArray(chords) || chords.length > 4) continue;
     const normalized = chords.map((chord) => typeof chord === "string" ? normalizeShortcutChord(chord) : null);
     if (normalized.some((chord) => !chord || !shortcutBindingAllowed(id, chord))) continue;
     defaults[id] = [...new Set(normalized as string[])];
+    explicit.add(id);
+  }
+  // A newly introduced default must not take over a saved custom binding.
+  // Explicit-to-explicit conflicts still reach the settings validator unchanged.
+  for (const item of SHORTCUT_ACTIONS) {
+    if (explicit.has(item.id)) continue;
+    defaults[item.id] = defaults[item.id].filter((chord) => !SHORTCUT_ACTIONS.some((other) =>
+      explicit.has(other.id) && overlap(item, other) && defaults[other.id].includes(chord)));
   }
   return defaults;
 }
@@ -293,7 +325,8 @@ function canonicalEvent(event: KeyboardEvent, chord: string): KeyboardEvent {
   });
 }
 
-/** Translate a physical key to an existing score/global handler's original key.
+/** Translate a physical key to the primary default expected by score/global handlers.
+ * Keep those handlers in sync when changing an action's primary default.
  * null means a displaced default was deliberately swallowed. */
 export function remapShortcutEvent(event: KeyboardEvent, context: ShortcutContext): KeyboardEvent | null {
   const chord = shortcutChordFromEvent(event);

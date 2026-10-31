@@ -225,12 +225,9 @@ body.file-drag-active #app::after {
 #rhythm-grid-control[data-toolbar-mode="grid"][data-mode="auto"] #rhythm-grid-mode-toggle::after { content: "·自动"; margin-left: 2px; color: #777; }
 #rhythm-grid-control[data-toolbar-mode="duration"][data-mode="auto"] #rhythm-grid-mode-toggle::after { content: "·跟随刻度"; margin-left: 2px; color: #777; }
 
-/* Dotted grids keep their binary subdivisions visible as subdued reference
-   marks; only dotted-value positions retain the normal ink colour. */
-.rhythm-guide-tick.rhythm-guide-muted {
-  stroke: #aaa !important;
-  opacity: 0.72;
-}
+/* The SVGs carry the same purple ruler colours directly, including exports.
+   Dotted grids keep binary subdivisions visible as paler reference marks. */
+.rhythm-guide-line, .rhythm-guide-tick { pointer-events: none; }
 
 .toolbar-notice {
   position: fixed;
@@ -367,6 +364,11 @@ body.file-drag-active #app::after {
    Keep all corresponding CodeMirror source ranges visibly highlighted even
    while the editor itself is not focused. */
 .cm-editor .cm-selectionBackground,
+.cm-editor .cm-playback-source {
+  background: #e6dcff;
+  box-shadow: inset 0 -2px #75529e;
+}
+#text-resume-follow[hidden] { display: none; }
 .cm-editor .cm-score-source-selection {
   background: rgba(21, 101, 255, 0.24) !important;
 }
@@ -1421,6 +1423,7 @@ textarea:focus-visible, summary:focus-visible, a:focus-visible {
 #app-header > * { min-width: 0; }
 #app-header .document-identity {
   display: flex;
+  flex: 1 1 160px;
   flex-direction: column;
   gap: 1px;
   min-width: 0;
@@ -1430,6 +1433,12 @@ textarea:focus-visible, summary:focus-visible, a:focus-visible {
 #workspace-document-name { display: block; max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); font-size: 12px; font-weight: 600; }
 #workspace-document-format { color: var(--muted); font-size: 10px; }
 #app-header .header-actions { display: flex; flex: 0 0 auto; align-items: center; gap: 4px; margin-left: auto; }
+#app-header #staff-view-toolbar { padding-inline: 5px; }
+#app-header #staff-view-select { padding: 5px 7px; border-color: var(--line); }
+#app-header button.active,
+#app-header button[aria-expanded="true"] { background: var(--purple); color: #fff; }
+#app-header button.active:hover,
+#app-header button[aria-expanded="true"]:hover { background: var(--purple); color: #fff; }
 #app-header .brand, #app-header .app-brand, #brand {
   display: inline-flex;
   align-items: center;
@@ -1816,6 +1825,15 @@ textarea:focus-visible, summary:focus-visible, a:focus-visible {
   paint-order: stroke fill;
   vector-effect: non-scaling-stroke;
 }
+/* Keep the existing playback glow visible on notes inside a selection. */
+.score-page g.playing { filter: drop-shadow(0 0 2px var(--gold)); }
+.cm-editor .cm-playback-source,
+.cm-editor .cm-score-source-selection.cm-playback-source,
+.cm-editor .cm-score-source-selection .cm-playback-source,
+.cm-editor .cm-playback-source .cm-score-source-selection {
+  background: #e6dcff !important;
+  box-shadow: inset 0 -2px #75529e;
+}
 .score-input-cell { fill: rgba(169, 141, 212, .12); stroke: var(--score-selection-ink); }
 .score-input-caret { stroke: var(--score-selection-ink); }
 .score-input-triangle, .score-input-plus {
@@ -1908,6 +1926,13 @@ body.file-drag-active #app::after { border-color: var(--purple); color: var(--pu
   #body #score-pane { flex: 1 1 auto; min-width: 0; }
   #body #inspector-pane { position: absolute; z-index: 18; top: 0; bottom: 0; right: 0; width: min(340px, calc(100vw - 42px)); max-width: none; box-shadow: var(--shadow); }
 }
+@media (max-width: 1250px) {
+  #app-header { flex-wrap: wrap; gap: 4px 12px; }
+  #app-header .header-actions { flex: 1 0 100%; flex-wrap: wrap; margin-left: 0; gap: 2px; }
+  #app-header .document-identity { align-items: flex-end; }
+  #workspace-document-name { max-width: min(65vw, 480px); }
+  #app-header button { padding-inline: 9px; }
+}
 @media (max-width: 620px) {
   #app-header { min-height: 48px; gap: 6px; padding: 5px 9px; }
   #app-header .brand, #app-header .app-brand, #brand { font-size: 13px; gap: 6px; }
@@ -1943,7 +1968,7 @@ body.file-drag-active #app::after { border-color: var(--purple); color: var(--pu
 @media (min-width: 761px) and (max-width: 1350px) {
   #toolbar {
     display: grid;
-    grid-template-columns: max-content repeat(3, max-content) minmax(0, 1fr) max-content max-content;
+    grid-template-columns: max-content repeat(4, max-content) minmax(0, 1fr);
     grid-template-rows: 34px 34px;
     column-gap: 8px;
     row-gap: 5px;
@@ -1952,11 +1977,10 @@ body.file-drag-active #app::after { border-color: var(--purple); color: var(--pu
   }
   #toolbar .sep { display: none; }
   #toolbar .toolbar-mode-group { grid-column: 1; grid-row: 1; }
-  #btn-undo { grid-column: 2; grid-row: 1; }
-  #btn-redo { grid-column: 3; grid-row: 1; }
-  #btn-play { grid-column: 4; grid-row: 1; }
-  #btn-score-settings { grid-column: 6; grid-row: 1; }
-  #btn-layout-style { grid-column: 7; grid-row: 1; }
+  #btn-chord-mode { grid-column: 2; grid-row: 1; }
+  #btn-undo { grid-column: 3; grid-row: 1; }
+  #btn-redo { grid-column: 4; grid-row: 1; }
+  #btn-play { grid-column: 5; grid-row: 1; }
   #rhythm-grid-control {
     grid-column: 1 / -1;
     grid-row: 2;
@@ -1975,7 +1999,7 @@ body.file-drag-active #app::after { border-color: var(--purple); color: var(--pu
 @media (max-width: 760px) {
   #toolbar {
     display: grid;
-    grid-template-columns: 92px repeat(5, minmax(44px, 1fr));
+    grid-template-columns: max-content repeat(4, minmax(44px, 1fr));
     grid-template-rows: 44px 44px;
     column-gap: 2px;
     row-gap: 4px;
@@ -1983,15 +2007,14 @@ body.file-drag-active #app::after { border-color: var(--purple); color: var(--pu
     overflow: hidden;
   }
   #toolbar .sep { display: none; }
-  #toolbar .toolbar-mode-group { grid-column: 1; grid-row: 1; width: 92px; padding: 0; }
+  #toolbar .toolbar-mode-group { grid-column: 1; grid-row: 1; min-width: 92px; padding: 0; }
   #toolbar .toolbar-mode-group button { flex: 1 1 44px; min-width: 44px; padding-inline: 2px; }
   #toolbar > button { width: 100%; min-width: 0; justify-content: center; }
   #toolbar #btn-play { width: 100%; }
-  #btn-undo { grid-column: 2; grid-row: 1; }
-  #btn-redo { grid-column: 3; grid-row: 1; }
-  #btn-play { grid-column: 4; grid-row: 1; }
-  #btn-score-settings { grid-column: 5; grid-row: 1; }
-  #btn-layout-style { grid-column: 6; grid-row: 1; }
+  #btn-chord-mode { grid-column: 2; grid-row: 1; }
+  #btn-undo { grid-column: 3; grid-row: 1; }
+  #btn-redo { grid-column: 4; grid-row: 1; }
+  #btn-play { grid-column: 5; grid-row: 1; }
   #rhythm-grid-control {
     grid-column: 1 / -1;
     grid-row: 2;

@@ -93,7 +93,8 @@ try {
   await page.waitForTimeout(250);
   await page.evaluate(() => { window.__app.deselect(false); window.__app.scorePane.focus(); });
   await page.keyboard.press("Space");
-  assert.equal((await state()).starts.length, startsBeforeText, "no selection must not unexpectedly start from the beginning");
+  assert.equal((await state()).starts.length, startsBeforeText + 1, "no selection plays the complete score from the beginning");
+  assert.equal((await state()).starts.at(-1).measure, undefined, "whole-score playback has no selected start anchor");
   assert.deepEqual(errors, []);
-  console.log("space-playback: selected JPW/keyboard/number start + stop; input and text space preserved");
+  console.log("space-playback: selected JPW/keyboard/number start + stop, whole-score fallback; input and text space preserved");
 } finally { await browser.close(); await new Promise(resolve => server.close(resolve)); }

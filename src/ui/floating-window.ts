@@ -1,3 +1,5 @@
+import { isTouchWorkspace } from "../bootstrap/device-mode";
+
 /** Viewport-bound placement and pointer/keyboard gestures for an inspector window. */
 interface Placement {
   left: number;
@@ -131,7 +133,10 @@ export class FloatingWindow {
     private readonly resetButton: HTMLButtonElement,
     private readonly options: FloatingWindowOptions = {},
   ) {
-    this.placement = fit((options.persist === false ? null : readPlacement(id)) ?? defaultPlacement(options), options);
+    const remembered = options.persist === false ? null : readPlacement(id);
+    this.placement = isTouchWorkspace() ? remembered ?? { left: MARGIN, top: MARGIN,
+      width: options.width ?? DEFAULT_WIDTH, height: options.height ?? DEFAULT_HEIGHT }
+      : fit(remembered ?? defaultPlacement(options), options);
     this.render();
     header.addEventListener("pointerdown", this.onHeaderPointerDown);
     grip.addEventListener("pointerdown", this.onGripPointerDown);
@@ -141,6 +146,8 @@ export class FloatingWindow {
     resetButton.addEventListener("click", this.reset);
     window.addEventListener("resize", this.onViewportChange);
     window.visualViewport?.addEventListener("resize", this.onViewportChange);
+    window.visualViewport?.addEventListener("scroll", this.onViewportChange);
+    document.addEventListener("workspace:mode-change", this.onWorkspaceModeChange);
     if (typeof ResizeObserver !== "undefined") {
       this.resizeObserver = new ResizeObserver(this.onViewportChange);
       for (const id of ["body", "toolbar", "statusbar"]) {
@@ -160,11 +167,25 @@ export class FloatingWindow {
     this.resetButton.removeEventListener("click", this.reset);
     window.removeEventListener("resize", this.onViewportChange);
     window.visualViewport?.removeEventListener("resize", this.onViewportChange);
+    window.visualViewport?.removeEventListener("scroll", this.onViewportChange);
+    document.removeEventListener("workspace:mode-change", this.onWorkspaceModeChange);
     this.resizeObserver?.disconnect();
     this.resizeObserver = null;
   }
 
   private render(): void {
+    if (isTouchWorkspace()) {
+      const viewport = window.visualViewport;
+      const visibleHeight = viewport?.height ?? window.innerHeight;
+      const availableHeight = Math.max(1, visibleHeight - 16);
+      const height = this.pane.classList.contains("inspector-pane") ? availableHeight
+        : Math.min(this.options.height ?? DEFAULT_HEIGHT, availableHeight);
+      this.pane.style.left = "8px";
+      this.pane.style.top = `${(viewport?.offsetTop ?? 0) + (this.options.centered ? (visibleHeight - height) / 2 : 8)}px`;
+      this.pane.style.width = `${Math.max(1, window.innerWidth - 16)}px`;
+      this.pane.style.height = `${height}px`;
+      return;
+    }
     this.pane.style.left = `${this.placement.left}px`;
     this.pane.style.top = `${this.placement.top}px`;
     this.pane.style.width = `${this.placement.width}px`;
@@ -172,7 +193,14 @@ export class FloatingWindow {
   }
 
   private readonly onViewportChange = (): void => {
-    this.placement = fit(this.placement, this.options);
+    if (!isTouchWorkspace()) this.placement = fit(this.placement, this.options);
+    this.render();
+  };
+
+  private readonly onWorkspaceModeChange = (): void => {
+    this.cancelGesture();
+    if (!isTouchWorkspace()) this.placement = fit((this.options.persist === false ? null : readPlacement(this.id))
+      ?? this.placement, this.options);
     this.render();
   };
 
@@ -184,11 +212,13 @@ export class FloatingWindow {
   };
 
   private readonly onHeaderPointerDown = (event: PointerEvent): void => {
+    if (isTouchWorkspace()) return;
     if (event.button !== 0 || (event.target instanceof Element && event.target.closest("button, input, select, textarea, a, [contenteditable]"))) return;
     this.beginGesture("move", this.header, event);
   };
 
   private readonly onGripPointerDown = (event: PointerEvent): void => {
+    if (isTouchWorkspace()) return;
     if (event.button !== 0) return;
     event.preventDefault();
     this.beginGesture("resize", this.grip, event);
@@ -247,6 +277,7 @@ export class FloatingWindow {
   };
 
   private readonly onGripKeyDown = (event: KeyboardEvent): void => {
+    if (isTouchWorkspace()) return;
     const step = event.shiftKey ? 24 : 10;
     let width = this.placement.width;
     let height = this.placement.height;
@@ -277,6 +308,6 @@ export class FloatingWindow {
   };
 
   private save(): void {
-    if (this.options.persist !== false) savePlacement(this.id, this.placement);
+    if (this.options.persist !== false && !isTouchWorkspace()) savePlacement(this.id, this.placement);
   }
 }

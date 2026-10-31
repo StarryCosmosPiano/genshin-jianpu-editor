@@ -1,6 +1,6 @@
 export { parseMidi } from "./parser";
 export { analyzeMidi, midiToScore } from "./importer";
-export { detectMidiSlashGestures } from "./gestures";
+export { detectMidiSlashGestures, importedMidiSlashGestures, rememberMidiSlashGestures } from "./gestures";
 export { detectMidiTempoMarks } from "./tempo";
 export type {
   MidiSlashGesture,

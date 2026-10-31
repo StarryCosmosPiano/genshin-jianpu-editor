@@ -5,7 +5,7 @@ import { createInputTriplet, ensureInputMeasure, inputNoteAtCursor } from "./src
 import { analyzeSlashScore, defaultSlashScoreOptions, embedSlashScoreOptionsFromScore, parseSlashScore, scoreToSlashScore, type SlashScoreOptions } from "./src/slashscore";
 
 const z = "\u2063";
-const source = `键盘谱\n4/4拍：\n点=16分音符\n(V${z}G).${z}W.N.(A${z}W)./.(V${z}W).A.${z}W./B.${z}Q.U.(M${z}J)./.(B${z}Q).M.${z}J./\n`;
+const source = `键盘谱\n4/4拍：\n点=16分音符\n方括号=三连音\n(V${z}G).${z}W.N.(A${z}W)./.(V${z}W).A.${z}W./B.${z}Q.U.(M${z}J)./.(B${z}Q).M.${z}J./\n`;
 const options: SlashScoreOptions = { ...defaultSlashScoreOptions("keyboard", analyzeSlashScore(source)), voiceCount: 2, beats: 4, beatType: 4, symbolDurations: { ".": 16 }, noteDivision: null };
 const score = parseSlashScore(source, options).score;
 assert(createInputTriplet(score, { partIndex: 1, measureIndex: 0, offset: new Fraction(0) }, new Fraction(1, 4)).changed);

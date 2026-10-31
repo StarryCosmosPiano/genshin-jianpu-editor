@@ -5,16 +5,17 @@
 //   - native MIDI: system MIDI player via Rust (desktop default)
 // See ~/.claude/plans/midi-serialized-snowflake.md.
 
-import { Soundfont, Soundfont2, type Smplr } from "smplr";
-import { SoundFont2 } from "soundfont2";
-import { Chord } from "../score/score";
+import { Soundfont, Soundfont2, type Smplr, type StopFn } from "smplr";
+import { parseSoundfont } from "./soundfonts";
+import { Chord, type Note } from "../score/score";
 import {
   buildTimeline,
+  buildSelectionTimeline,
   partGain,
   PlayOptions,
   quarterToSeconds,
 } from "../score/timeline";
-import { scoreToMidi } from "../score/midi";
+import { timelineToMidi } from "../score/midi";
 import { Score } from "../score/score";
 import { isTauriRuntime } from "./fileio";
 
@@ -38,12 +39,22 @@ export interface InputAuditionNote {
   part: number;
   /** Full sounding duration in seconds. Omitted for a short cursor preview. */
   durationSeconds?: number;
+  /** Relative performed onset, preserving rolled chords and ornaments. */
+  offsetSeconds?: number;
 }
 
 interface AuditionSession {
-  ctx: AudioContext;
-  instruments: Smplr[];
+  stop: StopFn[];
   timer: number;
+}
+
+interface AudioBank {
+  context: AudioContext;
+  bytes: Uint8Array | undefined;
+  mapping: string;
+  instruments: Smplr[];
+  byPart: Smplr[];
+  ready: Promise<void>;
 }
 
 export class ScorePlayer {
@@ -58,13 +69,16 @@ export class ScorePlayer {
   private startSec = 0; // timeline seconds the cursor begins at (selection start)
   private anchors: Anchor[] = [];
   private duration = 0; // seconds
+  private endTail = 0.3;
   private curIdx = -1;
   private gen = 0; // invalidates in-flight async play() when stop()/replay happens
   private auditionSessions = new Set<AuditionSession>();
   private auditionGen = 0;
+  private bank: AudioBank | null = null;
+  private selectionScope: ReadonlySet<Note> | undefined;
 
   constructor(
-    private onChord: (chords: Chord[] | null, pass: number) => void,
+    private onChord: (chords: Chord[] | null, pass: number, notes?: ReadonlySet<Note>) => void,
     private onStateChange: (state: PlayState) => void,
   ) {}
 
@@ -72,65 +86,101 @@ export class ScorePlayer {
     return this.state === "playing";
   }
 
+  /** Resume directly inside the user's tap, before fetching an optional SF2. */
+  unlockAudio(loading = false): void {
+    if (loading) this.setState("loading");
+    void this.audioContext().resume().catch(() => { /* play() reports a resume failure. */ });
+  }
+
+  private audioContext(): AudioContext {
+    if (!this.ctx || this.ctx.state === "closed") {
+      const ctx = new AudioContext();
+      this.ctx = ctx;
+      ctx.addEventListener("statechange", () => {
+        if (ctx !== this.ctx) return;
+        const state = String(ctx.state);
+        if (state === "interrupted" || state === "suspended" && this.state === "playing") this.stop();
+      });
+    }
+    return this.ctx;
+  }
+
+  /** Keep one decoded sampler bank across taps and replay. A changed timbre
+   * replaces the bank; ordinary stop only stops voices, not the audio device. */
+  private audioBank(sf2?: Sf2PlaybackOptions): AudioBank {
+    const ctx = this.audioContext();
+    const mapping = JSON.stringify(sf2?.instrumentByPart ?? []);
+    if (this.bank && this.bank.context === ctx && this.bank.bytes === sf2?.bytes && this.bank.mapping === mapping) return this.bank;
+    this.stopAudition();
+    if (this.bank) {
+      if (this.instruments === this.bank.instruments) this.instruments = [];
+      for (const instrument of this.bank.instruments) instrument.dispose();
+    }
+    const bank: AudioBank = { context: ctx, bytes: sf2?.bytes, mapping, instruments: [], byPart: [], ready: Promise.resolve() };
+    this.bank = bank;
+    bank.ready = (async () => {
+      try {
+        if (sf2) {
+          try { bank.byPart = await this.loadSf2Instruments(ctx, sf2, bank.instruments, () => this.bank === bank); }
+          catch (error) {
+            for (const instrument of bank.instruments) instrument.dispose();
+            if (this.bank !== bank) return;
+            console.warn("SF2 playback failed; using piano", error);
+            bank.instruments = [];
+          }
+        }
+        if (!bank.instruments.length) {
+          const piano = Soundfont(ctx, { kit: "FluidR3_GM", instrument: "acoustic_grand_piano" });
+          bank.instruments.push(piano);
+          await piano.ready;
+          bank.byPart = [piano];
+        }
+      } catch (error) {
+        if (this.bank === bank) this.bank = null;
+        for (const instrument of bank.instruments) instrument.dispose();
+        throw error;
+      }
+      if (this.bank !== bank) for (const instrument of bank.instruments) instrument.dispose();
+    })();
+    return bank;
+  }
+
   /** Play a short cursor audition using the assigned SF2 instrument per row. */
   async audition(notes: InputAuditionNote[], sf2?: Sf2PlaybackOptions): Promise<void> {
     if (notes.length === 0) return;
-    // Do not stop the previous session here.  A new cursor position may be
-    // selected while the previous chord is still sounding; Web Audio can
-    // overlap these sessions naturally and stopAudition() remains the explicit
-    // cancellation point used when leaving input mode.
+    const ctx = this.audioContext();
+    const bank = this.audioBank(sf2);
     const gen = this.auditionGen;
-    const ctx = new AudioContext();
     await ctx.resume();
-    let instruments: Smplr[] = [];
-    let byPart: Smplr[] = [];
-    if (sf2) {
-      try {
-        byPart = await this.loadSf2Instruments(ctx, sf2, instruments);
-      } catch (error) {
-        console.warn("input audition SF2 failed; using piano", error);
-        for (const instrument of instruments) instrument.dispose();
-        instruments = [];
-        byPart = [];
-      }
-    }
-    if (instruments.length === 0) {
-      const piano = Soundfont(ctx, {
-        kit: "FluidR3_GM",
-        instrument: "acoustic_grand_piano",
-      });
-      instruments.push(piano);
-      await piano.ready;
-      byPart = notes.map(() => piano);
-    }
-    if (gen !== this.auditionGen) {
-      for (const instrument of instruments) instrument.dispose();
-      void ctx.close();
-      return;
+    await bank.ready;
+    if (gen !== this.auditionGen || bank !== this.bank) return;
+    // Keep natural overlap, with a bounded number of active audition chords.
+    while (this.auditionSessions.size >= 8) {
+      const oldest = this.auditionSessions.values().next().value!;
+      window.clearTimeout(oldest.timer);
+      oldest.stop.forEach(stop => stop());
+      this.auditionSessions.delete(oldest);
     }
     const now = ctx.currentTime + 0.015;
     const sessionDuration = Math.max(
       0.05,
-      ...notes.map((note) => note.durationSeconds ?? 0.8),
+      ...notes.map((note) => (note.offsetSeconds ?? 0) + (note.durationSeconds ?? 0.8)),
     );
+    const stops: StopFn[] = [];
     for (const note of notes) {
-      const instrument = byPart[note.part] ?? instruments[0];
-      instrument.start({
+      const instrument = bank.byPart[note.part] ?? bank.instruments[0];
+      stops.push(instrument.start({
         note: note.pitch,
-        time: now,
+        time: now + Math.max(0, note.offsetSeconds ?? 0),
         duration: Math.max(0.05, note.durationSeconds ?? 0.8),
         velocity: 100,
-      });
+      }));
     }
-    const session: AuditionSession = { ctx, instruments, timer: 0 };
+    const session: AuditionSession = { stop: stops, timer: 0 };
     this.auditionSessions.add(session);
     session.timer = window.setTimeout(() => {
       this.auditionSessions.delete(session);
-      for (const instrument of session.instruments) {
-        instrument.stop();
-        instrument.dispose();
-      }
-      void session.ctx.close();
+      session.stop.forEach(stop => stop());
     }, Math.ceil((sessionDuration + 0.35) * 1000));
   }
 
@@ -138,11 +188,7 @@ export class ScorePlayer {
     this.auditionGen++;
     for (const session of this.auditionSessions) {
       window.clearTimeout(session.timer);
-      for (const instrument of session.instruments) {
-        instrument.stop();
-        instrument.dispose();
-      }
-      void session.ctx.close();
+      session.stop.forEach(stop => stop());
     }
     this.auditionSessions.clear();
   }
@@ -152,25 +198,30 @@ export class ScorePlayer {
     opts?: PlayOptions,
     start?: { chord: Chord; pass: number },
     sf2?: Sf2PlaybackOptions,
+    selection?: ReadonlySet<Note>,
   ): Promise<void> {
     this.stop();
     const gen = this.gen;
-    const tl = buildTimeline(score);
+    const scope = selection ? new Set(selection) : undefined;
+    const tl = scope ? buildSelectionTimeline(score, scope) : buildTimeline(score);
     if (tl.notes.length === 0) return;
+    this.selectionScope = scope;
 
     this.anchors = tl.anchors.map((a) => ({
       t: quarterToSeconds(tl.tempo, a.t0),
       chords: a.chords,
       pass: a.pass,
     }));
-    this.duration = tl.tempo.durationSeconds;
+    this.duration = quarterToSeconds(tl.tempo, tl.duration);
+    this.endTail = selection ? 0 : 0.3;
     this.curIdx = -1;
     // Selecting an SF2 explicitly opts out of the desktop native MIDI player.
     this.useNative = isTauriRuntime() && !sf2;
 
     // Start offset: if a note is selected, begin at that anchor's time.
-    let startSec = 0;
-    if (start) {
+    let startSec = selection ? quarterToSeconds(tl.tempo,
+      tl.notes.reduce((begin, note) => Math.min(begin, note.t0), Number.POSITIVE_INFINITY)) : 0;
+    if (start && !selection) {
       const a =
         tl.anchors.find((x) => x.chords.includes(start.chord) && x.pass === start.pass) ??
         tl.anchors.find((x) => x.chords.includes(start.chord));
@@ -182,7 +233,7 @@ export class ScorePlayer {
 
     if (this.useNative) {
       try {
-        const bytes = scoreToMidi(score, opts); // per-part CC7 volume baked in
+        const bytes = timelineToMidi(score, tl, opts); // per-part CC7 volume baked in
         const { invoke } = await import("@tauri-apps/api/core");
         if (gen !== this.gen) return;
         await invoke("midi_play_cmd", { bytes: Array.from(bytes), startSeconds: startSec });
@@ -198,38 +249,12 @@ export class ScorePlayer {
     }
 
     if (!this.useNative) {
-      const ctx = new AudioContext();
+      const ctx = this.audioContext();
       await ctx.resume();
-      if (gen !== this.gen) {
-        void ctx.close();
-        return;
-      }
-      let instruments: Smplr[] = [];
-      let instrumentByPart: Smplr[] = [];
-      if (sf2) {
-        try {
-          instrumentByPart = await this.loadSf2Instruments(ctx, sf2, instruments);
-        } catch (error) {
-          console.warn("SF2 playback failed, falling back to the default piano sampler", error);
-          for (const instrument of instruments) instrument.dispose();
-          instruments = [];
-          instrumentByPart = [];
-        }
-      }
-      if (instruments.length === 0) {
-        const fallback = Soundfont(ctx, {
-          kit: "FluidR3_GM",
-          instrument: "acoustic_grand_piano",
-        });
-        instruments.push(fallback);
-        await fallback.ready;
-        instrumentByPart = score.parts.map(() => fallback);
-      }
-      if (gen !== this.gen) {
-        for (const instrument of instruments) instrument.dispose();
-        void ctx.close();
-        return;
-      }
+      if (gen !== this.gen) return;
+      const bank = this.audioBank(sf2);
+      await bank.ready;
+      if (gen !== this.gen || bank !== this.bank) return;
       // base maps timeline second `startSec` to `ctx.currentTime + lead`.
       const lead = 0.15;
       const base = ctx.currentTime + lead - startSec;
@@ -237,7 +262,7 @@ export class ScorePlayer {
         const t0 = quarterToSeconds(tl.tempo, n.t0);
         const t1 = quarterToSeconds(tl.tempo, n.t1);
         if (t1 <= startSec) continue; // already finished before the start point
-        const instrument = instrumentByPart[n.part] ?? instruments[0];
+        const instrument = bank.byPart[n.part] ?? bank.instruments[0];
         instrument.start({
           note: n.pitch,
           time: Math.max(ctx.currentTime + lead, base + t0),
@@ -246,7 +271,7 @@ export class ScorePlayer {
         });
       }
       this.ctx = ctx;
-      this.instruments = instruments;
+      this.instruments = bank.instruments;
       this.startCtxTime = base;
     }
 
@@ -259,8 +284,9 @@ export class ScorePlayer {
     ctx: AudioContext,
     options: Sf2PlaybackOptions,
     loaded: Smplr[],
+    current: () => boolean,
   ): Promise<Smplr[]> {
-    const parsed = new SoundFont2(options.bytes);
+    const parsed = parseSoundfont(options.bytes);
     const names = [...new Set(
       parsed.instruments
         .map((instrument) => instrument.header.name.trim())
@@ -283,7 +309,9 @@ export class ScorePlayer {
         });
         loaded.push(instrument);
         await instrument.ready;
+        if (!current()) throw new DOMException("音源已切换", "AbortError");
         await instrument.loadInstrument(name);
+        if (!current()) throw new DOMException("音源已切换", "AbortError");
         byName.set(name, instrument);
       }
     } finally {
@@ -303,17 +331,13 @@ export class ScorePlayer {
     }
     for (const instrument of this.instruments) {
       instrument.stop();
-      instrument.dispose();
     }
     this.instruments = [];
-    if (this.ctx) {
-      void this.ctx.close();
-      this.ctx = null;
-    }
     if (this.useNative) {
       void import("@tauri-apps/api/core").then(({ invoke }) => invoke("midi_stop_cmd")).catch(() => {});
     }
     this.curIdx = -1;
+    this.selectionScope = undefined;
     this.onChord(null, 0);
     this.setState("stopped");
   }
@@ -329,7 +353,7 @@ export class ScorePlayer {
     // Clamp to the start point so the sampler's lead-in never lands the cursor
     // on the note just before a selection start.
     const t = Math.max(this.startSec, this.now());
-    if (t >= this.duration + 0.3) {
+    if (t >= this.duration + this.endTail) {
       this.stop();
       return;
     }
@@ -339,7 +363,7 @@ export class ScorePlayer {
     if (idx !== this.curIdx) {
       this.curIdx = idx;
       const a = idx >= 0 ? this.anchors[idx] : null;
-      this.onChord(a ? a.chords : null, a ? a.pass : 0);
+      this.onChord(a ? a.chords : null, a ? a.pass : 0, this.selectionScope);
     }
     this.raf = requestAnimationFrame(this.tick);
   };

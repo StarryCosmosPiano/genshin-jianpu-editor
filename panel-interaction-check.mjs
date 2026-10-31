@@ -26,6 +26,8 @@ const server = createServer(async (request, response) => {
 await new Promise((resolve) => server.listen(0, resolve));
 const browser = await chromium.launch({ channel: "msedge", headless: true });
 const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
+// Phone/tablet forms have their own workflow; retain desktop panel regression here.
+await page.addInitScript(() => localStorage.setItem('jpeditor:workspace-mode:v1', 'desktop'));
 const errors = [];
 page.on("pageerror", (error) => errors.push(error.message));
 const pane = page.locator("#inspector-pane");

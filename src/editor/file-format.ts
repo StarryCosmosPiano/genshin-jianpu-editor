@@ -42,7 +42,7 @@ export const SCORE_OPEN_TAURI_EXTENSIONS = Object.freeze([
   ...SCORE_OPEN_EXTENSIONS.filter((extension) => extension !== "jpwabc"),
 ]);
 
-export const SCORE_OPEN_DESCRIPTION = "简谱 / 斜杠谱 TXT / MIDI / MusicXML / ABC";
+export const SCORE_OPEN_DESCRIPTION = "简谱 / 文本谱 TXT / MIDI / MusicXML / ABC";
 
 export const SCORE_OPEN_INPUT_ACCEPT = SCORE_OPEN_EXTENSIONS
   .map((extension) => `.${extension}`)

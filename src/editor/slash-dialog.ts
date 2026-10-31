@@ -10,6 +10,7 @@ import {
   defaultSlashScoreOptions,
   inferSlashMeter,
   parseSlashScore,
+  rewriteSlashDurationDirectives,
   type SlashBraceMode,
   type SlashDurationDivision,
   type SlashGroupMode,
@@ -20,6 +21,9 @@ import {
 import { fileStem } from "./file-format";
 import { openInspector } from "../ui/inspector";
 import { retainDetailsScroll } from "../ui/details-scroll-retention";
+import { SlashScorePreview } from "./slash-score-preview";
+import { blockImportBackground } from "../ui/import-dialog";
+import { reencodeSourceTimedRows } from "../slashscore/add-slashes";
 
 const DIVISIONS: SlashDurationDivision[] = [4, 8, 16, 32, 64];
 
@@ -44,12 +48,14 @@ function divisionSelect(value: SlashDurationDivision | null): HTMLSelectElement 
   const select = document.createElement("select");
   select.append(option("", "留空（不作为时值）", value === null));
   for (const division of DIVISIONS) select.append(option(String(division), `${division} 分音符`, value === division));
+  // Preserve a generated fine value without adding it to new MIDI/grid choices.
+  if (value === 128) select.append(option("128", "128 分音符", true));
   return select;
 }
 
 function selectedDivision(select: HTMLSelectElement): SlashDurationDivision | null {
   const value = parseInt(select.value, 10);
-  return DIVISIONS.includes(value as SlashDurationDivision) ? value as SlashDurationDivision : null;
+  return value === 128 || DIVISIONS.includes(value as SlashDurationDivision) ? value as SlashDurationDivision : null;
 }
 
 function groupModeSelect(value: SlashGroupMode): HTMLSelectElement {
@@ -79,6 +85,11 @@ interface SymbolRow {
 }
 
 type SlashDialogPurpose = "import" | "settings";
+
+export interface SlashScoreImportResult {
+  text: string;
+  options: SlashScoreOptions;
+}
 
 function activeSymbolRows(rows: SymbolRow[], multiple: boolean): SymbolRow[] {
   return multiple ? rows : rows.slice(0, 1);
@@ -117,15 +128,20 @@ export function showSlashScoreImportDialog(
   fileName: string,
   seed?: Partial<SlashScoreOptions>,
   purpose: SlashDialogPurpose = "import",
-): Promise<SlashScoreOptions | null> {
+): Promise<SlashScoreImportResult | null> {
   return new Promise((resolve) => {
     const defaults = defaultSlashScoreOptions(analysis.detectedKind, analysis);
     const initial: SlashScoreOptions = {
       ...defaults,
       ...seed,
-      symbolDurations: { ...defaults.symbolDurations, ...seed?.symbolDurations },
+      symbolDurations: seed?.symbolDurations
+        ? { ...seed.symbolDurations }
+        : { ...defaults.symbolDurations },
     };
     if (!initial.title || initial.title === "未命名") initial.title = analysis.title || fileStem(fileName) || "未命名";
+    const sourceOptions = structuredClone(initial);
+    const rewritesDurations = purpose === "import" && sourceOptions.sourceTimedRows === true;
+    const requiresSymbolMapping = purpose === "import" && !rewritesDurations && analysis.requiresSymbolMapping === true;
 
     const overlay = document.createElement("div");
     overlay.className = "modal-overlay";
@@ -203,10 +219,12 @@ export function showSlashScoreImportDialog(
     }
     const beats = document.createElement("input");
     beats.type = "number";
+    beats.dataset.slashImport = "beats";
     beats.min = "1";
     beats.max = "32";
     beats.value = String(initial.beats);
     const beatType = document.createElement("select");
+    beatType.dataset.slashImport = "beat-type";
     for (const value of [2, 4, 8, 16]) beatType.append(option(String(value), String(value), value === initial.beatType));
     const meter = document.createElement("span");
     meter.className = "midi-meter-control";
@@ -258,13 +276,15 @@ export function showSlashScoreImportDialog(
     mappingSummary.textContent = "时值符号对应（可全部自定义）";
     const mappingHint = document.createElement("div");
     mappingHint.className = "modal-hint";
-    mappingHint.textContent = "符号每出现一次就给相邻音符增加所选时值；例如“.”设为8分、“=”设为16分时，两个“=”会和一个“.”产生相同音长。符号栏留空但选择了时值时，代表把普通空格当作该时值；选择“不作为时值”才会忽略。";
+    mappingHint.textContent = rewritesDurations
+      ? "这里选择导入后的符号写法，音长按第一步确认的时值保持不变。例如原来的 + 是八分音符，改用三十二分音符的 . 后，一个 + 会换成四个点。目标符号须能表达原谱最短时值；可切换右侧“文本谱”查看结果。"
+      : "符号每出现一次就给相邻音符增加所选时值；例如“.”设为8分、“=”设为16分时，两个“=”会和一个“.”产生相同音长。符号栏留空但选择了时值时，代表把普通空格当作该时值；选择“不作为时值”才会忽略。";
 
     const symbols = [...new Set([...Object.keys(initial.symbolDurations), ...analysis.observedSymbols])];
-    if (symbols.length === 0) symbols.push(".");
     while (symbols.length < 5) symbols.push("");
     const useMultipleSymbols = document.createElement("input");
     useMultipleSymbols.type = "checkbox";
+    useMultipleSymbols.dataset.slashImport = "multiple-symbols";
     useMultipleSymbols.checked = initial.multiDurationSymbols ?? false;
     const symbolGrid = document.createElement("div");
     symbolGrid.className = "slash-symbol-grid";
@@ -294,7 +314,7 @@ export function showSlashScoreImportDialog(
     const noteDivision = divisionSelect(initial.noteDivision);
     noteDivision.name = "noteDivision";
     const noteHint = document.createElement("small");
-    noteHint.textContent = "设置后，每个单音或括号和弦先具有一次所选基础时值，再叠加相邻空格和时值符号；括号里的多个键仍只算一个同时发声的和弦。";
+      noteHint.textContent = "设置后，每个单音、和弦括号或三连音括号整体先占一次所选时值，再叠加紧随其后的空格和时值符号。三连音内部按各成员的相对时值分配整组时长；例如设为16分音符时，[QWE]整组占一个16分音符。";
     const noteWrap = document.createElement("span");
     noteWrap.className = "slash-space-control";
     noteWrap.append(noteDivision, noteHint);
@@ -333,6 +353,18 @@ export function showSlashScoreImportDialog(
     // offered as a new setting.
     const angleMode = groupModeSelect(initial.angleMode ?? "grace");
     const parenMode = groupModeSelect(initial.parenMode ?? "chord");
+    const bracketFields = [
+      { id: "brace", label: "花括号 {}", control: braceMode },
+      { id: "bracket", label: "方括号 []", control: bracketMode },
+      { id: "bar", label: "竖线括号 | |", control: barMode },
+      { id: "angle", label: "尖括号 <>", control: angleMode },
+      { id: "paren", label: "圆括号 ()", control: parenMode },
+    ] as const;
+    for (const field of bracketFields) field.control.dataset.slashImport = field.id;
+    const bracketWarning = document.createElement("div");
+    bracketWarning.className = "midi-import-warning slash-bracket-warning";
+    bracketWarning.dataset.slashImport = "bracket-warning";
+    bracketWarning.setAttribute("role", "status");
     const ordering = document.createElement("select");
     ordering.append(
       option("pitch-asc", "音高正序（低音到高音）", (initial.ordering ?? "pitch-asc") === "pitch-asc"),
@@ -344,12 +376,13 @@ export function showSlashScoreImportDialog(
 
     const meterHint = document.createElement("div");
     meterHint.className = "slash-meter-hint";
+    meterHint.dataset.slashImport = "meter-hint";
     const warning = document.createElement("div");
     warning.className = "midi-import-warning";
     warning.hidden = true;
     // Import may seed an inferred meter. Editing an existing document must
     // preserve its stored meter unless the user explicitly changes it.
-    let meterTouched = purpose === "settings";
+    let meterTouched = purpose === "settings" || seed?.beats !== undefined || initial.sourceTimedRows === true;
 
     const currentMappings = () => collectMappings(symbolRows, useMultipleSymbols.checked);
     const currentSpaceDivision = () => mappedSpaceDivision(
@@ -381,17 +414,38 @@ export function showSlashScoreImportDialog(
           parenMode: parenMode.value as SlashGroupMode,
         },
       );
-      meterHint.textContent = `按当前符号推荐：${suggestion.beats}/${suggestion.beatType}；` +
+      // The initial analysis compares competing timing interpretations. Do
+      // not turn its uncertain candidate into apparently certain evidence by
+      // running that candidate through the meter estimator a second time.
+      const requiresMeterInput = !meterTouched
+        ? analysis.requiresMeterInput === true || suggestion.requiresInput === true
+        : suggestion.requiresInput ?? analysis.requiresMeterInput ?? false;
+      meterHint.textContent = initial.sourceTimedRows
+        ? rewritesDurations ? "按第一步确认的音长换写目标符号；右侧预览显示最终导入结果。"
+          : "按原文符号累计时值，保留音符与符号写法；右侧谱面随设置更新。"
+        : requiresMeterInput ? "未能可靠识别拍号，请手动填写拍号后再导入；可先核对音符自身、空格和实际时值符号。"
+        : `${analysis.timingInferred ? "已按音符和空格时值识别，优先常用拍号" : "按当前时值推荐"}：${suggestion.beats}/${suggestion.beatType}；` +
         `典型每小节 ${suggestion.groupsPerMeasure} 个斜杠拍组，每组约 ${suggestion.groupQuarterNotes.toFixed(3)} 个四分音符。` +
         (selectedDivision(noteDivision) ? " 若分段按音符与空格自身时值明显超过一拍，会自动把每个 / 分段识别为整小节。" : "");
       if (!meterTouched) {
-        beats.value = String(suggestion.beats);
+        beats.value = requiresMeterInput ? "" : String(suggestion.beats);
+        beats.placeholder = requiresMeterInput ? "请填写" : "";
         beatType.value = String(suggestion.beatType);
         updateTempoUnit();
       }
-      const unmapped = analysis.observedSymbols.filter((symbol) => !(symbol in currentMappings()));
+      const detectedBrackets = bracketFields.filter(field => analysis.observedDelimiters?.includes(field.id));
+      const unassignedBrackets = detectedBrackets.filter(field => field.control.value === "none");
+      bracketWarning.hidden = detectedBrackets.length === 0;
+      bracketWarning.textContent = detectedBrackets.length
+        ? `检测到${detectedBrackets.map(field => field.label).join("、")}，请核对下方对应括号用途。` +
+          (unassignedBrackets.length
+            ? `${unassignedBrackets.map(field => field.label).join("、")}尚未指定用途；如需三连音、琶音或其他作用，请手动填写。`
+            : "当前用途将用于导入，可按原谱说明修改。")
+        : "";
+      const unmapped = rewritesDurations ? [] : analysis.observedSymbols.filter((symbol) => !(symbol in currentMappings()));
       warning.hidden = unmapped.length === 0;
-      warning.textContent = unmapped.length ? `⚠ 未映射符号 ${unmapped.join("、")} 将作为注释忽略。` : "";
+      warning.textContent = unmapped.length ? `⚠ 未映射符号 ${unmapped.join("、")} ` +
+        (initial.sourceTimedRows || requiresSymbolMapping ? "须指定时值后导入。" : "将作为注释忽略。") : "";
     };
     beats.oninput = () => {
       meterTouched = true;
@@ -471,6 +525,8 @@ export function showSlashScoreImportDialog(
     voiceCount.addEventListener("input", updateVoiceHint);
     const error = document.createElement("div");
     error.className = "midi-import-warning";
+    error.dataset.slashImport = "error";
+    error.dataset.slashImport = "error";
     error.hidden = true;
 
     const footer = document.createElement("div");
@@ -506,6 +562,7 @@ export function showSlashScoreImportDialog(
       tempoUnitRow,
       meterHint,
       mappingDetails,
+      bracketWarning,
       row("花括号 {}", braceMode),
       row("方括号 []", bracketMode),
       row("竖线括号 | |", barMode),
@@ -517,13 +574,36 @@ export function showSlashScoreImportDialog(
       error,
       footer,
     );
+    const preview = purpose === "import" ? new SlashScorePreview() : null;
+    const importControls = document.createElement("div");
+    let releaseBackground: (() => void) | null = null;
     if (purpose === "import") {
+      box.classList.add("slash-import-preview-box");
+      box.setAttribute("role", "dialog");
+      box.setAttribute("aria-modal", "true");
+      box.setAttribute("aria-label", heading.textContent ?? "导入乐谱");
+      importControls.className = "slash-import-preview-controls";
+      const body = document.createElement("div");
+      body.className = "slash-import-preview-body";
+      // Keep existing controls/classes intact; only the import modal gains a
+      // separate score pane. The settings inspector keeps its existing layout.
+      for (const item of Array.from(box.children)) {
+        if (item !== heading && item !== footer) importControls.append(item);
+      }
+      body.append(importControls, preview!.element);
+      box.insertBefore(body, footer);
       overlay.append(box);
       document.body.append(overlay);
+      releaseBackground = blockImportBackground(overlay);
     }
-    const releaseImportScroll = purpose === "import" ? retainDetailsScroll(box, box) : null;
+    const releaseImportScroll = purpose === "import" ? retainDetailsScroll(importControls, importControls) : null;
 
     const readOptions = (): SlashScoreOptions => ({
+      headerTypography: initial.headerTypography,
+      // These semantic fields have no controls, but must survive a fresh
+      // import/settings apply when the accepted options replace the footer.
+      annotations: structuredClone(initial.annotations ?? []),
+      noteTimingEdits: structuredClone(initial.noteTimingEdits ?? []),
       kind: kind.value as SlashScoreKind,
       keyboardKeyLabels: kind.value === "keyboard" && keyboardKeyLabels.checked,
       keyboardTieAsZero: keyboardTieAsZero.checked,
@@ -553,6 +633,8 @@ export function showSlashScoreImportDialog(
       multiDurationSymbols: useMultipleSymbols.checked,
       spaceDivision: currentSpaceDivision(),
       noteDivision: selectedDivision(noteDivision),
+      sourceTimedRows: initial.sourceTimedRows,
+      adjacentAsChord: initial.adjacentAsChord,
       wholeMeasureGroups: initial.wholeMeasureGroups || analysis.wholeMeasureGroups
         ? true
         : undefined,
@@ -567,6 +649,43 @@ export function showSlashScoreImportDialog(
       tempoMarks: initial.tempoMarks?.map((mark) => ({ ...mark })) ?? [],
       keyChanges: initial.keyChanges?.map((change) => ({ ...change })) ?? [],
     });
+
+    const prepareDraft = (): SlashScoreImportResult => {
+      const enteredBeats = Number(beats.value);
+      const enteredBeatType = Number(beatType.value);
+      if (!beats.value.trim() || !Number.isInteger(enteredBeats) || enteredBeats < 1 || enteredBeats > 32
+        || ![2, 4, 8, 16].includes(enteredBeatType)) {
+        throw new Error("请手动填写有效拍号（拍数为 1–32 的整数）。");
+      }
+      const options = readOptions();
+      if (requiresSymbolMapping) {
+        const unmapped = analysis.observedSymbols.filter(symbol => !(symbol in options.symbolDurations));
+        if (unmapped.length) throw new Error(`请为时值符号 ${unmapped.join("、")} 分别填写时值；多种符号请开启“使用多种符号”。`);
+      }
+      if (!rewritesDurations) return { text, options };
+      const result = reencodeSourceTimedRows(text, sourceOptions, options);
+      if (!result.canImport) throw new Error(result.errors[0] || "当前符号不能准确表达原谱时值，请调整符号时值。");
+      const hasDurationInstructions = /^\s*(?:点|两个点|符号\s*[（(].*?[）)]|空格|音符(?:自身时值)?|音自身时值|[^\sA-Za-z0-9\u3400-\u9fff])\s*[=＝：:]/im.test(text);
+      const output = result.text !== text && hasDurationInstructions
+        ? rewriteSlashDurationDirectives(result.text, result.options)
+        : result.text;
+      return { text: output, options: result.options };
+    };
+    const updatePreview = (): void => {
+      if (!preview) return;
+      try {
+        const draft = prepareDraft();
+        error.hidden = true;
+        confirm.disabled = false;
+        preview.set(draft.text, draft.options);
+      } catch (reason) {
+        const message = reason instanceof Error ? reason.message : String(reason);
+        error.hidden = false;
+        error.textContent = message;
+        confirm.disabled = true;
+        preview.showError(message, text);
+      }
+    };
 
     let dirty = false;
     const markDirty = () => {
@@ -602,6 +721,7 @@ export function showSlashScoreImportDialog(
       const notationRules = section("时值与括号规则");
       notationRules.append(
         mappingDetails,
+        bracketWarning,
         row("花括号 {}", braceMode), row("方括号 []", bracketMode),
         row("竖线括号 | |", barMode), row("尖括号 <>", angleMode),
         row("圆括号 ()", parenMode), warning,
@@ -614,19 +734,30 @@ export function showSlashScoreImportDialog(
     } else {
       box.addEventListener("input", markDirty);
       box.addEventListener("change", markDirty);
+      box.addEventListener("input", updatePreview);
+      box.addEventListener("change", updatePreview);
     }
 
-    const close = (value: SlashScoreOptions | null) => {
+    const onImportKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      event.stopPropagation();
+      close(null);
+    };
+    const close = (value: SlashScoreImportResult | null) => {
       releaseImportScroll?.();
+      preview?.destroy();
+      document.removeEventListener("keydown", onImportKeyDown, true);
       overlay.remove();
+      releaseBackground?.();
       resolve(value);
     };
-    const validatedOptions = (): SlashScoreOptions | null => {
-      const value = readOptions();
+    const validatedDraft = (): SlashScoreImportResult | null => {
       try {
-        parseSlashScore(text, value);
+        const draft = prepareDraft();
+        parseSlashScore(draft.text, draft.options);
         error.hidden = true;
-        return value;
+        return draft;
       } catch (reason) {
         error.hidden = false;
         error.textContent = reason instanceof Error ? reason.message : String(reason);
@@ -635,14 +766,18 @@ export function showSlashScoreImportDialog(
       }
     };
     const applyAndClose = () => {
-      const value = validatedOptions();
+      const value = validatedDraft();
       if (value) close(value);
     };
     updateTempoUnit();
     updateKindControls();
     updateSymbolRows();
     updateRecommendation();
+    // Import suggestions initialize the form once. Later changes recompute
+    // the hint without replacing a meter the user is reviewing or editing.
+    meterTouched = true;
     updateVoiceHint();
+    updatePreview();
     if (purpose === "settings") {
       let appliedOptions: SlashScoreOptions | null = null;
       let releaseSettingsScroll: (() => void) | null = null;
@@ -650,6 +785,7 @@ export function showSlashScoreImportDialog(
         if (!settingsBody.isConnected) return;
         const changes = (event as CustomEvent<Partial<SlashScoreOptions>>).detail;
         if (!changes || typeof changes !== "object") return;
+        if ("headerTypography" in changes) initial.headerTypography = changes.headerTypography;
         for (const [field, input] of [
           ["title", title], ["subtitle", subtitle], ["composer", composer],
           ["arranger", arranger], ["lyricist", lyricist],
@@ -697,13 +833,19 @@ export function showSlashScoreImportDialog(
         body: settingsBody,
         isDirty: () => dirty,
         onApply: () => {
-          appliedOptions = validatedOptions();
+          // Applying an untouched inspector is a close operation. Avoid
+          // materializing timing overlays or rewriting the saved document.
+          if (!dirty) {
+            appliedOptions = null;
+            return true;
+          }
+          appliedOptions = validatedDraft()?.options ?? null;
           return appliedOptions !== null;
         },
         onClosed: (applied) => {
           releaseSettingsScroll?.();
           document.removeEventListener("editor:header-changed", onHeaderChanged);
-          resolve(applied ? appliedOptions : null);
+          resolve(applied && appliedOptions ? { text, options: appliedOptions } : null);
         },
         applyText: "应用到当前乐谱",
         initialFocus: kind,
@@ -719,28 +861,26 @@ export function showSlashScoreImportDialog(
       return;
     }
     cancel.onclick = () => close(null);
-    overlay.onclick = (event) => {
-      if (event.target !== overlay) return;
-      close(null);
-    };
+    document.addEventListener("keydown", onImportKeyDown, true);
     confirm.onclick = applyAndClose;
     kind.focus();
   });
 }
 
 /** Reuse the complete import configuration as an editor for the current slash-score document. */
-export function showSlashScoreSettingsDialog(
+export async function showSlashScoreSettingsDialog(
   text: string,
   current: SlashScoreOptions,
 ): Promise<SlashScoreOptions | null> {
   const analysis = analyzeSlashScore(text);
-  return showSlashScoreImportDialog(
+  const result = await showSlashScoreImportDialog(
     text,
     { ...analysis, detectedKind: current.kind },
     `${current.title.trim() || "当前乐谱"}.txt`,
     current,
     "settings",
   );
+  return result?.options ?? null;
 }
 
 export function showCreateScoreDialog(): Promise<"jpw" | SlashScoreKind | null> {

@@ -70,7 +70,15 @@ if (typeof window === 'undefined') {
             shouldDeregister: () => false,
             coepCredentialless: () => !(window.chrome !== undefined || window.netscape !== undefined),
             coepDegrade: () => true,
-            doReload: () => window.location.reload(),
+            doReload: () => {
+                // Never interrupt a mounted editor, including its uncommitted
+                // form/text drafts. The worker is used on the next page load.
+                if (window.__app?.view) {
+                    document.dispatchEvent(new Event("editor:update-ready"));
+                    return;
+                }
+                window.location.reload();
+            },
             quiet: false,
             ...window.coi
         };

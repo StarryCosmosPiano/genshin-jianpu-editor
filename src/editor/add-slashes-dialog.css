@@ -1,0 +1,48 @@
+.add-slashes-dialog { container-type: inline-size; }
+.add-slashes-dialog .add-slashes-workspace { display: grid; grid-template-columns: minmax(320px, .95fr) minmax(0, 1.1fr); gap: 0; padding: 0; overflow: hidden; }
+.add-slashes-controls { min-width: 0; min-height: 0; padding: 14px 18px; overflow: auto; }
+.add-slashes-score { position: relative; display: flex; flex-direction: column; min-width: 0; min-height: 0; padding: 14px; overflow: hidden; border-left: 1px solid var(--border); background: var(--surface-2, var(--surface)); }
+.add-slashes-score > [data-add-slashes="score-preview"] { flex: 1 1 auto; min-height: 0; overflow: auto; }
+.add-slashes-score .slash-score-preview-sheet { position: relative; min-height: 0; }
+.add-slashes-score .slash-score-preview-svg { position: static; inset: auto; display: block; width: 100%; height: auto; max-width: 100%; flex: none; }
+.add-slashes-dialog > .app-dialog-footer { position: relative; z-index: 1; background: var(--surface); }
+.add-slashes-dialog .add-slashes-intro, .add-slashes-dialog .add-slashes-note { color: var(--muted); font-size: 12px; }
+.add-slashes-meter-guide { padding: 11px 13px; margin-bottom: 12px; border: 1px solid var(--purple-ink); border-radius: 8px; background: var(--surface-2, var(--surface)); }
+.add-slashes-meter-guide strong { color: var(--purple-ink); font-size: 14px; }
+.add-slashes-meter-guide p { margin: 5px 0 0; color: var(--text); font-size: 12px; line-height: 1.6; }
+.add-slashes-analysis-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.add-slashes-settings { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.add-slashes-settings > :first-child { grid-column: 1 / -1; }
+.add-slashes-dialog .app-dialog-field { margin-bottom: 8px; gap: 5px; font-size: 13px; }
+.add-slashes-dialog .app-dialog-field input, .add-slashes-dialog .app-dialog-field select { min-height: 34px; padding: 6px 9px; }
+.add-slashes-meter { display: flex; align-items: center; gap: 7px; }
+.add-slashes-meter input { width: 92px !important; }
+.add-slashes-meter select { width: 70px !important; }
+.add-slashes-timing { display: flex; flex-wrap: wrap; align-items: start; gap: 10px 16px; padding: 10px 0; }
+.add-slashes-timing .app-dialog-field { min-width: 122px; }
+.add-slashes-symbol { min-width: 98px !important; }
+.add-slashes-chord { display: flex; align-items: center; gap: 7px; padding: 8px 0; font-size: 13px; }
+.add-slashes-chord[hidden] { display: none; }
+.add-slashes-chord input { accent-color: var(--purple-ink); }
+.add-slashes-dialog button { font: inherit; cursor: pointer; }
+.add-slashes-analyze, .add-slashes-candidates button { border: 1px solid var(--border); border-radius: 8px; background: var(--surface); color: var(--text); padding: 7px 10px; }
+.add-slashes-analyze:hover, .add-slashes-candidates button:hover { background: var(--hover); color: var(--purple-ink); }
+.add-slashes-dialog button:disabled { opacity: .45; cursor: default; }
+.add-slashes-candidates { display: flex; gap: 8px; flex-wrap: wrap; margin: 6px 0 10px; }
+.add-slashes-candidates button { max-width: 100%; text-align: left; font-size: 12px; white-space: pre-line; line-height: 1.5; }
+.add-slashes-text textarea { height: 200px; min-height: 130px !important; font: 12px/1.65 Consolas, monospace !important; overflow: auto; white-space: pre; }
+.add-slashes-text textarea[readonly] { background: var(--surface-2, var(--surface)); }
+.add-slashes-text details .app-dialog-field { margin-top: 8px; }
+.add-slashes-dialog .add-slashes-status { font-size: 13px; margin: 8px 0; }
+.add-slashes-detail { margin-top: 10px; color: var(--muted); font-size: 12px; }
+.add-slashes-detail summary { cursor: pointer; }
+.add-slashes-detail table { width: 100%; margin-top: 8px; border-collapse: collapse; color: var(--text); font-size: 12px; }
+.add-slashes-detail th, .add-slashes-detail td { border-bottom: 1px solid var(--border); padding: 5px 7px; text-align: left; }
+.add-slashes-dialog .add-slashes-warning { color: var(--gold-ink); font-size: 12px; }
+.add-slashes-dialog :focus-visible { outline: 2px solid var(--purple-ink); outline-offset: 2px; }
+@container (max-width: 760px) {
+  .add-slashes-dialog .add-slashes-workspace { display: block; overflow: auto; }
+  .add-slashes-controls { overflow: visible; }
+  .add-slashes-score { height: 440px; min-height: 380px; border-left: 0; border-top: 1px solid var(--border); }
+  .add-slashes-text textarea { height: 170px; }
+}

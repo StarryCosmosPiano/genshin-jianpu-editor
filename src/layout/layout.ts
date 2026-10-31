@@ -8,6 +8,8 @@ import { pathTightBounds } from "../common/measure";
 import { Font } from "./font";
 import { normalizeEngravingStyle, type EngravingStyle } from "./style";
 import { staffBraceSegments } from "./brace";
+import { buildRhythmGrid } from "./rhythm-grid";
+import { RHYTHM_GUIDE_STYLE, rhythmGuideStrokeWidth, rhythmGuideTickHeight } from "./rhythm-guide-style";
 import {
   buildMeasureLayout,
   packMeasureSystems,
@@ -17,7 +19,9 @@ import {
 } from "./horizontal";
 import { MetaData, GlyphCodes } from "../smufl/smufl";
 import * as S from "../score/score";
+import { chordArpeggioNoteGroups } from "../score/arpeggio";
 import { buildScoreLayoutSnapshot, type ScoreLayoutSnapshot } from "./score-layout-snapshot";
+import { headerFontSize, type HeaderTypography, type HeaderTextField } from "../score/header-typography";
 
 function getOrNull<T>(arr: T[], i: number): T | null {
   return i >= 0 && i < arr.length ? arr[i] : null;
@@ -674,8 +678,6 @@ export class NoteEntry extends Entry {
   notations: SmuflText[] = [];
   /** Selectable visual group for each non-metrical grace note. */
   graceItems = new Map<S.Note, Group>();
-  /** Left edge before a cross-part arpeggio reserve is added. */
-  crossArpeggioVisualLeft: number | null = null;
   private rowYs: number[] = [];
 
   constructor() {
@@ -984,64 +986,93 @@ export class NoteEntry extends Entry {
     }
   }
 
+  arpeggioMemberBounds(pitches: readonly number[], options: LayoutOptions): { top: number; bottom: number } | null {
+    if (this.numbers.length !== this.chord.notes.length) return null;
+    const remaining = [...pitches];
+    const rows = this.chord.notes.flatMap((note, index) => {
+      if (note.rest) return [];
+      const match = remaining.indexOf(note.pitch);
+      if (match < 0) return [];
+      remaining.splice(match, 1);
+      return [index];
+    });
+    return this.arpeggioRowBounds(rows, options);
+  }
+
+  private arpeggioRowBounds(rows: readonly number[], options: LayoutOptions): { top: number; bottom: number } | null {
+    if (rows.length === 0) return null;
+    // Group.update rebases children into a normalized box. Read the rendered
+    // baseline after those translations, not the original pre-layout rowYs.
+    const baseline = (index: number): number => (this.numbers[index]?.y ?? this.rowYs[index] ?? 0)
+      - NoteEntry.noteBaselineOffset(this.chord.notes[index], options);
+    const top = Math.min(...rows.map(index => baseline(index)
+      + NoteEntry.noteTop(this.chord.notes[index], options)));
+    const bottom = Math.max(...rows.map(index => baseline(index)
+      + NoteEntry.noteBottom(this.chord.notes[index], this.chord, options)));
+    return Number.isFinite(top) && Number.isFinite(bottom) ? { top, bottom } : null;
+  }
+
+  arpeggioVisualLeft(): number {
+    const visible = this.group.children.filter(child => child.affectsLayout
+      && !child.classes.has("jianpu-cross-part-arpeggio-reserve"));
+    return visible.length > 0 ? Math.min(...visible.map(child => child.x
+      + (child instanceof Group ? child.childrenBound.left : child.bound.left))) : 0;
+  }
+
   private static addArpeggio(
     ch: S.Chord,
     options: LayoutOptions,
     ent: NoteEntry,
   ): number {
-    const existingLeft = Math.min(0, ...ent.group.children.map((child) => child.x));
-    if (!ch.arpeggio) return existingLeft;
-    const pitchRange = ch.arpeggioPitches?.length
-      ? new Set(ch.arpeggioPitches)
-      : null;
-    const coveredRows = ch.notes.flatMap((note, index) =>
-      !note.rest && (!pitchRange || pitchRange.has(note.pitch)) ? [index] : []);
-    if (coveredRows.length < 2) return existingLeft;
-
-    let top = Number.POSITIVE_INFINITY;
-    let bottom = Number.NEGATIVE_INFINITY;
-    for (const index of coveredRows) {
-      const note = ch.notes[index];
-      const rowY = ent.rowYs[index] ?? 0;
-      top = Math.min(top, rowY + NoteEntry.noteTop(note, options));
-      bottom = Math.max(bottom, rowY + NoteEntry.noteBottom(note, ch, options));
-    }
-    if (!Number.isFinite(top) || !Number.isFinite(bottom)) return existingLeft;
-    if (bottom - top < options.numberSize * 0.72) {
-      const center = (top + bottom) / 2;
-      top = center - options.numberSize * 0.36;
-      bottom = center + options.numberSize * 0.36;
-    }
-
+    const existingLeft = Math.min(0, ...ent.group.children.map(child => child.x));
+    const groups = chordArpeggioNoteGroups(ch);
+    if (groups.length === 0) return existingLeft;
     const amplitude = Math.max(options.musicLength(1.5), options.numberSize * 0.055);
     const halfWave = Math.max(options.musicLength(3), options.numberSize * 0.12);
     const gap = options.numberSize * 0.12;
-    const centerX = existingLeft - gap - amplitude;
-    const path = new GraphicPath();
-    // The arpeggio glyph is a selectable semantic object, not just decoration.
-    path.data = ch;
-    path.selectable = true;
-    path.classes.add("jianpu-arpeggio");
-    path.stroke = true;
-    path.fill = false;
-    path.strokeColor = options.color;
-    path.strokeWidth = Math.max(options.musicLength(1), options.numberSize * 0.035);
-    path.moveTo(centerX, top);
-    let y = top;
-    let direction = 1;
-    while (y < bottom - 1e-6) {
-      const next = Math.min(bottom, y + halfWave);
-      const dy = next - y;
-      path.cubicTo(
-        centerX + amplitude * direction, y + dy * 0.22,
-        centerX + amplitude * direction, y + dy * 0.78,
-        centerX, next,
-      );
-      direction *= -1;
-      y = next;
+    const laneWidth = amplitude * 2 + gap;
+    const occupied: Array<{ top: number; bottom: number; lane: number }> = [];
+    let leftEdge = existingLeft;
+    for (const members of groups) {
+      const bounds = ent.arpeggioRowBounds(members.map(note => ch.notes.indexOf(note)), options);
+      if (!bounds) continue;
+      let { top, bottom } = bounds;
+      if (bottom - top < options.numberSize * 0.72) {
+        const center = (top + bottom) / 2;
+        top = center - options.numberSize * 0.36;
+        bottom = center + options.numberSize * 0.36;
+      }
+      let lane = 0;
+      while (occupied.some(item => item.lane === lane
+        && top < item.bottom + gap && bottom > item.top - gap)) lane++;
+      occupied.push({ top, bottom, lane });
+      const centerX = existingLeft - gap - amplitude - lane * laneWidth;
+      const path = new GraphicPath();
+      path.data = ch;
+      path.selectable = true;
+      path.classes.add("jianpu-arpeggio");
+      path.stroke = true;
+      path.fill = false;
+      path.strokeColor = options.color;
+      path.strokeWidth = Math.max(options.musicLength(1), options.numberSize * 0.035);
+      path.moveTo(centerX, top);
+      let y = top;
+      let direction = 1;
+      while (y < bottom - 1e-6) {
+        const next = Math.min(bottom, y + halfWave);
+        const dy = next - y;
+        path.cubicTo(
+          centerX + amplitude * direction, y + dy * 0.22,
+          centerX + amplitude * direction, y + dy * 0.78,
+          centerX, next,
+        );
+        direction *= -1;
+        y = next;
+      }
+      ent.group.add(path);
+      leftEdge = Math.min(leftEdge, centerX - amplitude - path.strokeWidth / 2);
     }
-    ent.group.add(path);
-    return centerX - amplitude;
+    return leftEdge;
   }
 
   private static addGraceNotes(
@@ -1386,70 +1417,11 @@ function buildRhythmGuideGrid(
 
   const meterAnchor = anchors.find((anchor) =>
     anchor.entry.syncBeats > 0 && anchor.entry.syncBeatType > 0)?.entry;
-  const beats = meterAnchor?.syncBeats ?? 4;
-  const beatType = meterAnchor?.syncBeatType ?? 4;
-  let division = Math.max(4, beatType);
-  if (style.rhythmGuideMode === "manual") {
-    division = Math.max(division, style.rhythmGuideDivision);
-  } else {
-    for (const anchor of anchors) {
-      if (anchor.entry instanceof NoteEntry) {
-        division = Math.max(division, Math.min(64, 4 * (1 << Math.max(0, anchor.entry.beams))));
-      }
-    }
-  }
-
-  // Multiple synchronized voices occasionally differ by a fraction of a
-  // pixel after glyph alignment. Average their same-tick anchors so neither
-  // the top nor bottom voice silently wins the input coordinate.
-  const buckets = new Map<number, { sum: number; count: number }>();
-  for (const anchor of anchors) {
-    const key = [...buckets.keys()].find((tick) => Math.abs(tick - anchor.tick) < 1e-8)
-      ?? anchor.tick;
-    const bucket = buckets.get(key) ?? { sum: 0, count: 0 };
-    bucket.sum += anchor.x;
-    bucket.count++;
-    buckets.set(key, bucket);
-  }
-  const unique = [...buckets.entries()]
-    .map(([tick, bucket]) => ({ tick, x: bucket.sum / bucket.count }))
-    .sort((left, right) => left.tick - right.tick);
-  const xAt = (tick: number): number => {
-    const exact = unique.find((item) => Math.abs(item.tick - tick) < 1e-8);
-    if (exact) return exact.x;
-    const rightIndex = unique.findIndex((item) => item.tick > tick);
-    if (rightIndex <= 0) return unique[0].x;
-    if (rightIndex < 0) return unique[unique.length - 1].x;
-    const left = unique[rightIndex - 1], right = unique[rightIndex];
-    const ratio = (tick - left.tick) / Math.max(1e-8, right.tick - left.tick);
-    return left.x + (right.x - left.x) * ratio;
-  };
-  const compound = beatType === 8 && beats >= 6 && beats % 3 === 0;
-  const majorStep = compound ? 3 * 4 / beatType : 4 / beatType;
-  // A dotted value sits halfway between two ordinary binary grid lines. Keep
-  // those underlying subdivisions available and visible, but mark only every
-  // third half-step as an active dotted position. This lets the ruler show
-  // where the skipped binary positions are instead of making them vanish.
-  const renderDivision = style.rhythmGuideDotted
-    ? Math.min(128, division * 2)
-    : division;
-  const minorStep = 4 / renderDivision;
-  const dottedStep = 6 / division;
-  const tickCount = Math.ceil(endAnchor.tick / minorStep - 1e-8);
-  const gridAnchors = Array.from({ length: tickCount }, (_, index) => {
-    const tick = index * minorStep;
-    const dottedRatio = tick / dottedStep;
-    const muted = style.rhythmGuideDotted
-      && Math.abs(dottedRatio - Math.round(dottedRatio)) >= 1e-7;
-    return { tick, x: xAt(tick), muted };
-  });
-  return {
-    endTick: endAnchor.tick,
-    endX: xAt(endAnchor.tick),
-    division,
-    majorStep,
-    gridAnchors,
-  };
+  return buildRhythmGrid({ anchors, endTick: endAnchor.tick,
+    beats: meterAnchor?.syncBeats ?? 4, beatType: meterAnchor?.syncBeatType ?? 4,
+    mode: style.rhythmGuideMode, manualDivision: style.rhythmGuideDivision, dotted: style.rhythmGuideDotted,
+    automaticDivisions: anchors.flatMap(anchor => anchor.entry instanceof NoteEntry
+      ? [Math.min(64, 4 * (1 << Math.max(0, anchor.entry.beams)))] : []) });
 }
 
 // ---------------- Line / layout ----------------
@@ -1723,20 +1695,28 @@ function addCrossPartArpeggios(
   lines: readonly Line[],
   opt: LayoutOptions,
 ): void {
+  const occupied: Array<{ measure: number; offset: Fraction; top: number; bottom: number; lane: number }> = [];
   for (const mark of marks) {
-    const selected = lines.flatMap((line) => line.entries
-      .filter((entry): entry is NoteEntry => entry instanceof NoteEntry
-        && entry.syncSourceMeasure === mark.measure
-        && entry.syncTick.equals(mark.offset)
-        && (mark.parts.length === 0 || mark.parts.includes(entry.sourcePartIndex)))
-      .map((entry) => ({ entry, box: entry.group.pos(target), bound: entry.group.childrenBound })));
-    if (selected.length < 2) continue;
-    const top = Math.min(...selected.map(({ box, bound }) => box.y + bound.top));
-    const bottom = Math.max(...selected.map(({ box, bound }) => box.y + bound.bottom));
-    const left = Math.min(...selected.map(({ entry, box, bound }) =>
-      box.x + (entry.crossArpeggioVisualLeft ?? bound.left)));
+    const selected = lines.flatMap(line => line.entries.flatMap(entry => {
+      if (!(entry instanceof NoteEntry) || entry.syncSourceMeasure !== mark.measure
+        || !entry.syncTick.equals(mark.offset)) return [];
+      const pitches = mark.pitches.filter(item => item.part === entry.sourcePartIndex).map(item => item.pitch);
+      const bounds = entry.arpeggioMemberBounds(pitches, opt);
+      return bounds ? [{ entry, box: entry.group.pos(target), bounds }] : [];
+    }));
+    if (new Set(selected.map(item => item.entry.sourcePartIndex)).size < 2) continue;
+    const top = Math.min(...selected.map(({ box, bounds }) => box.y + bounds.top));
+    const bottom = Math.max(...selected.map(({ box, bounds }) => box.y + bounds.bottom));
+    const left = Math.min(...selected.map(({ entry, box }) =>
+      box.x + entry.arpeggioVisualLeft()));
     const amplitude = Math.max(opt.musicLength(1.5), opt.numberSize * 0.055);
-    const centerX = left - opt.numberSize * 0.16 - amplitude;
+    const gap = opt.numberSize * 0.16;
+    const laneWidth = amplitude * 2 + gap;
+    let lane = 0;
+    while (occupied.some(item => item.measure === mark.measure && item.offset.equals(mark.offset)
+      && item.lane === lane && top < item.bottom + gap && bottom > item.top - gap)) lane++;
+    occupied.push({ measure: mark.measure, offset: mark.offset, top, bottom, lane });
+    const centerX = left - gap - amplitude - lane * laneWidth;
     const path = new GraphicPath();
     path.classes.add("jianpu-cross-part-arpeggio");
     path.data = mark;
@@ -1771,17 +1751,16 @@ function reserveCrossPartArpeggioSpace(
 ): void {
   for (const mark of marks) {
     const selected = entries.filter((entry): entry is NoteEntry => entry instanceof NoteEntry
-      && entry.syncSourceMeasure === mark.measure
-      && entry.syncTick.equals(mark.offset)
-      && (mark.parts.length === 0 || mark.parts.includes(entry.sourcePartIndex)));
-    if (selected.length < 2) continue;
+      && entry.syncSourceMeasure === mark.measure && entry.syncTick.equals(mark.offset)
+      && entry.arpeggioMemberBounds(mark.pitches.filter(item => item.part === entry.sourcePartIndex)
+        .map(item => item.pitch), opt) !== null);
+    if (new Set(selected.map(entry => entry.sourcePartIndex)).size < 2) continue;
     const amplitude = Math.max(opt.musicLength(1.5), opt.numberSize * 0.055);
-    const reserve = amplitude * 2 + opt.numberSize * 0.24;
+    const lanes = marks.filter(item => item.measure === mark.measure && item.offset.equals(mark.offset)).length;
+    const reserve = lanes * (amplitude * 2 + opt.numberSize * 0.16) + opt.numberSize * 0.08;
     for (const entry of selected) {
       entry.group.update();
-      if (entry.crossArpeggioVisualLeft === null) {
-        entry.crossArpeggioVisualLeft = entry.group.childrenBound.left;
-      }
+      const visualLeft = entry.arpeggioVisualLeft();
       const existingAnchor = entry.group.children.find((child): child is GraphicLine =>
         child instanceof GraphicLine
         && child.classes.has("jianpu-cross-part-arpeggio-reserve"));
@@ -1789,8 +1768,8 @@ function reserveCrossPartArpeggioSpace(
       if (!existingAnchor) anchor.classes.add("jianpu-cross-part-arpeggio-reserve");
       anchor.strokeColor = 0x00000000;
       anchor.strokeWidth = 0;
-      anchor.p0 = new Point(entry.crossArpeggioVisualLeft - reserve, 0);
-      anchor.p1 = new Point(entry.crossArpeggioVisualLeft - reserve + 0.01, 0.01);
+      anchor.p0 = new Point(visualLeft - reserve, 0);
+      anchor.p1 = new Point(visualLeft - reserve + 0.01, 0.01);
       if (!existingAnchor) entry.group.add(anchor);
       entry.group.update();
     }
@@ -2126,7 +2105,7 @@ export class Line {
     return grps;
   }
 
-  private addSlurTie(a: S.Note, b: S.Note, ypos: number, thickness: number, clr: number, musicScale: number): void {
+  private addSlurTie(a: S.Note, b: S.Note, ypos: number, thickness: number, clr: number, musicScale: number): Tie {
     const ena = this.chordEntry.get(a.chord);
     const enb = this.chordEntry.get(b.chord);
     const grp = new Tie();
@@ -2142,6 +2121,7 @@ export class Line {
     grp.normalizeX();
     grp.normalizeY();
     this.group.add(grp);
+    return grp;
   }
 
   private addSystemTieFragment(
@@ -2277,7 +2257,11 @@ export class Line {
       const ypos = Math.min(...span.map((entry, index) =>
         this.slurTop(entry, opt, index === 0)));
       const nb = endCh!.notes[0];
-      this.addSlurTie(nt, nb, ypos, thickness, opt.color, opt.musicLength(1));
+      const slur = this.addSlurTie(nt, nb, ypos, thickness, opt.color, opt.musicLength(1));
+      // Every rendered occurrence refers to the same semantic start chord.
+      // Ties share this geometry builder but retain their existing hit behavior.
+      slur.data = e.chord;
+      slur.classes.add("jianpu-slur");
     }
   }
 
@@ -2586,7 +2570,7 @@ export class Line {
     }
     if (byMeasure.size === 0) return;
 
-    const strokeWidth = Math.max(opt.musicLength(0.8), opt.numberSize * 0.038);
+    const strokeWidth = rhythmGuideStrokeWidth(opt.musicLength(1), style.contentScale);
     for (const [measureIndex, entries] of byMeasure) {
       const geometry = buildRhythmGuideGrid(entries, style);
       if (!geometry || geometry.gridAnchors.length === 0) continue;
@@ -2594,7 +2578,7 @@ export class Line {
       const baseline = new GraphicLine();
       baseline.classes.add("rhythm-guide-line");
       baseline.classes.add(`rhythm-guide-measure-${measureIndex}`);
-      baseline.strokeColor = opt.color;
+      baseline.strokeColor = RHYTHM_GUIDE_STYLE.color;
       baseline.strokeWidth = strokeWidth;
       baseline.p0 = new Point(geometry.gridAnchors[0].x, baselineY);
       baseline.p1 = new Point(geometry.endX, baselineY);
@@ -2614,11 +2598,9 @@ export class Line {
         if (major) {
           mark.classes.add(`rhythm-guide-beat-${Math.round(majorRatio)}`);
         }
-        mark.strokeColor = opt.color;
+        mark.strokeColor = anchor.muted ? RHYTHM_GUIDE_STYLE.mutedColor : RHYTHM_GUIDE_STYLE.color;
         mark.strokeWidth = strokeWidth;
-        const height = opt.numberSize * (style.rhythmGuideDotted
-          ? activeDotted ? 0.34 : 0.18
-          : major ? 0.34 : 0.18);
+        const height = opt.musicLength(rhythmGuideTickHeight(major, style.rhythmGuideDotted, Boolean(anchor.muted)));
         mark.p0 = new Point(anchor.x, baselineY);
         mark.p1 = new Point(anchor.x, baselineY - height);
         target.add(mark);
@@ -3040,6 +3022,16 @@ export class LayoutOptions {
     return this.fontSize * this.engravingStyle.contentScale * this.engravingStyle.numberScale;
   }
 
+  /** Unscaled point sizes used when a document has no individual override. */
+  headerTypographyDefaults(): HeaderTypography {
+    const style = this.engravingStyle;
+    const unit = this.fontSize * style.numberScale;
+    const credit = unit * 0.52 * style.publicationCreditScale;
+    return { title: Math.min(this.titleSize, unit * 1.25) * style.publicationTitleScale,
+      subtitle: unit * 0.62 * style.publicationSubtitleScale,
+      lyricist: credit, composer: credit, arranger: credit };
+  }
+
   /** Convert a fixed music-space length at 100% into page units once. */
   musicLength(value: number): number {
     return value * this.engravingStyle.notationScale * this.engravingStyle.contentScale;
@@ -3176,8 +3168,11 @@ function alignPianoEntries(
     }
     slot.entries.push(e);
     const anchor = pianoEntryAnchor(e);
-    slot.left = Math.max(slot.left, anchor);
-    slot.right = Math.max(slot.right, Math.max(0, e.group.width - anchor));
+    const bounds = e.group.childrenBound;
+    // A shared wave is drawn after row layout. Its reserved negative extent,
+    // just like a local wave/accidental, must also count in legacy spacing.
+    slot.left = Math.max(slot.left, anchor - bounds.left);
+    slot.right = Math.max(slot.right, Math.max(0, bounds.right - anchor));
   }
   const slots = [...slotsByKey.values()].sort((a, b) =>
     a.measure - b.measure || a.tick.compareTo(b.tick) || a.order - b.order,
@@ -3676,7 +3671,7 @@ export class Layout {
     const braceWidth = Math.max(numberSize * 0.08, numberSize * 1.2 * style.braceWidthScale);
     const instrumentWidth = instrumentFont.measureText(instrumentName);
     const systemLeftX = continuationBraceLeft === null
-      ? Math.max(68 * style.contentScale, style.contentScale + instrumentWidth + numberSize * 0.25 + braceWidth + numberSize * 0.12)
+      ? style.contentScale + instrumentWidth + numberSize * 0.25 + braceWidth + numberSize * 0.12
       : Math.max(style.contentScale, continuationBraceLeft) + braceWidth + numberSize * 0.12;
     const braceLeft = continuationBraceLeft === null
       ? systemLeftX - numberSize * 0.12 - braceWidth
@@ -3714,6 +3709,41 @@ export class Layout {
       musicStart: systemLeftX + numberSize * 0.62,
       instrumentFont,
     };
+  }
+
+  private addSystemLeftLines(
+    system: Group,
+    rows: readonly Line[],
+    x: number,
+    top: number,
+    bottom: number,
+    className: string,
+  ): { top: number; bottom: number } {
+    const style = this.options.engravingStyle;
+    const addLine = (fromY: number, toY: number): { top: number; bottom: number } => {
+      const line = new GraphicLine();
+      line.classes.add(className);
+      line.strokeColor = this.options.color;
+      line.strokeWidth = this.options.musicLength(style.pianoLeftLineWidth);
+      line.p0 = new Point(x, fromY);
+      line.p1 = new Point(x, toY);
+      system.add(line);
+      return { top: fromY, bottom: toY };
+    };
+    if (style.connectBarlines) return addLine(top, bottom);
+    // The system entrance stays connected even when interior barlines do
+    // not. Its outer endpoints follow the first/last row's actual barlines,
+    // without extending into tall chords, lyrics or annotations.
+    const spans = rows.flatMap((row) => {
+      const barline = row.entries.find((entry) => entry instanceof Barline)?.entryItem();
+      if (!barline) return [];
+      const y = barline.pos(system).y;
+      return [{ top: y, bottom: y + barline.height }];
+    });
+    if (spans.length > 0) {
+      return addLine(Math.min(...spans.map((span) => span.top)), Math.max(...spans.map((span) => span.bottom)));
+    }
+    return { top, bottom };
   }
 
   private makePianoSystem(
@@ -3776,13 +3806,13 @@ export class Layout {
     pair.add(leftAnchor);
 
     // Key/time/text annotations may extend above the row's normalized origin,
-    // but connecting barlines and the piano brace must start at the highest
-    // actual musical glyph, not at the annotation tier.
+    // but full-height connected barlines start at the highest actual musical
+    // glyph, not at the annotation tier. The brace uses the entrance span below.
     const y0 = (right.entries.length > 0 ? right : left).musicalContentTop();
     const y1 = left.group.y + left.group.height;
     // Tempo marks share the annotation tier with key changes.  Keep them
     // above the full system bounds (which include key/time/text entries),
-    // rather than reusing the music-only y0 used by barlines and braces.
+    // rather than reusing the music-only y0.
     const annotationTop = Math.min(
       right.group.y + right.group.childrenBound.top,
       left.group.y + left.group.childrenBound.top,
@@ -3799,7 +3829,7 @@ export class Layout {
       tempoEntries,
       this.options,
       (mark, marker) => mark.kind === "tempo"
-        // Leave the compact measure number sitting directly above the brace;
+        // Keep the compact measure number above the music at the brace's x;
         // a tempo change on the first beat belongs in the next tier above it.
         ? annotationTop - marker.height - this.options.numberSize * 0.42
         : right.group.y + right.group.height + (handGap - marker.height) / 2,
@@ -3831,6 +3861,8 @@ export class Layout {
         false,
       );
     }
+    // The brace and its adjacent line share one measured vertical span.
+    const entrance = this.addSystemLeftLines(pair, [right, left], systemLeftX, y0, y1, "piano-system-left");
     if (showInstrument && instrumentName.trim()) {
       const tf = new TextFrame();
       tf.text = instrumentName;
@@ -3839,7 +3871,7 @@ export class Layout {
       tf.update();
       tf.x = instrumentX;
       const metrics = instrumentFont.metrics;
-      tf.y = (y0 + y1) / 2 - (metrics.ascent + metrics.descent) / 2;
+      tf.y = (entrance.top + entrance.bottom) / 2 - (metrics.ascent + metrics.descent) / 2;
       pair.add(tf);
     }
 
@@ -3847,23 +3879,13 @@ export class Layout {
     braceGroup.classes.add("piano-brace");
     const brace = new GraphicPath();
     brace.classes.add("piano-brace-path");
-    brace.segs = staffBraceSegments(braceWidth, y1 - y0, this.options.musicLength(style.braceStrokeWidth));
+    brace.segs = staffBraceSegments(braceWidth, entrance.bottom - entrance.top, this.options.musicLength(style.braceStrokeWidth));
     brace.fill = true;
     brace.fillColor = this.options.color;
     brace.x = braceLeft;
-    brace.y = y0;
+    brace.y = entrance.top;
     braceGroup.add(brace);
     pair.add(braceGroup);
-
-    // Piano-system left edge: the brace terminates on one continuous vertical
-    // line, matching conventional paired numbered-notation engraving.
-    const systemLeft = new GraphicLine();
-    systemLeft.classes.add("piano-system-left");
-    systemLeft.strokeColor = this.options.color;
-    systemLeft.strokeWidth = this.options.musicLength(style.pianoLeftLineWidth);
-    systemLeft.p0 = new Point(systemLeftX, y0);
-    systemLeft.p1 = new Point(systemLeftX, y1);
-    pair.add(systemLeft);
 
     // Join only the space between matching barlines. Both hands keep their
     // own complete strokes when this engraving option is switched off.
@@ -4052,6 +4074,15 @@ export class Layout {
         }
       }
 
+      const entrance = this.addSystemLeftLines(
+        system,
+        group.rows.map((row) => lines[row]),
+        geometry.systemLeftX,
+        top,
+        bottom,
+        "ensemble-group-line",
+      );
+
       const label = new TextFrame();
       label.classes.add("ensemble-instrument-label");
       label.text = group.name;
@@ -4060,7 +4091,7 @@ export class Layout {
       label.update();
       label.x = geometry.labelX;
       const metrics = geometry.instrumentFont.metrics;
-      label.y = (top + bottom) / 2 - (metrics.ascent + metrics.descent) / 2;
+      label.y = (entrance.top + entrance.bottom) / 2 - (metrics.ascent + metrics.descent) / 2;
       system.add(label);
 
       if (group.rows.length >= 2) {
@@ -4068,22 +4099,14 @@ export class Layout {
         braceGroup.classes.add("ensemble-instrument-brace");
         const brace = new GraphicPath();
         brace.classes.add("ensemble-instrument-brace-path");
-        brace.segs = staffBraceSegments(geometry.braceWidth, bottom - top, this.options.musicLength(style.braceStrokeWidth));
+        brace.segs = staffBraceSegments(geometry.braceWidth, entrance.bottom - entrance.top, this.options.musicLength(style.braceStrokeWidth));
         brace.fill = true;
         brace.fillColor = this.options.color;
         brace.x = geometry.braceLeft;
-        brace.y = top;
+        brace.y = entrance.top;
         braceGroup.add(brace);
         system.add(braceGroup);
       }
-
-      const groupLine = new GraphicLine();
-      groupLine.classes.add("ensemble-group-line");
-      groupLine.strokeColor = this.options.color;
-      groupLine.strokeWidth = this.options.musicLength(style.pianoLeftLineWidth);
-      groupLine.p0 = new Point(geometry.systemLeftX, top);
-      groupLine.p1 = new Point(geometry.systemLeftX, bottom);
-      system.add(groupLine);
 
       if (style.connectBarlines) {
         for (let rowIndex = 0; rowIndex + 1 < group.rows.length; rowIndex++) {
@@ -4183,11 +4206,20 @@ export class Layout {
     const baseReserve = textUnit * (hasTitleBlock ? 3.85 : 2.35)
       + titleShift
       + textUnit * 0.35;
+    const defaults = this.options.headerTypographyDefaults();
+    const growth = (field: HeaderTextField): number => Math.max(0,
+      headerFontSize(field, scr.headerTypography, defaults[field]!, style.contentScale)
+        - defaults[field]! * style.contentScale);
+    const typographyReserve = growth("title") * 2.2 + growth("subtitle")
+      + (scr.lyricist.trim() ? growth("lyricist") * 1.18 : 0)
+      + (scr.composer.trim() ? growth("composer") * 1.18 : 0)
+      + (scr.arranger.trim() ? growth("arranger") * 1.18 : 0);
     // Keep metadata vertical movement and the requested metadata→first-system
     // gap independent. Defaults reproduce the historical 0.88-number gap.
     return Math.max(
       textUnit * 0.5,
       baseReserve
+        + typographyReserve
         + textUnit * style.publicationMetaYOffset
         + textUnit * (style.publicationFirstSystemGap - 0.88),
     );
@@ -4218,7 +4250,7 @@ export class Layout {
       tf.font = font;
       tf.color = opt.color;
       tf.classes.add("publication-header");
-      if (className) tf.classes.add(className);
+      for (const name of className.split(/\s+/).filter(Boolean)) tf.classes.add(name);
       const measured = tf.measureText();
       tf.x = align === "center" ? x - measured / 2 : align === "right" ? x - measured : x;
       tf.y = y;
@@ -4226,12 +4258,11 @@ export class Layout {
       page.add(tf);
     };
 
-    const titleFont = opt.lrcFont.makeWithSize(
-      Math.min(opt.titleSize * style.contentScale, textUnit * 1.25) * style.publicationTitleScale,
-    );
-    const subtitleFont = opt.lrcFont.makeWithSize(
-      textUnit * 0.62 * style.publicationSubtitleScale,
-    );
+    const defaults = opt.headerTypographyDefaults();
+    const fieldFont = (field: HeaderTextField): Font => opt.lrcFont.makeWithSize(
+      headerFontSize(field, scr.headerTypography, defaults[field]!, style.contentScale));
+    const titleFont = fieldFont("title");
+    const subtitleFont = fieldFont("subtitle");
     const metaFont = opt.lrcFont.makeWithSize(
       textUnit * 0.87 * style.publicationMetaScale,
     );
@@ -4243,7 +4274,8 @@ export class Layout {
     const titleY = titleFont.size * 2.2
       + textUnit * (0.35 + style.publicationTitleYOffset);
     const subtitleY = titleY
-      + textUnit * (0.9 + style.publicationSubtitleYOffset);
+      + textUnit * (0.9 + style.publicationSubtitleYOffset)
+      + Math.max(0, subtitleFont.size - defaults.subtitle! * style.contentScale);
     addText(
       scr.title,
       titleFont,
@@ -4282,25 +4314,30 @@ export class Layout {
       );
     }
 
-    const explicitCredits = [
-      scr.lyricist.trim() ? `作词：${scr.lyricist.trim()}` : "",
-      scr.composer.trim() ? `作曲：${scr.composer.trim()}` : "",
-      scr.arranger.trim() ? `编曲：${scr.arranger.trim()}` : "",
-    ].filter(Boolean);
+    const explicitCredits = ([
+      ["lyricist", "作词"], ["composer", "作曲"], ["arranger", "编曲"],
+    ] as const).filter(([field]) => scr[field].trim())
+      .map(([field, label]) => ({ text: `${label}：${scr[field].trim()}`, field }));
     const credits = explicitCredits.length > 0
       ? explicitCredits
-      : scr.credit.filter((x) => x.type !== "title").flatMap((x) => x.text.split("\n").map((s) => s.trim()).filter(Boolean));
-    const creditGap = creditFont.size * 1.18;
+      : scr.credit.filter((x) => x.type !== "title").flatMap((x) => x.text.split("\n").map((s) => s.trim()).filter(Boolean))
+        .map(text => ({ text, field: undefined }));
     const creditBottom = metaY + textUnit * style.publicationCreditYOffset;
-    credits.forEach((text, index) => {
-      const y = creditBottom - (credits.length - 1 - index) * creditGap;
+    const creditFonts = credits.map(credit => credit.field ? fieldFont(credit.field) : creditFont);
+    let creditY = creditBottom;
+    const baselines = new Array<number>(credits.length);
+    for (let index = credits.length - 1; index >= 0; index--) {
+      baselines[index] = creditY;
+      if (index > 0) creditY -= Math.max(creditFonts[index].size, creditFonts[index - 1].size) * 1.18;
+    }
+    credits.forEach((credit, index) => {
       addText(
-        text,
-        creditFont,
+        credit.text,
+        creditFonts[index],
         width * style.publicationCreditX,
-        y,
+        baselines[index],
         "right",
-        "publication-credit",
+        credit.field ? `publication-credit publication-${credit.field}` : "publication-credit",
       );
     });
   }

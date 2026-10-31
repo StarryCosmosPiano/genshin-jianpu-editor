@@ -18,16 +18,14 @@ async function importDroppedBytes(
   nativePath = false,
 ): Promise<void> {
   if (isRecognitionFile(name, mime)) {
-    await app.recognizeBytes("musicpp", {
+    if (!(await app.recognizeBytes("musicpp", {
       bytes,
       mime: mime || undefined,
       path: nativePath ? name : null,
-    });
-    app.setImportedFileSource(name);
+    }))) return;
     return;
   }
-  await app.importBytes(bytes, name);
-  app.setImportedFileSource(name);
+  if (!(await app.importBytes(bytes, name))) return;
   if (nativePath && !isMidiFile(name)) app.rememberLastFile(name);
 }
 

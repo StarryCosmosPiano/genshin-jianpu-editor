@@ -103,8 +103,8 @@ try {
         if (kind === "piano") {
           const systems = [...rendered.svg.children].filter(node => node.tagName.toLowerCase() === "g");
           const names = [...rendered.svg.querySelectorAll('[data-staff-prose="instrument"]')];
-          check(names.length === systems.length && names.every(name => name.textContent === "钢琴"),
-            "piano: expected one shared instrument name per grand staff");
+          check(names.length === (index === 0 ? 1 : 0) && names.every(name => name.textContent === "钢琴"),
+            "piano: expected one shared instrument name on the first system only");
           systems.forEach((system, position) => {
             const braces = [...system.querySelectorAll('[data-staff-brace]')];
             check(braces.length > 0, "piano: grand staff brace missing");
@@ -112,9 +112,11 @@ try {
               const box = brace.getBBox(); const matrix = brace.getCTM();
               return box.x * matrix.a + matrix.e;
             }));
-            const box = names[position].getBBox();
-            check(braceLeft - (box.x + box.width) >= 6,
-              "piano: shared instrument name touches the brace");
+            if (position === 0 && names[0]) {
+              const box = names[0].getBBox();
+              check(braceLeft - (box.x + box.width) >= 6,
+                "piano: shared instrument name touches the brace");
+            }
           });
         }
         text += rendered.svg.textContent;
@@ -167,7 +169,7 @@ try {
     const meterPage = changedMeter.renderPage(0);
     check(systems(meterPage)[1].querySelectorAll("g.vf-timesignature").length === 1, "cached next system did not show 3/4 → 4/4 change");
     const voltaLegs = page => [...systems(page)[0].querySelectorAll('rect[width="1"]')]
-      .filter(rect => Math.abs(Number(rect.getAttribute("height")) - 15 * Math.SQRT1_2) < 0.1).length;
+      .filter(rect => Math.abs(Number(rect.getAttribute("height")) - 15 * Math.SQRT1_2 * 0.75) < 0.1).length;
     const oldLegs = voltaLegs(meterPage);
     right.endingNum = null;
     const changedVolta = await prepareStaffPreview(snapshot(boundaries, 12), changedMeter);

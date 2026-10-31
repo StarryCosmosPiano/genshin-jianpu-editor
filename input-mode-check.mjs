@@ -172,19 +172,25 @@ try {
     throw new Error("upper empty chord slot did not use one dashed note placeholder");
   }
   const placeholderAlignment = async () => page.evaluate(() => {
+    const app = window.__app;
+    const cursor = app._input.cursor;
     const placeholder = document.querySelector(".score-input-note-placeholder")?.getBoundingClientRect();
     const caret = document.querySelector(".score-input-caret")?.getBoundingClientRect();
-    const selected = document.querySelector(".score-page g.selected")?.getBoundingClientRect();
-    if (!placeholder || !caret || !selected) return null;
+    const chord = cursor && app.painter.score.parts[cursor.partIndex]?.measures[cursor.measureIndex]?.entries
+      .find((entry) => entry.notes && entry.position.equals(cursor.offset));
+    const anchor = chord?.notes.find((note) => !note.rest && note.pitch === app._input.focusPitch);
+    const rendered = anchor && app.painter.noteGroupEls(chord, anchor)[0]?.element.getBoundingClientRect();
+    if (!placeholder || !caret || !rendered) return null;
     const placeholderX = (placeholder.left + placeholder.right) / 2;
     return {
       caret: Math.abs(placeholderX - (caret.left + caret.right) / 2),
-      selected: Math.abs(placeholderX - (selected.left + selected.right) / 2),
+      anchor: Math.abs(placeholderX - (rendered.left + rendered.right) / 2),
+      selected: app._selectedNotes.length,
     };
   });
   const upperAlignment = await placeholderAlignment();
-  if (upperAlignment === null || upperAlignment.caret > 2.5 || upperAlignment.selected > 2.5) {
-    throw new Error(`upper placeholder is not centered on its selected note: ${JSON.stringify(upperAlignment)}`);
+  if (upperAlignment === null || upperAlignment.caret > 2.5 || upperAlignment.anchor > 2.5 || upperAlignment.selected !== 0) {
+    throw new Error(`upper placeholder is not centered on its exact unselected anchor: ${JSON.stringify(upperAlignment)}`);
   }
   const placeholderBoundaryState = async () => page.evaluate(() => {
     const cursor = window.__app._input.cursor;
@@ -208,8 +214,8 @@ try {
   await page.keyboard.press("ArrowDown");
   await page.keyboard.press("ArrowDown");
   const lowerAlignment = await placeholderAlignment();
-  if (lowerAlignment === null || lowerAlignment.caret > 2.5 || lowerAlignment.selected > 2.5) {
-    throw new Error(`lower placeholder is not centered on its selected note: ${JSON.stringify(lowerAlignment)}`);
+  if (lowerAlignment === null || lowerAlignment.caret > 2.5 || lowerAlignment.anchor > 2.5 || lowerAlignment.selected !== 0) {
+    throw new Error(`lower placeholder is not centered on its exact unselected anchor: ${JSON.stringify(lowerAlignment)}`);
   }
   const lowerBoundaryBefore = await placeholderBoundaryState();
   await page.keyboard.press("ArrowDown");
@@ -484,9 +490,13 @@ KeyAndMeters = {1=C,4/4}
   await page.keyboard.press("ArrowUp");
   const tiedPlaceholderAlignment = await page.evaluate(() => {
     const placeholder = document.querySelector(".score-input-note-placeholder")?.getBoundingClientRect();
-    const selected = document.querySelector(".score-page g.selected")?.getBoundingClientRect();
     const caret = document.querySelector(".score-input-caret")?.getBoundingClientRect();
     const app = window.__app;
+    const cursor = app._input.cursor;
+    const chord = cursor && app.painter.score.parts[cursor.partIndex]?.measures[cursor.measureIndex]?.entries
+      .find((entry) => entry.notes && entry.position.equals(cursor.offset));
+    const note = chord?.notes.find((item) => !item.rest && item.pitch === app._input.focusPitch);
+    const anchor = note && app.painter.noteGroupEls(chord, note)[0]?.element.getBoundingClientRect();
     const svg = document.querySelector("#score-pane svg");
     const span = app.painter.rhythmInputSpansForPage(0, svg)
       .find((candidate) => candidate.measureIndex === 1 && candidate.partIndexes.includes(0));
@@ -494,16 +504,18 @@ KeyAndMeters = {1=C,4/4}
     const tick = owner?.querySelector(
       ".rhythm-guide-tick.rhythm-guide-measure-1.rhythm-guide-beat-0",
     )?.getBoundingClientRect();
-    if (!placeholder || !selected || !caret || !tick) return null;
+    if (!placeholder || !anchor || !caret || !tick) return null;
     const placeholderX = (placeholder.left + placeholder.right) / 2;
     return {
-      selected: Math.abs(placeholderX - (selected.left + selected.right) / 2),
+      anchor: Math.abs(placeholderX - (anchor.left + anchor.right) / 2),
+      selected: app._selectedNotes.length,
       caret: Math.abs(placeholderX - (caret.left + caret.right) / 2),
       ruler: Math.abs(placeholderX - (tick.left + tick.right) / 2),
     };
   });
   if (tiedPlaceholderAlignment === null
-    || tiedPlaceholderAlignment.selected > 2.5
+    || tiedPlaceholderAlignment.anchor > 2.5
+    || tiedPlaceholderAlignment.selected !== 0
     || tiedPlaceholderAlignment.caret > 2.5
     || tiedPlaceholderAlignment.ruler > 2.5) {
     throw new Error(`tied placeholder jumped away from its note/ruler: ${JSON.stringify(tiedPlaceholderAlignment)}`);
@@ -2361,6 +2373,27 @@ KeyAndMeters = {1=C,4/4}\r
   if (!gracePitch || gracePitch.octave !== 1 || gracePitch.pitch < 69) {
     throw new Error(`grace pitch model did not follow degree/octave edits: ${JSON.stringify(gracePitch)}`);
   }
+  for (const direction of ["ArrowUp", "ArrowDown"]) {
+    await page.locator("#score-pane .jianpu-grace-number").click();
+    await page.keyboard.press(`Control+Alt+${direction}`);
+    const afterPartShortcut = await page.evaluate(() => {
+      const source = window.__app._sourceNotes.find((item) => item.grace);
+      return source ? { pitch: source.note.pitch, octave: source.note.jpOctave } : null;
+    });
+    if (JSON.stringify(afterPartShortcut) !== JSON.stringify(gracePitch)) {
+      throw new Error(`part shortcut changed the selected grace octave (${direction}): ${JSON.stringify(afterPartShortcut)}`);
+    }
+  }
+  await page.locator("#score-pane .jianpu-grace-number").click();
+  await page.keyboard.press("Control+ArrowDown");
+  await page.waitForFunction(() => /\{6\}3/.test(window.__app.getText()));
+  const loweredGrace = await page.evaluate(() => {
+    const note = window.__app._sourceNotes.find((item) => item.grace)?.note;
+    return note ? { pitch: note.pitch, octave: note.jpOctave } : null;
+  });
+  if (!loweredGrace || loweredGrace.octave !== 0 || loweredGrace.pitch !== gracePitch.pitch - 12) {
+    throw new Error(`plain Ctrl down no longer lowers the selected grace octave: ${JSON.stringify(loweredGrace)}`);
+  }
   await page.locator("#score-pane .jianpu-grace-number").click();
   await page.keyboard.press("Delete");
   await page.waitForFunction(() => document.querySelectorAll("#score-pane .jianpu-grace-number").length === 0);
@@ -3078,12 +3111,12 @@ KeyAndMeters = {1=C,2/4}
   await page.screenshot({ path: "dist/input-mode-check.png", fullPage: false });
   await page.setViewportSize({ width: 390, height: 844 });
   await page.waitForTimeout(150);
-  const keypadBox = await page.locator("#score-input-keypad").boundingBox();
+  const keypadBox = await page.locator(".mobile-number-keyboard").boundingBox();
   if (!keypadBox || keypadBox.x < -0.5 || keypadBox.x + keypadBox.width > 390.5) {
     throw new Error(`mobile input keypad overflowed the viewport: ${JSON.stringify(keypadBox)}`);
   }
-  const toolbarButton = await page.locator("#btn-input-mode").boundingBox();
-  if (!toolbarButton || toolbarButton.width < 40) {
+  const toolbarButton = await page.locator('[data-mobile-mode="input"]').boundingBox();
+  if (!toolbarButton || toolbarButton.width < 44) {
     throw new Error(`mobile input-mode toolbar button is not usable: ${JSON.stringify(toolbarButton)}`);
   }
   await page.screenshot({ path: "dist/input-mode-mobile.png", fullPage: false });

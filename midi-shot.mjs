@@ -4,6 +4,7 @@ import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
 import { extname, join, normalize } from "node:path";
 import { chromium } from "playwright";
+import { acceptFixtureImport } from "./browser-test-helpers.mjs";
 
 const root = join(process.cwd(), "dist");
 const mime = {
@@ -90,7 +91,7 @@ try {
       await page.getByLabel("竖线括号 || ||").inputValue() !== "none") {
     throw new Error("arpeggio/triplet/grace defaults were not assigned to {}, [] and <>");
   }
-  await page.getByRole("button", { name: "导入并转为简谱" }).click();
+  await acceptFixtureImport(page, page.getByRole("button", { name: "导入并转为简谱" }));
   await page.waitForFunction(() =>
     window.__app.getText().includes("花括号 = 琶音") &&
     window.__app.getText().split(/\r?\n/).some((line) =>
@@ -145,7 +146,7 @@ try {
   await page.getByLabel("作曲").fill("测试作曲");
   await page.getByLabel("编曲").fill("测试编曲");
   await page.getByLabel("乐器名称").fill("中文钢琴");
-  await page.getByRole("button", { name: "导入并转为简谱" }).click();
+  await acceptFixtureImport(page, page.getByRole("button", { name: "导入并转为简谱" }));
   await page.waitForFunction(() => window.__app.getText().includes(".Voice.RH"));
   await page.waitForTimeout(500);
   const defaultPage = await page.evaluate(() => {

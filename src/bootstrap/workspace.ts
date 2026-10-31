@@ -3,6 +3,7 @@ import { showEngravingStyleDialog, showOptionsDialog } from "../editor/dialogs";
 import { showExportDialog } from "../editor/export";
 import { showHelpDialog } from "../editor/help";
 import { isTauriRuntime } from "../editor/fileio";
+import { wireDocumentSaveShortcuts } from "../editor/document-save-shortcut";
 import { showCreateScoreDialog } from "../editor/slash-dialog";
 import { activeInspectorId, requestCloseInspector } from "../ui/inspector";
 import type { NoteTimingDivision } from "../score/note-timing";
@@ -129,10 +130,12 @@ function wireWorkspaceSummary(app: App): void {
       summary.diagnostics > 0 ? `${summary.diagnostics} 处时值待检查` : "",
     ].filter(Boolean).join(" · ");
     if (pageCount) pageCount.textContent = `${summary.page} / ${Math.max(1, summary.pages)}`;
-    select?.setAttribute("aria-pressed", String(!summary.inputEnabled));
-    select?.classList.toggle("active", !summary.inputEnabled);
+    select?.setAttribute("aria-pressed", String(app.interactionMode === "select"));
+    select?.classList.toggle("active", app.interactionMode === "select");
     input?.setAttribute("aria-pressed", String(summary.inputEnabled));
     input?.classList.toggle("active", summary.inputEnabled);
+    const keypad = document.getElementById("score-input-keypad");
+    if (keypad) keypad.hidden = !summary.inputEnabled || app.getActiveScoreSurface() === "staff";
     button("btn-prev")?.toggleAttribute("disabled", summary.page <= 1);
     button("btn-next")?.toggleAttribute("disabled", summary.page >= summary.pages);
   };
@@ -201,7 +204,10 @@ function wireWorkspaceSummary(app: App): void {
 
 function wireRhythmControls(app: App, scorePane: HTMLElement): void {
   const divisions: NoteTimingDivision[] = [1, 2, 4, 8, 16, 32, 64];
-  const focusScore = (): void => scorePane.focus({ preventScroll: true });
+  const focusScore = (): void => {
+    const pane = app.getActiveScoreSurface() === "staff" ? document.getElementById("staff-pane") : scorePane;
+    pane?.focus({ preventScroll: true });
+  };
   document.querySelectorAll<HTMLButtonElement>("#rhythm-grid-control button[data-rhythm-division]")
     .forEach((item) => item.addEventListener("click", () => {
       const division = Number(item.dataset.rhythmDivision) as NoteTimingDivision;
@@ -229,9 +235,13 @@ export async function wireWorkspace(app: App, scorePane: HTMLElement): Promise<v
   wireWorkspaceSummary(app);
   wireRhythmControls(app, scorePane);
   wireZoomControls(app, scorePane);
+  wireDocumentSaveShortcuts(app);
 
   on("btn-save", () => void app.saveFile());
   on("btn-saveas", () => void app.saveFileAs());
+  on("btn-backup-history", () => void (async () => {
+    if (await requestCloseInspector()) await app.showBackupHistory();
+  })());
   on("btn-export", () => showExportDialog(app));
   on("btn-prev", () => app.prevPage());
   on("btn-next", () => app.nextPage());
@@ -242,7 +252,7 @@ export async function wireWorkspace(app: App, scorePane: HTMLElement): Promise<v
   on("btn-undo", () => app.undoEdit());
   on("btn-redo", () => app.redoEdit());
   on("btn-select-mode", () => void (async () => {
-    if (app.workspaceSummary().inputEnabled && await requestCloseInspector()) app.toggleInputMode();
+    if (await requestCloseInspector()) app.toggleSelectionMode();
   })());
   const inputMode = button("btn-input-mode");
   if (inputMode) {
@@ -252,6 +262,12 @@ export async function wireWorkspace(app: App, scorePane: HTMLElement): Promise<v
     })());
   }
   const previewLock = button("btn-preview-lock");
+  on("btn-chord-mode", () => void (async () => {
+    if (await requestCloseInspector()) app.setChordInputMode(!app.chordInputMode);
+  })());
+  on("btn-midi-input", () => void (async () => {
+    if (await requestCloseInspector()) await app.showMidiInputSettings();
+  })());
   if (previewLock) {
     app.setPreviewLockBtn(previewLock);
     previewLock.addEventListener("click", () => app.togglePreviewLock());
@@ -266,6 +282,9 @@ export async function wireWorkspace(app: App, scorePane: HTMLElement): Promise<v
       if (await requestCloseInspector()) await app.openFile();
     })());
   }
+  on("btn-add-slashes", () => void (async () => {
+    if (await requestCloseInspector()) await app.addSlashes();
+  })());
   on("btn-score-settings", () => void (async () => {
     if (activeInspectorId() === "score") { await requestCloseInspector(); return; }
     await app.showScoreSettings();
@@ -275,7 +294,7 @@ export async function wireWorkspace(app: App, scorePane: HTMLElement): Promise<v
     showEngravingStyleDialog(app);
   })());
   if (!isTauriRuntime()) {
-    for (const id of ["btn-mixed", "btn-recognize", "sel-recog-view", "btn-phrase"]) {
+    for (const id of ["btn-mixed", "btn-recognize", "sel-recog-view", "btn-phrase", "btn-backup-history"]) {
       const element = document.getElementById(id);
       if (element) element.hidden = true;
     }

@@ -7,6 +7,7 @@ import {
   BarStyle,
   BarlineEntry,
   Chord,
+  CrossPartArpeggio,
   Credit,
   AccidentalStat,
   JumpSpec,
@@ -25,6 +26,9 @@ import {
   TimePosition,
   type TempoBeatUnit,
 } from "./score";
+import { chordArpeggioPitchGroups, setChordArpeggioPitchGroups } from "./arpeggio";
+
+const CROSS_PART_ARPEGGIO_FIELD = "jpeditor-cross-part-arpeggios";
 
 // ---------------- DOM helpers ----------------
 function elems(parent: Element, tag: string): Element[] {
@@ -56,6 +60,16 @@ function has(parent: Element, tag: string): boolean {
 interface MState {
   pos: Fraction; // raw (un-divided) running position within measure
   noteEnd: Fraction;
+  currentChord: Chord | null;
+  sourcePart: Element;
+  arpeggios: ImportedArpeggio[];
+}
+
+interface ImportedArpeggio {
+  note: Note;
+  sourcePart: Element;
+  number: number;
+  direction: "up" | "down";
 }
 
 interface ImportedTempoEvent {
@@ -139,8 +153,6 @@ function parseNotations(nt: Note, noteEl: Element): void {
       const ty = it.getAttribute("type");
       if (ty === "start") nt.chord.slurStart = true;
       else if (ty === "stop") nt.chord.slurEnd = true;
-    } else if (it.tagName === "arpeggiate") {
-      nt.chord.arpeggio = true;
     } else if (it.tagName === "ornaments") {
       for (const ornament of Array.from(it.children)) {
         const value = ornament.tagName === "inverted-mordent"
@@ -188,22 +200,45 @@ function onNote(
   if (has(noteEl, "grace")) return;
   const isChord = has(noteEl, "chord");
   const noteStaff = intOf(noteEl, "staff") ?? 1;
+  // Only the first (non-<chord>) note advances the source cursor. A chord
+  // member on another staff keeps that onset even if its first note was
+  // filtered out of this destination Part.
+  if (!isChord) {
+    st.pos = st.noteEnd;
+    if (!has(noteEl, "duration")) throw new Error("note without duration");
+    st.noteEnd = st.pos.plus(noteDuration(noteEl));
+    st.currentChord = null;
+  }
   // A piano part is parsed twice (staff 1 -> RH, staff 2 -> LH).  Even when a
   // note belongs to the other staff we must advance the MusicXML cursor so the
   // selected staff keeps its original rhythmic positions after backup/forward.
   if (staffFilter !== null && noteStaff !== staffFilter) {
-    if (!isChord) {
-      st.pos = st.noteEnd;
-      if (!has(noteEl, "duration")) throw new Error("note without duration");
-      st.noteEnd = st.pos.plus(noteDuration(noteEl));
-    }
     return;
   }
-  const newChord = m.entries.length === 0 || !isChord;
-  if (newChord) m.add(new Chord(m));
-  const last = m.entries[m.entries.length - 1] as Chord;
+  const newChord = st.currentChord === null;
+  if (newChord) {
+    st.currentChord = new Chord(m);
+    m.add(st.currentChord);
+  }
+  const last = st.currentChord!;
   const nt = new Note(last);
   loadNote(nt, noteEl);
+  if (!nt.rest) {
+    const numbers = new Set<number>();
+    for (const notations of elems(noteEl, "notations")) {
+      for (const arpeggiate of elems(notations, "arpeggiate")) {
+        const value = arpeggiate.getAttribute("number");
+        const number = value === null || value === "" ? 1 : Number(value);
+        if (!Number.isInteger(number) || number < 1 || number > 16 || numbers.has(number)) continue;
+        numbers.add(number);
+        st.arpeggios.push({ note: nt, sourcePart: st.sourcePart, number,
+          direction: arpeggiate.getAttribute("direction") === "down" ? "down" : "up" });
+        // Keep members until voice/chord filtering has completed. The exact
+        // groups replace this provisional flag in applyImportedArpeggios.
+        last.arpeggio = true;
+      }
+    }
+  }
   if (last.slurEnd) {
     if (tmp.slurStart) tmp.slurStart.slurEndChord = last;
   } else if (last.slurStart) {
@@ -213,9 +248,7 @@ function onNote(
   if (nt.tupletBegin || nt.tupletEnd) tmp.tupletNotes.push(nt);
   last.add(nt);
   if (newChord) {
-    st.pos = st.noteEnd;
     if (!has(noteEl, "duration")) throw new Error("note without duration");
-    st.noteEnd = st.pos.plus(noteDuration(noteEl));
     parseDuration(last, noteEl);
     last.position = st.pos.divInt(div);
     last.duration = noteDuration(noteEl).divInt(div);
@@ -383,6 +416,7 @@ function loadMeasure(
   tempos: ImportedTempoEvent[] | null,
   keys: ImportedKeyEvent[] | null,
   inheritedFifths: number,
+  arpeggioState: Pick<MState, "sourcePart" | "arpeggios">,
 ): void {
   if (/^(?:yes|true|1)$/i.test(measureEl.getAttribute("implicit") ?? "")) {
     m.pickup = true;
@@ -393,7 +427,7 @@ function loadMeasure(
     m.time.beats = prev.time.beats;
     m.time.beatType = prev.time.beatType;
   }
-  const st: MState = { pos: new Fraction(0), noteEnd: new Fraction(0) };
+  const st: MState = { pos: new Fraction(0), noteEnd: new Fraction(0), currentChord: null, ...arpeggioState };
   for (const item of Array.from(measureEl.children)) {
     switch (item.tagName) {
       case "note": onNote(m, item, tmp, div, st, staffFilter); break;
@@ -432,6 +466,7 @@ function loadPart(
   staffFilter: number | null = null,
   tempos: ImportedTempoEvent[] | null = null,
   keys: ImportedKeyEvent[] | null = null,
+  arpeggios: ImportedArpeggio[] = [],
 ): void {
   const measureEls = elems(partEl, "measure");
   let div = 1;
@@ -445,7 +480,8 @@ function loadPart(
     if (nextDiv !== null && nextDiv > 0) div = nextDiv;
     const mea = new Measure(mid);
     mea.position = pos;
-    loadMeasure(mea, mel, cur, div, tmp, staffFilter, tempos, keys, inheritedFifths);
+    loadMeasure(mea, mel, cur, div, tmp, staffFilter, tempos, keys, inheritedFifths,
+      { sourcePart: partEl, arpeggios });
     part.measures.push(mea);
     tmp.pairTuplet();
     pos = pos.plus(mea.duration);
@@ -458,6 +494,104 @@ function loadPart(
     cur = mea;
   });
   tmp.pairTie();
+}
+
+function applyImportedArpeggios(score: Score, root: Element, imported: ImportedArpeggio[]): void {
+  const owners = new Map<Note, number>();
+  for (const [partIndex, part] of score.parts.entries()) {
+    for (const measure of part.measures) {
+      for (const entry of measure.entries) {
+        if (!(entry instanceof Chord)) continue;
+        setChordArpeggioPitchGroups(entry, []);
+        if (entry.rest) continue;
+        for (const note of entry.notes) {
+          if (!note.rest && !note.softDeleted) owners.set(note, partIndex);
+        }
+      }
+    }
+  }
+  const live = imported.filter(item => owners.has(item.note));
+  const consumed = new Set<ImportedArpeggio>();
+  const addCrossPart = (items: ImportedArpeggio[], direction: "up" | "down"): boolean => {
+    const notes = [...new Set(items.map(item => item.note))];
+    const parts = [...new Set(notes.map(note => owners.get(note)!))].sort((a, b) => a - b);
+    if (parts.length < 2) return false;
+    const mark = new CrossPartArpeggio();
+    mark.measure = notes[0].chord.measure.index;
+    mark.offset = notes[0].chord.position;
+    mark.parts = parts;
+    mark.pitches = notes.map(note => ({ part: owners.get(note)!, pitch: note.pitch }));
+    mark.direction = direction;
+    score.crossPartArpeggios.push(mark);
+    return true;
+  };
+
+  // This optional, explicitly named extension is the only bridge across
+  // separate MusicXML <part>s. Never join external parts just because their
+  // (part-local) arpeggiate numbers happen to be equal.
+  const identification = elem(root, "identification");
+  const miscellaneous = identification ? elem(identification, "miscellaneous") : null;
+  const field = miscellaneous ? elems(miscellaneous, "miscellaneous-field")
+    .find(item => item.getAttribute("name") === CROSS_PART_ARPEGGIO_FIELD) : null;
+  let metadata: unknown = null;
+  try { metadata = field ? JSON.parse(field.textContent ?? "") : null; } catch { /* Ignore invalid optional metadata. */ }
+  if (Array.isArray(metadata)) {
+    for (const raw of metadata) {
+      if (!raw || typeof raw !== "object") continue;
+      const value = raw as Record<string, unknown>;
+      if (!Number.isSafeInteger(value.measure) || (value.measure as number) < 0
+        || typeof value.offset !== "string" || !/^\d+(?:\/[1-9]\d*)?$/.test(value.offset)
+        || !Array.isArray(value.pitches)) continue;
+      const components = value.offset.split("/").map(Number);
+      if (components.some(component => !Number.isSafeInteger(component))) continue;
+      const offset = new Fraction(components[0], components[1] ?? 1);
+      const selected: ImportedArpeggio[] = [];
+      for (const rawMember of value.pitches) {
+        if (!rawMember || typeof rawMember !== "object") break;
+        const member = rawMember as Record<string, unknown>;
+        if (typeof member.part !== "string" || !Number.isInteger(member.pitch)
+          || (member.pitch as number) < 0 || (member.pitch as number) > 127
+          || !Number.isInteger(member.number) || (member.number as number) < 1
+          || (member.number as number) > 16) break;
+        const item = live.find(candidate => !consumed.has(candidate) && !selected.includes(candidate)
+          && candidate.sourcePart.getAttribute("id") === member.part
+          && candidate.note.chord.measure.index === value.measure
+          && candidate.note.chord.position.equals(offset)
+          && candidate.note.pitch === member.pitch && candidate.number === member.number);
+        if (!item) break;
+        selected.push(item);
+      }
+      if (selected.length !== value.pitches.length
+        || !addCrossPart(selected, value.direction === "down" ? "down" : "up")) continue;
+      for (const item of selected) consumed.add(item);
+    }
+  }
+
+  const bySourcePart = new Map<Element, Map<string, ImportedArpeggio[]>>();
+  for (const item of live) {
+    if (consumed.has(item)) continue;
+    const byPosition = bySourcePart.get(item.sourcePart) ?? new Map<string, ImportedArpeggio[]>();
+    const chord = item.note.chord;
+    const key = `${chord.measure.index}:${chord.position}:${item.number}`;
+    const items = byPosition.get(key) ?? [];
+    items.push(item);
+    byPosition.set(key, items);
+    bySourcePart.set(item.sourcePart, byPosition);
+  }
+  for (const byPosition of bySourcePart.values()) {
+    for (const items of byPosition.values()) {
+      if (addCrossPart(items, items.some(item => item.direction === "down") ? "down" : "up")) continue;
+      const byChord = new Map<Chord, number[]>();
+      for (const note of new Set(items.map(item => item.note))) {
+        const pitches = byChord.get(note.chord) ?? [];
+        pitches.push(note.pitch);
+        byChord.set(note.chord, pitches);
+      }
+      for (const [chord, pitches] of byChord) {
+        setChordArpeggioPitchGroups(chord, [...chordArpeggioPitchGroups(chord), pitches]);
+      }
+    }
+  }
 }
 
 function applyImportedTempos(score: Score, imported: ImportedTempoEvent[]): void {
@@ -649,6 +783,7 @@ export function loadMusicXml(xmlText: string): Score {
   const score = new Score();
   const importedTempos: ImportedTempoEvent[] = [];
   const importedKeys: ImportedKeyEvent[] = [];
+  const importedArpeggios: ImportedArpeggio[] = [];
 
   score.title = extractScoreTitle(root);
   const movementTitle = normText(txt(root, "movement-title"));
@@ -694,24 +829,24 @@ export function loadMusicXml(xmlText: string): Score {
     const right = new Part();
     right.hand = "right";
     right.voiceIndex = 1;
-    loadPart(right, partEls[0], score.playData, 1, importedTempos, importedKeys);
+    loadPart(right, partEls[0], score.playData, 1, importedTempos, importedKeys, importedArpeggios);
     const left = new Part();
     left.hand = "left";
     left.voiceIndex = 2;
     // Sound/repeat metadata is score-global; parsing the second staff into a
     // throwaway PlayData avoids duplicating jump entries.
-    loadPart(left, partEls[0], new PlayData(), 2);
+    loadPart(left, partEls[0], new PlayData(), 2, null, null, importedArpeggios);
     score.parts.push(right, left);
     score.piano = true;
   } else if (twoPartPiano(root)) {
     const right = new Part();
     right.hand = "right";
     right.voiceIndex = 1;
-    loadPart(right, partEls[0], score.playData, null, importedTempos, importedKeys);
+    loadPart(right, partEls[0], score.playData, null, importedTempos, importedKeys, importedArpeggios);
     const left = new Part();
     left.hand = "left";
     left.voiceIndex = 2;
-    loadPart(left, partEls[1], new PlayData());
+    loadPart(left, partEls[1], new PlayData(), null, null, null, importedArpeggios);
     score.parts.push(right, left);
     score.piano = true;
   } else {
@@ -735,6 +870,7 @@ export function loadMusicXml(xmlText: string): Score {
           staves > 1 ? staff : undefined,
           score.parts.length === 0 ? importedTempos : null,
           score.parts.length === 0 ? importedKeys : null,
+          importedArpeggios,
         );
         score.parts.push(part);
       }
@@ -760,9 +896,29 @@ export function loadMusicXml(xmlText: string): Score {
     .map((event) => new KeyMark(event.measure, event.offset, event.fifths));
   for (const part of score.parts) {
     for (const m of part.measures) {
+      // The ordinary single-part importer still extracts its melody. Keep
+      // complete chords only where an arpeggiate marker needs exact members;
+      // discarded secondary-voice chords must remain discarded.
+      const retainedArpeggios = !score.piano && !score.ensemble ? m.entries.flatMap(entry =>
+        entry instanceof Chord && entry.arpeggio
+          ? [{ chord: entry, notes: [...entry.notes], lyrics: entry.notes.flatMap(note => note.lyrics) }]
+          : []) : [];
       m.init(score.piano || score.ensemble
         ? { keepChords: true, primaryVoice: true }
         : undefined);
+      if (retainedArpeggios.length > 0) {
+        for (const { chord, notes, lyrics } of retainedArpeggios) {
+          if (!m.entries.includes(chord)) continue;
+          chord.notes = notes.sort((left, right) => right.pitch - left.pitch);
+          for (const note of chord.notes) note.lyrics = [];
+          if (chord.notes.length > 0) chord.notes[0].lyrics = lyrics;
+        }
+        const accidental = new AccidentalStat(m.key.fifths);
+        for (const entry of m.entries) {
+          if (!(entry instanceof Chord) || entry.rest) continue;
+          for (const note of entry.notes) note.init(m.key.fifths, accidental);
+        }
+      }
       if (score.piano || score.ensemble) {
         for (const ent of m.entries) {
           if (!(ent instanceof Chord)) continue;
@@ -799,6 +955,7 @@ export function loadMusicXml(xmlText: string): Score {
       }
     }
   }
+  applyImportedArpeggios(score, root, importedArpeggios);
   normalizeOpeningPickup(score);
   findRefrain(score);
   score.parseRepeatInf();

@@ -3,6 +3,7 @@ export interface WatermarkOptions {
   enabled: boolean;
   text: string;
   opacity: number;
+  /** Spacing level from 1 (sparse) to 15 (dense), never a mark count. */
   density: number;
 }
 
@@ -14,11 +15,15 @@ export const DEFAULT_WATERMARK: Readonly<WatermarkOptions> = {
 };
 
 const SVG_NS = "http://www.w3.org/2000/svg";
-const STORAGE_KEY = "jpeditor:export-watermark:v1";
+const STORAGE_KEY = "jpeditor:export-watermark:v2";
+const LEGACY_STORAGE_KEY = "jpeditor:export-watermark:v1";
 
 export function loadWatermarkOptions(): WatermarkOptions {
   try {
-    const raw = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "null") as Partial<WatermarkOptions> | null;
+    // Keep the old slider level, text and opacity when upgrading from count-based
+    // placement. Only accepting an export saves the new density settings.
+    const raw = JSON.parse(localStorage.getItem(STORAGE_KEY)
+      ?? localStorage.getItem(LEGACY_STORAGE_KEY) ?? "null") as Partial<WatermarkOptions> | null;
     if (!raw) return { ...DEFAULT_WATERMARK };
     return normalizeWatermarkOptions(raw);
   } catch {
@@ -51,16 +56,29 @@ export function pageViewBox(svg: SVGSVGElement): { x: number; y: number; width: 
   return { x: 0, y: 0, width, height };
 }
 
-/** First mark is always fully inside the page; the others may cross an edge. */
-export function watermarkPositions(count: number): ReadonlyArray<readonly [number, number]> {
+/**
+ * A centered square lattice in page units, returned as normalized coordinates.
+ * Increasing density reduces spacing rather than truncating a list of marks.
+ * Every added row/column has its reflected partner, including on landscape pages.
+ * The central mark comes first and stays fully inside the page after rotation.
+ */
+export function watermarkPositions(density: number, width = 1, height = 1): ReadonlyArray<readonly [number, number]> {
+  const level = normalizeWatermarkOptions({ density }).density;
+  const pageWidth = Number.isFinite(width) && width > 0 ? width : 1;
+  const pageHeight = Number.isFinite(height) && height > 0 ? height : 1;
+  const spacing = Math.min(pageWidth, pageHeight) * 0.9 / (1 + (level - 1) * 0.25);
+  // Keep centers away from the edge; complete reflected rows may still have
+  // partially clipped lettering, just like other tiled watermarks.
+  const columns = Math.floor(pageWidth * 0.46 / spacing);
+  const rows = Math.floor(pageHeight * 0.46 / spacing);
   const positions: Array<readonly [number, number]> = [[0.5, 0.5]];
-  const ring: Array<readonly [number, number]> = [
-    [0.12, 0.13], [0.88, 0.13], [0.12, 0.5], [0.88, 0.5],
-    [0.12, 0.87], [0.88, 0.87], [0.5, 0.12], [0.5, 0.88],
-    [0.3, 0.3], [0.7, 0.3], [0.3, 0.7], [0.7, 0.7],
-    [0.5, 0.29], [0.5, 0.71],
-  ];
-  return positions.concat(ring).slice(0, Math.max(1, Math.min(15, Math.round(count))));
+  for (let row = -rows; row <= rows; row++) {
+    for (let column = -columns; column <= columns; column++) {
+      if (row === 0 && column === 0) continue;
+      positions.push([0.5 + column * spacing / pageWidth, 0.5 + row * spacing / pageHeight]);
+    }
+  }
+  return positions;
 }
 
 export function watermarkFontSize(text: string, width: number, height: number): number {
@@ -103,7 +121,7 @@ export function withWatermark(source: SVGSVGElement, raw: Partial<WatermarkOptio
   layer.setAttribute("font-size", String(fontSize));
   layer.setAttribute("text-anchor", "middle");
   layer.setAttribute("dominant-baseline", "middle");
-  for (const [nx, ny] of watermarkPositions(options.density)) {
+  for (const [nx, ny] of watermarkPositions(options.density, width, height)) {
     const cx = x + width * nx;
     const cy = y + height * ny;
     const mark = document.createElementNS(SVG_NS, "text");

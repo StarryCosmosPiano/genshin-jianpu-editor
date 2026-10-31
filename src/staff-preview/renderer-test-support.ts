@@ -5,8 +5,10 @@ import { Score, Part, Measure, Chord, Note, Lyric, Tuplet, PlaySpecKind, JumpSpe
 import { Fraction } from "../common/fraction";
 import { createStaffNoteRegistry } from "./identity";
 import { buildStaffModel } from "./model";
+import { staffInputAtPoint, staffPitchAtY, staffCursorPoint, staffSnapAnchors, staffNextInputAnchor } from "./input-geometry";
 
 export const staffPreviewTestApi = {
   prepareStaffPreview, Score, Part, Measure, Chord, Note, Lyric, Tuplet,
   Fraction, createStaffNoteRegistry, buildStaffModel, PlaySpecKind, JumpSpec, TimePosition,
+  staffInputAtPoint, staffPitchAtY, staffCursorPoint, staffSnapAnchors, staffNextInputAnchor,
 };

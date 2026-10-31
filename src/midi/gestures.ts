@@ -7,6 +7,8 @@ export interface MidiSlashGestureEvent {
   pitches: number[];
   track?: number;
   channel?: number;
+  /** Exact source identities survive cross-track onset merging. */
+  sourceNotes?: readonly ParsedMidiNote[];
 }
 
 export interface MidiSlashGesture {
@@ -24,6 +26,31 @@ export interface MidiSlashGestureAnalysis {
   grace: MidiSlashGesture[];
   arpeggio: MidiSlashGesture[];
   triplet: MidiSlashGesture[];
+}
+
+// Keep the decisions actually used for one imported Score. The serializer
+// must not rerun detection and re-enable tuplets that the user disabled.
+// A WeakMap avoids retaining closed scores or adding format-specific state to
+// the shared Score model. Match the MIDI identity before reusing a record.
+const importedGestureAnalyses = new WeakMap<object, {
+  source: ParsedMidi;
+  gestures: MidiSlashGestureAnalysis;
+}>();
+
+export function rememberMidiSlashGestures(
+  score: object,
+  source: ParsedMidi,
+  gestures: MidiSlashGestureAnalysis,
+): void {
+  importedGestureAnalyses.set(score, { source, gestures });
+}
+
+export function importedMidiSlashGestures(
+  score: object,
+  source: ParsedMidi,
+): MidiSlashGestureAnalysis | null {
+  const remembered = importedGestureAnalyses.get(score);
+  return remembered?.source === source ? remembered.gestures : null;
 }
 
 interface TimedNote {
@@ -84,6 +111,7 @@ function gestureEvent(group: Onset): MidiSlashGestureEvent {
     pitches: pitches(group),
     track: source?.track,
     channel: source?.channel,
+    sourceNotes: group.notes.map((note) => note.source),
   };
 }
 

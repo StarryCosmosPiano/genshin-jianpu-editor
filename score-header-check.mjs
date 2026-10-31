@@ -31,11 +31,13 @@ function headerState() {
   const first = score.parts[0].measures[0];
   return { text: app.getText(), title: score.title, subtitle: score.subtitle,
     lyricist: score.lyricist, composer: score.composer, arranger: score.arranger,
+    headerTypography: score.headerTypography ?? null,
     fifths: first.key.fifths, beats: first.time.beats, beatType: first.time.beatType,
     tempoBpm: score.tempoBpm, tempoBeatUnit: score.tempoBeatUnit };
 }
 
 async function clickHeader(selector) {
+  await page.evaluate(() => window.__app.setInputMode(true));
   const node = page.locator(`#score-pane ${selector}`).first();
   await node.waitFor();
   await node.click();
@@ -46,7 +48,7 @@ async function editCredits(name) {
   await clickHeader(".publication-title");
   const dialog = page.locator('.app-dialog[aria-labelledby="app-dialog-title"]');
   await dialog.waitFor();
-  assert(await dialog.locator("input").count() === 5, `${name}: credit dialog lacks five fields`);
+  assert(await dialog.locator("input").count() === 10, `${name}: credit dialog lacks five text/size pairs`);
   const expected = { title: `${name} 新标题`, subtitle: `${name} 新副标题`,
     lyricist: `${name} 新作词`, composer: `${name} 新作曲`, arranger: `${name} 新编曲` };
   for (const [field, value] of Object.entries(expected)) await dialog.locator(`[name="${field}"]`).fill(value);
@@ -81,6 +83,60 @@ async function checkCancel(name) {
   }
 }
 
+async function editTypography(name) {
+  const before = await page.evaluate(headerState);
+  const fields = ["title", "subtitle", "lyricist", "composer", "arranger"];
+  for (const field of fields) {
+    await clickHeader(`.publication-${field}`);
+    const dialog = page.locator(".app-dialog");
+    await dialog.waitFor();
+    assert(await dialog.locator(`[name="${field}"]`).evaluate(node => document.activeElement === node),
+      `${name}: clicking ${field} focused the wrong input`);
+    const box = await dialog.locator(`[name="${field}"]`).boundingBox();
+    const content = await dialog.locator(".app-dialog-content").boundingBox();
+    assert(box.y >= content.y - 1 && box.y + box.height <= content.y + content.height + 1,
+      `${name}: focused ${field} is scrolled out of view`);
+    await dialog.locator('button[data-action="cancel"]').click();
+    await dialog.waitFor({ state: "detached" });
+  }
+  const sizes = { title: 32, subtitle: 14, lyricist: 10, composer: 11, arranger: 12 };
+  await clickHeader(".publication-composer");
+  const dialog = page.locator(".app-dialog");
+  for (const [field, size] of Object.entries(sizes)) await dialog.locator(`[name="${field}Size"]`).fill(String(size));
+  await dialog.locator('button[data-action="apply"]').click();
+  await dialog.waitFor({ state: "detached" });
+  const saved = await page.evaluate(headerState);
+  assert(JSON.stringify(saved.headerTypography) === JSON.stringify(sizes), `${name}: individual sizes were not saved`);
+  for (const scale of [0.5, 1, 1.5]) {
+    const actual = await page.evaluate(({ sizes, scale }) => {
+      const app = window.__app;
+      app.setEngravingStyle({ ...app.engravingStyle, contentScale: scale }, false);
+      return Object.fromEntries(Object.keys(sizes).map(field => [field,
+        Number(document.querySelector(`#score-pane .publication-${field} text`)?.getAttribute("font-size"))]));
+    }, { sizes, scale });
+    for (const [field, size] of Object.entries(sizes)) assert(Math.abs(actual[field] - size * scale) < 0.01,
+      `${name}: ${field} size ${actual[field]} differs from ${size * scale}`);
+  }
+  await page.evaluate(() => window.__app.setEngravingStyle({ ...window.__app.engravingStyle, contentScale: 1 }, false));
+  await page.evaluate(() => window.__app.undoEdit());
+  await page.waitForFunction(() => !window.__app.painter.score.headerTypography);
+  assert((await page.evaluate(headerState)).text === before.text, `${name}: undo did not restore absent typography`);
+  await page.evaluate(() => window.__app.redoEdit());
+  await page.waitForFunction(() => window.__app.painter.score.headerTypography?.title === 32);
+  const text = await page.evaluate(() => window.__app.getText());
+  await page.evaluate(({ text, name }) => window.__app.loadText(text, name === "JPW" ? "reopened.jpwabc" : "reopened.txt"), { text, name });
+  await page.waitForFunction(() => window.__app.painter.score.headerTypography?.title === 32);
+  assert(JSON.stringify((await page.evaluate(headerState)).headerTypography) === JSON.stringify(sizes), `${name}: reopen lost sizes`);
+  await clickHeader(".publication-arranger");
+  const clear = page.locator(".app-dialog");
+  await clear.locator('[name="arrangerSize"]').fill("");
+  await clear.locator('button[data-action="apply"]').click();
+  await clear.waitFor({ state: "detached" });
+  const partial = await page.evaluate(headerState);
+  assert(partial.headerTypography.arranger === undefined && partial.headerTypography.title === 32,
+    `${name}: clearing one override affected another`);
+}
+
 async function editRhythm(name) {
   const before = await page.evaluate(headerState);
   await clickHeader(".publication-meta");
@@ -112,6 +168,7 @@ try {
   await page.locator("#score-pane .publication-title").waitFor();
   await editCredits("JPW");
   await checkCancel("JPW");
+  await editTypography("JPW");
   await editRhythm("JPW");
 
   await page.evaluate((text) => {
@@ -129,6 +186,7 @@ try {
   await page.locator("#score-pane .publication-title").waitFor();
   await editCredits("键盘");
   await checkCancel("键盘");
+  await editTypography("键盘");
   await editRhythm("键盘");
 
   // A metadata edit should update an open settings pane without replacing unrelated drafts.
@@ -184,8 +242,36 @@ try {
     "Old settings pane survived document replacement");
   const replacement = await page.evaluate(headerState);
   assert(replacement.title === "替换文档" && !replacement.text.includes("过期窗口标题"), "Stale header edit touched replacement score");
+  for (const instrumentName of ["钢琴", "长乐器名称居中核对"]) for (const scale of [0.5, 1, 1.5]) {
+    const voice = Array(18).fill("1 2 3 4").join(" | ");
+    const lower = Array(18).fill("1,- 5,-").join(" | ");
+    await page.evaluate(({ instrumentName, voice, lower, scale }) => {
+      const app = window.__app;
+      app.loadText(`.Title\nTitle = 留白核对\nInstrument = {${instrumentName}}\nKeyAndMeters = {1=C,4/4}\n.Voice.RH\n${voice} |]\n.Voice.LH\n${lower} |]\n`, "margins.jpwabc");
+      app.setEngravingStyle({ ...app.engravingStyle, contentScale: scale, measuresPerSystem: 6, justifyLastSystem: true }, false);
+    }, { instrumentName, voice, lower, scale });
+    const geometry = await page.evaluate(() => {
+      const svg = document.querySelector("#score-pane svg");
+      const rect = svg.getBoundingClientRect();
+      const unit = rect.width / window.__app.pageW;
+      return [...svg.querySelectorAll(".piano-system")].map(system => {
+        const boxes = [...system.querySelectorAll("text,path,line")].filter(node => {
+          if (node.tagName.toLowerCase() !== "line") return true;
+          return Number(node.getAttribute("stroke-width")) > 0;
+        }).map(node => node.getBoundingClientRect()).filter(box => box.width > 0);
+        const left = (Math.min(...boxes.map(box => box.left)) - rect.left) / unit;
+        const right = (rect.right - Math.max(...boxes.map(box => box.right))) / unit;
+        return { left, right };
+      });
+    });
+    assert(geometry.length >= 2, "Centered piano fixture lacks continuation systems");
+    // Advance-box spacing retains a small half-glyph clearance at the right;
+    // reject the former fixed 68-unit left inset, allowing that glyph padding.
+    for (const bounds of geometry) assert(Math.abs(bounds.left - bounds.right) <= 6 * scale + 1,
+      `${instrumentName}/${scale}: visible system margins are unbalanced ${JSON.stringify(bounds)}`);
+  }
   assert(errors.length === 0, `Browser errors: ${errors.join("; ")}`);
-  console.log("谱头点击编辑通过：JPW/键盘 TXT、五项署名、取消、撤销重做、调拍速、设置同步与撤销重做、切文档关闭");
+  console.log("谱头点击编辑通过：对应字段焦点、JPW/键盘TXT独立字号、保存重开、单乘缩放、清除覆盖、撤销重做、设置同步、切文档关闭及钢琴左右留白");
 } finally {
   await browser.close();
   server?.close();

@@ -5,6 +5,8 @@
   "windows": ["main"],
   "permissions": [
     "core:default",
+    "core:window:allow-close",
+    "core:window:allow-destroy",
     "core:webview:allow-internal-toggle-devtools",
     "opener:default",
     "dialog:default",

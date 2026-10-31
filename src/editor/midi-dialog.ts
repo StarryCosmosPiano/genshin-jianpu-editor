@@ -7,6 +7,7 @@ import {
 } from "../score/score";
 import { detectMidiSlashGestures } from "../midi";
 import { fileStem } from "./file-format";
+import { blockImportBackground } from "../ui/import-dialog";
 import type {
   MidiAnalysis,
   MidiHandMode,
@@ -453,10 +454,10 @@ export function showMidiImportDialog(parsed: ParsedMidi, analysis: MidiAnalysis,
     box.append(heading, info, histogram, liveGestureCounts, warning, controls, slashGroups, mapping, metadata, advanced, hint, footer);
     overlay.append(box);
     document.body.append(overlay);
+    const releaseBackground = blockImportBackground(overlay);
 
-    const close = (value: MidiImportOptions | null) => { overlay.remove(); resolve(value); };
+    const close = (value: MidiImportOptions | null) => { overlay.remove(); releaseBackground(); resolve(value); };
     cancel.onclick = () => close(null);
-    overlay.onclick = (event) => { if (event.target === overlay) close(null); };
     const updateStructure = (): void => {
       const ensemble = scoreMode.value === "ensemble";
       mapping.hidden = !ensemble;

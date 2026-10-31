@@ -1,6 +1,10 @@
 import { Fraction } from "./src/common/fraction";
-import { Chord, KeyMark, Measure, Note, Part, Score } from "./src/score/score";
+import { Chord, CrossPartArpeggio, KeyMark, Measure, Note, Part, Score } from "./src/score/score";
 import { applyKeyChangeKeepingDegrees } from "./src/score/key-edit";
+import { chordArpeggioPitchGroups, setChordArpeggioPitchGroups } from "./src/score/arpeggio";
+import { JpwFile } from "./src/jpword/jpwfile";
+import { fromJpw } from "./src/score/jpwimport";
+import { scoreToJpwabc } from "./src/score/jpscore";
 
 function assert(condition: unknown, message: string): asserts condition {
   if (!condition) throw new Error(message);
@@ -56,5 +60,28 @@ assert(after.pitch === 65, "note after next key mark moved");
 assert(lowerRetuned.pitch === 55, "same-instrument lower part was not transposed at the global key mark");
 assert(lowerAfter.pitch === 50, "lower part moved past the next key mark");
 assert(retuned.number === "3", "visible degree changed");
+
+{
+  const decorated = fromJpw(JpwFile.fromString(".Title\nKeyAndMeters = {1=C,4/4}\n.Voice.RH\n[1357] 0 0 0 | [1357] 0 0 0 |]\n.Voice.LH\n1, 0 0 0 | 1, 0 0 0 |]\n")!)!;
+  const chords = decorated.parts[0].measures.map(measure => measure.entries.find((entry): entry is Chord => entry instanceof Chord && !entry.rest)!);
+  for (const chord of chords) setChordArpeggioPitchGroups(chord, [[60, 64], [67, 71]]);
+  for (let measure = 0; measure < 2; measure++) {
+    const mark = new CrossPartArpeggio(); mark.measure = measure; mark.parts = [0, 1];
+    mark.pitches = [{ part: 0, pitch: 60 }, { part: 1, pitch: 48 }];
+    decorated.crossPartArpeggios.push(mark);
+  }
+  decorated.keyMarks.push(new KeyMark(1, new Fraction(0), 0));
+  assert(applyKeyChangeKeepingDegrees(decorated, 0, 0, new Fraction(0), 1), "Decorated key edit rejected");
+  const expected = JSON.stringify([[67, 71], [74, 78]]);
+  assert(JSON.stringify(chordArpeggioPitchGroups(chords[0])) === expected, "Key edit detached local waves");
+  assert(JSON.stringify(chordArpeggioPitchGroups(chords[1])) === JSON.stringify([[60, 64], [67, 71]]), "Key edit altered waves past next key mark");
+  assert(JSON.stringify(decorated.crossPartArpeggios.map(mark => mark.pitches.map(member => member.pitch))) === JSON.stringify([[67, 55], [60, 48]]),
+    "Key edit detached cross-part waves or retuned members past next key mark");
+  const reopened = fromJpw(JpwFile.fromString(scoreToJpwabc(decorated))!)!;
+  const firstChord = reopened.parts[0].measures[0].entries.find((entry): entry is Chord => entry instanceof Chord && !entry.rest)!;
+  assert(JSON.stringify(chordArpeggioPitchGroups(firstChord)) === expected, "Key-edited waves changed on JPW save/reopen");
+  assert(JSON.stringify(reopened.crossPartArpeggios.map(mark => mark.pitches.map(member => member.pitch))) === JSON.stringify([[67, 55], [60, 48]]),
+    "Key-edited cross-part waves changed on JPW save/reopen");
+}
 
 console.log("key edit checks passed");

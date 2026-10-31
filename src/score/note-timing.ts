@@ -1,5 +1,7 @@
 import { Fraction } from "../common/fraction";
-import { Chord, Measure, Note, type Part, type Score } from "./score";
+import { AccidentalStat, Chord, CrossPartArpeggio, Measure, Note, type Part, type Score, type Tuplet } from "./score";
+import { chordArpeggioNoteGroups, chordArpeggioPitchGroups, setChordArpeggioPitchGroups } from "./arpeggio";
+import { spellPitch } from "./musicxml-export";
 
 export type NoteTimingDivision = 1 | 2 | 4 | 8 | 16 | 32 | 64;
 export type NoteTimingSourceMode = "jpw" | "slash";
@@ -552,6 +554,7 @@ function resetAttackNotation(chord: Chord): void {
 function mergeTimelineAttacks(left: Chord, right: Chord): Chord {
   const leftSounding = left.notes.some((note) => !note.rest);
   const rightSounding = right.notes.some((note) => !note.rest);
+  const arpeggioGroups = [...chordArpeggioPitchGroups(left), ...chordArpeggioPitchGroups(right)];
   const target = leftSounding || !rightSounding ? left : right;
   const source = target === left ? right : left;
   const mergeOrdinaryRestOnset = !leftSounding && !rightSounding
@@ -580,14 +583,7 @@ function mergeTimelineAttacks(left: Chord, right: Chord): Chord {
       target.graceNotes.push(grace);
     }
   }
-  target.arpeggio = target.arpeggio || source.arpeggio;
-  if (target.arpeggio || source.arpeggio) {
-    const values = new Set([
-      ...(target.arpeggioPitches ?? []),
-      ...(source.arpeggioPitches ?? []),
-    ]);
-    target.arpeggioPitches = values.size > 0 ? [...values].sort((a, b) => a - b) : null;
-  }
+  setChordArpeggioPitchGroups(target, arpeggioGroups);
   target.slurStart = target.slurStart || source.slurStart;
   target.slurEnd = target.slurEnd || source.slurEnd;
   return target;
@@ -642,13 +638,7 @@ export function mergeDuplicateChordPitches(score: Score): number {
           entry.notes = entry.notes.filter((candidate) => candidate !== note);
           removed++;
         }
-        if (entry.arpeggioPitches) {
-          entry.arpeggioPitches = [...new Set(entry.arpeggioPitches)].sort((a, b) => a - b);
-          if (entry.arpeggioPitches.length < 2) {
-            entry.arpeggio = false;
-            entry.arpeggioPitches = null;
-          }
-        }
+        setChordArpeggioPitchGroups(entry, chordArpeggioPitchGroups(entry));
         removeChordIfEmpty(entry);
       }
     }
@@ -1032,7 +1022,7 @@ export function normalizeScoreRhythmicSpelling(score: Score): void {
         && entry.notes.some((note) => note.tuplet !== null
           || note.tupletBegin
           || note.tupletEnd)));
-    if (hasSemanticTie && !hasTuplet) {
+    if (hasSemanticTie && !hasTuplet && !partNeedsExplicitNoteTies(part)) {
       const originalNoteOrder = new Map<Chord, Note[]>();
       for (const measure of part.measures) {
         for (const entry of measure.entries) {
@@ -1180,18 +1170,12 @@ export function moveScoreNotesOnTimeline(
     });
   }
 
+  const movingArpeggios = new Map(moves.map(move => [move.source, chordArpeggioNoteGroups(move.source)]));
   const affected = new Set<number>();
   for (const move of moves) {
     detachMovedTieChain(move.note);
     move.source.notes = move.source.notes.filter((note) => note !== move.note);
-    if (move.source.arpeggioPitches) {
-      move.source.arpeggioPitches = move.source.arpeggioPitches
-        .filter((pitch) => pitch !== move.note.pitch);
-      if (move.source.arpeggioPitches.length < 2) {
-        move.source.arpeggio = false;
-        move.source.arpeggioPitches = null;
-      }
-    }
+    setChordArpeggioPitchGroups(move.source, chordArpeggioPitchGroups(move.source));
     removeChordIfEmpty(move.source);
     affected.add(move.partIndex);
   }
@@ -1285,15 +1269,20 @@ export function moveScoreNotesOnTimeline(
       }
       move.source.graceNotes = [];
     }
-    if (!move.source.notes.some((note) => !note.rest) && move.source.arpeggio) {
-      target.arpeggio = true;
-      target.arpeggioPitches = move.source.arpeggioPitches
-        ? [...move.source.arpeggioPitches]
-        : null;
-      move.source.arpeggio = false;
-      move.source.arpeggioPitches = null;
-    }
+
     removeChordIfEmpty(move.source);
+  }
+
+  for (const [source, groups] of movingArpeggios) for (const group of groups) {
+    const byChord = new Map<Chord, number[]>();
+    for (const note of group) {
+      if (note.chord === source || !note.chord.notes.includes(note)) continue;
+      const pitches = byChord.get(note.chord) ?? [];
+      pitches.push(note.pitch);
+      byChord.set(note.chord, pitches);
+    }
+    for (const [chord, pitches] of byChord) if (pitches.length >= 2)
+      setChordArpeggioPitchGroups(chord, [...chordArpeggioPitchGroups(chord), pitches]);
   }
 
   if (options.preserveRests && delta.compareTo(ZERO) < 0) {
@@ -1812,4 +1801,620 @@ export function resizeScoreNoteSegmentsWithRests(
     }
   }
   return { changed, blocked };
+}
+
+/** Ordinary JPW parentheses describe complete repeated chords. A partial
+ * chord tie needs explicit note occurrences so an unselected tone cannot
+ * inherit another member's duration when the text is opened again. */
+export function partNeedsExplicitNoteTies(part: Part): boolean {
+  return part.measures.some(measure => measure.entries.some(entry => {
+    if (!(entry instanceof Chord)) return false;
+    const tones = entry.notes.filter(note => !note.rest);
+    return (['tiePrev', 'tieNext'] as const).some(direction => {
+      const linked = tones.filter(note => note[direction] !== null);
+      if (!linked.length) return false;
+      const destination = linked[0][direction]!.chord;
+      const others = destination.notes.filter(note => !note.rest);
+      return linked.length !== tones.length || others.length !== tones.length
+        || linked.some(note => note[direction]!.chord !== destination)
+        // Rebuilding a repeated chord from one spelling would overwrite a
+        // continuation's local degree across a key change on the next save.
+        || linked.some(note => note.number !== note[direction]!.number
+          || note.jpOctave !== note[direction]!.jpOctave
+          || note.jpAlter !== note[direction]!.jpAlter)
+        || new Set(linked.map(note => note[direction])).size !== others.length;
+    });
+  }));
+}
+
+export interface ExplicitNoteTieEndpoint {
+  measure: number;
+  offset: string;
+  pitch: number;
+  occurrence: number;
+}
+export interface ExplicitNoteTie {
+  part: number;
+  from: ExplicitNoteTieEndpoint;
+  to: ExplicitNoteTieEndpoint;
+}
+
+export function noteTieAnnotations(score: Score): ExplicitNoteTie[] {
+  const endpoint = (part: Part, note: Note): ExplicitNoteTieEndpoint => ({
+    measure: part.measures.indexOf(note.chord.measure), offset: note.chord.position.toString(),
+    pitch: note.pitch, occurrence: note.chord.notes.slice(0, note.chord.notes.indexOf(note))
+      .filter(other => !other.rest && other.pitch === note.pitch).length,
+  });
+  return score.parts.flatMap((part, partIndex) => !partNeedsExplicitNoteTies(part) ? []
+    : part.measures.flatMap(measure => measure.entries.flatMap(entry => !(entry instanceof Chord) ? []
+      : entry.notes.flatMap(note => note.rest || !note.tieNext ? [] : [{
+        part: partIndex, from: endpoint(part, note), to: endpoint(part, note.tieNext),
+      }]))));
+}
+
+/** Restore only exact, contiguous, one-to-one endpoints. Unknown or stale
+ * annotations are ignored; hand-written slur inference remains unchanged. */
+export function applyExplicitNoteTies(score: Score, raw: unknown): void {
+  if (!Array.isArray(raw) || raw.length === 0) return;
+  const touched = new Set<Chord>();
+  const endpoint = (part: Part, value: unknown): Note | null => {
+    if (!value || typeof value !== 'object') return null;
+    const item = value as Partial<ExplicitNoteTieEndpoint>;
+    if (!Number.isInteger(item.measure) || item.measure! < 0
+      || !Number.isInteger(item.pitch) || !Number.isInteger(item.occurrence) || item.occurrence! < 0) return null;
+    const at = safeFraction(item.offset);
+    if (!at || at.compareTo(ZERO) < 0) return null;
+    const chord = part.measures[item.measure!]?.entries.find((entry): entry is Chord =>
+      entry instanceof Chord && entry.position.equals(at));
+    return chord?.notes.filter(note => !note.rest && note.pitch === item.pitch)[item.occurrence!] ?? null;
+  };
+  for (const value of raw) {
+    if (!value || typeof value !== 'object') continue;
+    const item = value as Partial<ExplicitNoteTie>;
+    if (!Number.isInteger(item.part) || item.part! < 0) continue;
+    const part = score.parts[item.part!];
+    if (!part) continue;
+    const from = endpoint(part, item.from);
+    const to = endpoint(part, item.to);
+    if (!from || !to || from === to || from.pitch !== to.pitch || !from.chord.duration
+      || !from.absoluteTick.plus(from.chord.duration).equals(to.absoluteTick)
+      || (from.tieNext && from.tieNext !== to) || (to.tiePrev && to.tiePrev !== from)) continue;
+    from.tieNext = to;
+    from.tieStart = true;
+    to.tiePrev = from;
+    to.tieEnd = true;
+    touched.add(from.chord);
+    touched.add(to.chord);
+  }
+  for (const chord of touched)
+    chord.transparentContinuation = !chord.rest && chord.notes.length > 0
+      && chord.notes.every(note => !note.rest && note.tiePrev !== null);
+}
+
+/** Logical attacks, including repeated equal pitches as separate occurrences.
+ * Used by timing edit transactions to verify every selected and unselected
+ * onset/end after the actual document serializer/parser round trip. */
+export function scoreNoteTimingFingerprint(score: Score): string {
+  const values: Array<{ part: number; pitch: number; start: string; end: string }> = [];
+  score.parts.forEach((part, partIndex) => {
+    for (const measure of part.measures) for (const entry of measure.entries) {
+      if (!(entry instanceof Chord)) continue;
+      for (const note of entry.notes) {
+        if (note.rest || note.softDeleted || note.tiePrev) continue;
+        let tail = note;
+        const seen = new Set<Note>();
+        while (tail.tieNext && !seen.has(tail)) { seen.add(tail); tail = tail.tieNext; }
+        values.push({ part: partIndex, pitch: note.pitch, start: note.absoluteTick.toString(),
+          end: tail.absoluteTick.plus(tail.chord.duration ?? ZERO).toString() });
+      }
+    }
+  });
+  return JSON.stringify(values.sort((a, b) => a.part - b.part || a.pitch - b.pitch
+    || Fraction.fromString(a.start).compareTo(Fraction.fromString(b.start))
+    || Fraction.fromString(a.end).compareTo(Fraction.fromString(b.end))));
+}
+
+interface MemberTimingSpan {
+  root: Note;
+  members: Array<{ note: Note; spelling: Note; fifths: number; start: Fraction; end: Fraction }>;
+  start: Fraction;
+  end: Fraction;
+  oldStart: Fraction;
+  oldEnd: Fraction;
+}
+interface MemberTimingChord {
+  chord: Chord;
+  start: Fraction;
+  end: Fraction;
+  groups: Note[][];
+}
+interface MemberTimingPart {
+  score: Score;
+  part: Part;
+  boundaries: MeasureBoundary[];
+  spans: MemberTimingSpan[];
+  chords: MemberTimingChord[];
+  tuplets: Array<{ tuplet: Tuplet; start: Fraction; end: Fraction }>;
+}
+interface MemberTimingCell {
+  boundary: MeasureBoundary;
+  start: Fraction;
+  end: Fraction;
+  written: Fraction;
+  tuplet: Tuplet | null;
+  spans: MemberTimingSpan[];
+}
+export interface NoteMemberTimingResult {
+  changed: number;
+  /** An ordinary duration limit keeps this member unchanged, while the
+   * remaining same-onset members may still be committed in one transaction. */
+  skipped: number;
+  blocked: number;
+  reason?: 'boundary' | 'incompatible-target';
+}
+
+function memberTimingKeyAt(score: Score, measure: Measure, offset: Fraction): number {
+  const marks = score.keyMarks.filter(mark => mark.measure < measure.index
+    || mark.measure === measure.index && mark.offset.compareTo(offset) <= 0)
+    .sort((a, b) => a.measure - b.measure || a.offset.compareTo(b.offset));
+  return marks[marks.length - 1]?.fifths ?? measure.key.fifths;
+}
+
+function captureMemberTimingPart(score: Score, part: Part): MemberTimingPart {
+  const chords = part.measures.flatMap(measure => measure.entries.flatMap(entry =>
+    entry instanceof Chord && entry.duration && entry.duration.compareTo(ZERO) > 0 ? [{
+      chord: entry, start: measure.position.plus(entry.position),
+      end: measure.position.plus(entry.position).plus(entry.duration),
+      groups: chordArpeggioNoteGroups(entry),
+    }] : []));
+  const spans: MemberTimingSpan[] = [];
+  const seen = new Set<Note>();
+  for (const { chord } of chords) for (const note of chord.notes) {
+    if (note.rest || seen.has(note)) continue;
+    const { root } = tieChainRootAndDuration(note);
+    const members: MemberTimingSpan['members'] = [];
+    let member: Note | null = root;
+    while (member && !seen.has(member)) {
+      seen.add(member);
+      members.push({ note: member, spelling: cloneNote(member, member.chord),
+        fifths: memberTimingKeyAt(score, member.chord.measure, member.chord.position), start: member.absoluteTick,
+        end: member.absoluteTick.plus(member.chord.duration ?? ZERO) });
+      member = member.tieNext;
+    }
+    if (!members.length) continue;
+    const start = members[0].start;
+    const end = members[members.length - 1].end;
+    spans.push({ root, members, start, end, oldStart: start, oldEnd: end });
+  }
+  const tupletMap = new Map<Tuplet, { tuplet: Tuplet; start: Fraction; end: Fraction }>();
+  for (const item of chords) for (const note of item.chord.notes) {
+    if (!note.tuplet) continue;
+    const existing = tupletMap.get(note.tuplet);
+    if (!existing) tupletMap.set(note.tuplet, { tuplet: note.tuplet, start: item.start, end: item.end });
+    else {
+      if (item.start.compareTo(existing.start) < 0) existing.start = item.start;
+      if (item.end.compareTo(existing.end) > 0) existing.end = item.end;
+    }
+  }
+  return { score, part, boundaries: boundariesOf(part), spans, chords, tuplets: [...tupletMap.values()] };
+}
+
+/** Reusing a numbered spelling under a new tonic changes its sounding pitch.
+ * Only changed keys need a fresh spelling; same-key enharmonics stay exact. */
+function respellMemberTimingNote(note: Note, fromFifths: number, toFifths: number): void {
+  if (fromFifths === toFifths) return;
+  const canonical = new Note(note.chord);
+  canonical.pitch = note.pitch;
+  Object.assign(canonical, spellPitch(canonical, toFifths));
+  canonical.init(toFifths, new AccidentalStat(toFifths));
+  note.step = canonical.step; note.alter = canonical.alter; note.octave = canonical.octave;
+  note.number = canonical.number; note.jpOctave = canonical.jpOctave; note.jpAlter = canonical.jpAlter;
+  if (note.displayOctave !== null) note.displayOctave = note.jpOctave;
+  if (note.displayAlter !== null) note.displayAlter = note.jpAlter;
+}
+
+function memberTimingNotation(state: MemberTimingPart, start: Fraction, end: Fraction) {
+  const spans = new Map(state.spans.flatMap(span => span.members.map(member => [member.note, span] as const)));
+  return state.chords.filter(item => item.start.compareTo(end) < 0 && item.end.compareTo(start) > 0).map(item => {
+    const attacks = item.chord.notes.filter(note => !note.rest && !note.tiePrev)
+      .map(note => spans.get(note)).filter((span): span is MemberTimingSpan => Boolean(span));
+    const moved = attacks.length > 0 && attacks.every(span => !span.start.equals(span.oldStart))
+      && attacks.every(span => span.start.equals(attacks[0].start));
+    return { ...item, at: moved ? attacks[0].start : item.start };
+  });
+}
+
+/** One written column cannot carry two distinct grace sequences or slur
+ * starts/ends. Reject those collisions while every model object is untouched. */
+function compatibleMemberTimingNotation(sources: ReturnType<typeof memberTimingNotation>): boolean {
+  const groups = new Map<string, typeof sources>();
+  for (const source of sources) {
+    const group = groups.get(source.at.toString()) ?? [];
+    group.push(source); groups.set(source.at.toString(), group);
+  }
+  return [...groups.values()].every(group => {
+    if (group.filter(item => item.chord.graceNotes.length > 0).length > 1
+      || group.filter(item => item.chord.slurStart).length > 1
+      || group.filter(item => item.chord.slurEnd).length > 1) return false;
+    const ornaments = new Map<string, string>();
+    for (const { chord } of group) for (const ornament of chord.ornaments) {
+      const value = JSON.stringify(ornament);
+      if (ornaments.has(ornament.kind) && ornaments.get(ornament.kind) !== value) return false;
+      ornaments.set(ornament.kind, value);
+    }
+    return true;
+  });
+}
+
+function memberTimingDomain(state: MemberTimingPart, start: Fraction, end: Fraction): Tuplet | null | undefined {
+  const overlapping = state.tuplets.filter(group => group.start.compareTo(end) < 0 && group.end.compareTo(start) > 0);
+  if (!overlapping.length) return null;
+  return overlapping.length === 1 && overlapping[0].start.compareTo(start) <= 0
+    && overlapping[0].end.compareTo(end) >= 0 ? overlapping[0].tuplet : undefined;
+}
+
+/** Build the smallest affected interval, split at every original boundary
+ * and changed member endpoint. Equal pitches remain separate span identities. */
+function planMemberTimingCells(state: MemberTimingPart): {
+  start: Fraction; end: Fraction; cells: MemberTimingCell[]; notation: ReturnType<typeof memberTimingNotation>;
+} | null {
+  const changed = state.spans.filter(span => !span.start.equals(span.oldStart) || !span.end.equals(span.oldEnd));
+  if (!changed.length) return null;
+  const endpoints = changed.flatMap(span => [span.start, span.end, span.oldStart, span.oldEnd])
+    .sort((a, b) => a.compareTo(b));
+  let start = endpoints[0];
+  let end = endpoints[endpoints.length - 1];
+  // A retained chord crossing the edge must be partitioned too, otherwise
+  // two independent written columns would overlap after the edit.
+  for (let pass = 0; pass < 2; pass++) for (const item of state.chords) {
+    if (item.start.compareTo(end) >= 0 || item.end.compareTo(start) <= 0) continue;
+    if (item.start.compareTo(start) < 0) start = item.start;
+    if (item.end.compareTo(end) > 0) end = item.end;
+  }
+  const cuts = new Map<string, Fraction>([[start.toString(), start], [end.toString(), end]]);
+  const cut = (value: Fraction): void => {
+    if (value.compareTo(start) > 0 && value.compareTo(end) < 0) cuts.set(value.toString(), value);
+  };
+  for (const item of state.chords) { cut(item.start); cut(item.end); }
+  for (const span of state.spans) { cut(span.start); cut(span.end); }
+  for (const boundary of state.boundaries) { cut(boundary.start); cut(boundary.end); }
+  for (const group of state.tuplets) { cut(group.start); cut(group.end); }
+  const sorted = [...cuts.values()].sort((a, b) => a.compareTo(b));
+  const cells: MemberTimingCell[] = [];
+  for (let index = 0; index + 1 < sorted.length; index++) {
+    const at = sorted[index];
+    const until = sorted[index + 1];
+    const boundary = boundaryAt(state.boundaries, at);
+    const tuplet = memberTimingDomain(state, at, until);
+    if (!boundary || until.compareTo(boundary.end) > 0 || tuplet === undefined) return null;
+    const actual = until.minus(at);
+    const written = tuplet ? tuplet.writtenMemberDuration(actual) : actual;
+    const pieces = tuplet ? splitWrittenDuration(written)
+      : splitMetricalWrittenDuration(written, at.minus(boundary.start), measureBeatDuration(boundary.measure));
+    if (pieces.some(piece => !WRITTEN_DURATIONS.some(value => value.value.equals(piece)))) return null;
+    const spans = state.spans.filter(span => span.start.compareTo(at) <= 0 && span.end.compareTo(until) >= 0);
+    let cursor = at;
+    for (const piece of pieces) {
+      const pieceEnd = cursor.plus(tuplet ? tuplet.actualMemberDuration(piece) : piece);
+      cells.push({ boundary, start: cursor, end: pieceEnd, written: piece, tuplet, spans });
+      cursor = pieceEnd;
+    }
+    if (!cursor.equals(until)) return null;
+  }
+  const notation = memberTimingNotation(state, start, end);
+  if (!compatibleMemberTimingNotation(notation)) return null;
+  return { start, end, cells, notation };
+}
+
+function commitMemberTimingCells(state: MemberTimingPart,
+  plan: NonNullable<ReturnType<typeof planMemberTimingCells>>): void {
+  const removed = new Set(state.chords.filter(item => item.start.compareTo(plan.end) < 0
+    && item.end.compareTo(plan.start) > 0).map(item => item.chord));
+  const assigned = new Map<MemberTimingSpan, Array<{ note: Note; start: Fraction; end: Fraction }>>();
+  const noteSpans = new Map<Note, MemberTimingSpan>();
+  for (const span of state.spans) {
+    assigned.set(span, span.members.filter(member => !removed.has(member.note.chord)));
+    for (const member of span.members) noteSpans.set(member.note, span);
+  }
+  // Capture chord-level marks before root notes receive their new chords.
+  // Marks stay with retained attack members; moving a complete attack carries
+  // its marks to the new onset. Rolled subsets are assigned separately below.
+  const notation = plan.notation;
+  for (const measure of state.part.measures)
+    measure.entries = measure.entries.filter(entry => !(entry instanceof Chord && removed.has(entry)));
+  const newChords: Chord[] = [];
+  const replacements = new Map<Chord, Chord>();
+  const used = new Set<Note>();
+  for (const cell of plan.cells) {
+    const chord = new Chord(cell.boundary.measure);
+    chord.position = cell.start.minus(cell.boundary.start);
+    setWrittenDuration(chord, cell.written);
+    chord.duration = cell.end.minus(cell.start);
+    const sources = notation.filter(item => item.at.equals(cell.start));
+    const source = sources[0];
+    const context = source?.chord ?? state.chords.find(item => item.start.compareTo(cell.start) <= 0
+      && item.end.compareTo(cell.start) > 0)?.chord;
+    if (context) { chord.voice = context.voice; chord.stemUp = context.stemUp; }
+    for (const item of sources) {
+      if (item.chord.graceNotes.length) {
+        const fromKey = memberTimingKeyAt(state.score, item.chord.measure, item.chord.position);
+        chord.graceNotes = item.chord.graceNotes;
+        for (const grace of chord.graceNotes) {
+          respellMemberTimingNote(grace, fromKey, memberTimingKeyAt(state.score, chord.measure, chord.position));
+          grace.chord = chord;
+        }
+      }
+      chord.fermata ||= item.chord.fermata;
+      for (const ornament of item.chord.ornaments)
+        if (!chord.ornaments.some(existing => JSON.stringify(existing) === JSON.stringify(ornament)))
+          chord.ornaments.push({ ...ornament });
+      chord.slurStart ||= item.chord.slurStart;
+      chord.slurEnd ||= item.chord.slurEnd;
+      if (item.chord.slurEndChord) chord.slurEndChord = item.chord.slurEndChord;
+      replacements.set(item.chord, chord);
+    }
+    for (const span of cell.spans) {
+      const old = span.members.find(member => member.start.equals(cell.start));
+      const reusable = cell.start.equals(span.start) ? span.root : old?.note;
+      const spelling = span.members.find(member => member.start.compareTo(cell.start) <= 0
+        && member.end.compareTo(cell.start) > 0) ?? span.members[0];
+      const note = reusable && !used.has(reusable) ? reusable : cloneNote(spelling.spelling, chord);
+      const fromKey = reusable === span.root ? span.members[0].fifths : old?.fifths ?? spelling.fifths;
+      respellMemberTimingNote(note, fromKey, memberTimingKeyAt(state.score, chord.measure, chord.position));
+      used.add(note);
+      note.tuplet = cell.tuplet;
+      note.tupletBegin = false;
+      note.tupletEnd = false;
+      chord.add(note);
+      assigned.get(span)!.push({ note, start: cell.start, end: cell.end });
+    }
+    if (!chord.notes.length) {
+      chord.rest = true;
+      const rest = new Note(chord);
+      rest.rest = true;
+      rest.number = '0';
+      rest.tuplet = cell.tuplet;
+      chord.add(rest);
+    }
+    chord.measure.entries.push(chord);
+    newChords.push(chord);
+  }
+  for (const [span, members] of assigned) {
+    if (!span.members.some(member => removed.has(member.note.chord))
+      && !members.some(member => used.has(member.note))) continue;
+    members.sort((a, b) => a.start.compareTo(b.start));
+    for (const member of span.members) {
+      member.note.tiePrev = null; member.note.tieNext = null;
+      member.note.tieStart = false; member.note.tieEnd = false;
+    }
+    for (let index = 0; index < members.length; index++) {
+      const member = members[index];
+      member.note.tiePrev = null; member.note.tieNext = null;
+      member.note.tieStart = false; member.note.tieEnd = false;
+      const previous = members[index - 1];
+      if (previous && previous.end.equals(member.start)) {
+        previous.note.tieNext = member.note; previous.note.tieStart = true;
+        member.note.tiePrev = previous.note; member.note.tieEnd = true;
+      }
+    }
+  }
+  for (const item of state.chords) for (const group of item.groups) {
+    if (!removed.has(item.chord)) continue;
+    const byChord = new Map<Chord, number[]>();
+    for (const note of group) {
+      const span = noteSpans.get(note);
+      const attack = span && assigned.get(span)?.find(member => member.start.equals(span.start))?.note;
+      if (!attack) continue;
+      const values = byChord.get(attack.chord) ?? [];
+      values.push(attack.pitch);
+      byChord.set(attack.chord, values);
+    }
+    for (const [chord, pitches] of byChord) if (pitches.length >= 2)
+      setChordArpeggioPitchGroups(chord, [...chordArpeggioPitchGroups(chord), pitches]);
+  }
+  for (const chord of newChords)
+    chord.transparentContinuation = !chord.rest && chord.notes.every(note => note.tiePrev !== null);
+  for (const measure of state.part.measures) {
+    sortMeasureEntries(measure);
+    for (const entry of measure.entries) if (entry instanceof Chord && entry.slurEndChord)
+      entry.slurEndChord = replacements.get(entry.slurEndChord) ?? entry.slurEndChord;
+  }
+  for (const { tuplet } of state.tuplets) {
+    const members = state.part.measures.flatMap(measure => measure.entries.filter((entry): entry is Chord =>
+      entry instanceof Chord && entry.notes.some(note => note.tuplet === tuplet)));
+    if (!members.length) continue;
+    for (const chord of members) for (const note of chord.notes) {
+      note.tupletBegin = false; note.tupletEnd = false;
+    }
+    const first = members[0]; const last = members[members.length - 1];
+    tuplet.first = first.notes[0]; tuplet.last = last.notes[0];
+    for (const note of first.notes) note.tupletBegin = true;
+    for (const note of last.notes) note.tupletEnd = true;
+    tuplet.refreshTiming();
+  }
+  normalizePartRestSpelling(state.part);
+}
+
+/** Exact same-onset note-member timing. Planning is atomic; ordinary duration
+ * limits alone are skipped. Other attacks, equal-pitch occurrences and every
+ * unselected note's original start/end remain independent of chord slicing. */
+export function editSameOnsetNoteTimings(score: Score, selections: readonly NoteTimelineSelection[],
+  operation: 'resize' | 'move', delta: Fraction, writtenDurationFor?: (note: Note) => Fraction): NoteMemberTimingResult {
+  const fail = (reason: NonNullable<NoteMemberTimingResult['reason']>): NoteMemberTimingResult =>
+    ({ changed: 0, skipped: 0, blocked: 1, reason });
+  if (!selections.length || delta.equals(ZERO) && !writtenDurationFor) return { changed: 0, skipped: 0, blocked: 0 };
+  const crossArpeggios = operation === 'move' ? captureCrossArpeggioMembers(score) : [];
+  const states = new Map<number, MemberTimingPart>();
+  const selected = new Map<Note, { state: MemberTimingPart; span: MemberTimingSpan }>();
+  for (const selection of selections) {
+    const part = score.parts[selection.partIndex];
+    if (!part || selection.grace || selection.note.rest || !selection.note.chord.notes.includes(selection.note))
+      return fail('incompatible-target');
+    let state = states.get(selection.partIndex);
+    if (!state) { state = captureMemberTimingPart(score, part); states.set(selection.partIndex, state); }
+    const span = state.spans.find(item => item.members.some(member => member.note === selection.note));
+    if (!span || !span.members.every((member, index) => member.note.pitch === span.root.pitch
+      && member.end.compareTo(member.start) > 0
+      && (index === 0 || span.members[index - 1].end.equals(member.start)))) return fail('incompatible-target');
+    selected.set(span.root, { state, span });
+  }
+  const commonStart = [...selected.values()][0].span.start;
+  if ([...selected.values()].some(({ span }) => !span.start.equals(commonStart))) return fail('incompatible-target');
+  let changed = 0;
+  let skipped = 0;
+  let movement: Fraction | null = null;
+  for (const { state, span } of selected.values()) {
+    const first = state.boundaries[0]?.start;
+    const end = state.boundaries[state.boundaries.length - 1]?.end;
+    if (!first || !end) return fail('boundary');
+    const tailTuplet = span.members[span.members.length - 1].note.tuplet;
+    const sourceDomain = memberTimingDomain(state, span.oldStart, span.oldEnd);
+    if ((operation === 'move' || writtenDurationFor) && sourceDomain === undefined) return fail('incompatible-target');
+    const domain = operation === 'move' || writtenDurationFor ? sourceDomain : tailTuplet;
+    const wanted = writtenDurationFor?.(span.root);
+    if (wanted && (!Number.isFinite(wanted.toFloat()) || wanted.compareTo(ZERO) <= 0)) return fail('boundary');
+    const step = wanted
+      ? (domain ? domain.actualMemberDuration(wanted) : wanted).minus(span.oldEnd.minus(span.oldStart))
+      : domain ? domain.actualMemberDuration(domain.writtenUnit ?? delta.timesInt(delta.compareTo(ZERO) < 0 ? -1 : 1))
+        .timesInt(delta.compareTo(ZERO) < 0 ? -1 : 1) : delta;
+    if (step.equals(ZERO)) continue;
+    const nextStart = operation === 'move' ? span.oldStart.plus(step) : span.oldStart;
+    const nextEnd = span.oldEnd.plus(step);
+    let limited = nextStart.compareTo(first) < 0 || nextEnd.compareTo(end) > 0 || nextEnd.compareTo(nextStart) <= 0;
+    if (operation === 'move') {
+      if (movement && !movement.equals(step)) return fail('incompatible-target');
+      movement = step;
+      if (memberTimingDomain(state, nextStart, nextEnd) !== sourceDomain) return fail('boundary');
+      const nextAttack = state.spans.filter(other => other !== span && !selected.has(other.root)
+        && !other.oldStart.equals(span.oldStart) && other.oldStart.compareTo(nextStart) > 0)
+        .sort((a, b) => a.oldStart.compareTo(b.oldStart))[0];
+      limited ||= Boolean(nextAttack && nextEnd.compareTo(nextAttack.oldStart) > 0);
+      if (limited) return fail('boundary');
+    } else if (step.compareTo(ZERO) > 0) {
+      const nextAttack = state.spans.filter(other => other !== span && other.oldStart.compareTo(span.oldStart) > 0
+        && other.oldStart.compareTo(span.oldEnd) >= 0).sort((a, b) => a.oldStart.compareTo(b.oldStart))[0];
+      limited ||= Boolean(nextAttack && nextEnd.compareTo(nextAttack.oldStart) > 0);
+      limited ||= memberTimingDomain(state, span.oldEnd, nextEnd) !== tailTuplet;
+      limited ||= state.chords.some(item => item.chord.rest && !isPlainMergeableRest(item.chord)
+        && !tailTuplet && item.start.compareTo(nextEnd) < 0 && item.end.compareTo(span.oldEnd) > 0);
+    } else {
+      // A resize cannot consume a complete tuplet domain or invent a binary
+      // tail at a non-binary boundary. The group itself stays fixed in time.
+      const removedDomain = memberTimingDomain(state, nextEnd, span.oldEnd);
+      limited ||= removedDomain !== tailTuplet;
+    }
+    if (limited) { skipped++; continue; }
+    span.start = nextStart;
+    span.end = nextEnd;
+    changed++;
+  }
+  if (!changed) return { changed: 0, skipped, blocked: 0 };
+  // Local rolls only support upward playback. Reject a downward cross-part
+  // roll's conversion to local groups while this is still an uncommitted plan.
+  // Complete rolls and surviving cross-part subsets retain their direction.
+  for (const { mark, members } of crossArpeggios) {
+    if (mark.direction !== 'down') continue;
+    const groups = new Map<string, number[]>();
+    let moved = false;
+    for (const member of members) {
+      const at = selected.get(member.note)?.span.start ?? member.start;
+      moved ||= !at.equals(member.start);
+      const parts = groups.get(at.toString()) ?? [];
+      parts.push(member.part);
+      groups.set(at.toString(), parts);
+    }
+    if (moved && [...groups.values()].some(parts => parts.length >= 2 && new Set(parts).size === 1))
+      return fail('incompatible-target');
+  }
+  const plans = [...states.values()].map(state => ({ state, plan: planMemberTimingCells(state) }));
+  if (plans.some(({ state, plan }) => !plan && state.spans.some(span =>
+    !span.start.equals(span.oldStart) || !span.end.equals(span.oldEnd)))) return fail('incompatible-target');
+  for (const { state, plan } of plans) if (plan) commitMemberTimingCells(state, plan);
+  restoreMovedCrossArpeggios(score, crossArpeggios);
+  score.noteTimingEdits = [];
+  clearStructuralTimingSnapshots(score);
+  return { changed, skipped, blocked: 0 };
+}
+
+/** Shared JPW/TXT metadata validation; fractions stay exact on disk. */
+export function normalizeExplicitNoteTies(raw: unknown): ExplicitNoteTie[] {
+  if (!Array.isArray(raw)) return [];
+  const endpoint = (rawEndpoint: unknown): ExplicitNoteTieEndpoint | null => {
+    if (!rawEndpoint || typeof rawEndpoint !== 'object') return null;
+    const value = rawEndpoint as Partial<ExplicitNoteTieEndpoint>;
+    const offset = safeFraction(value.offset);
+    return Number.isInteger(value.measure) && value.measure! >= 0
+      && Number.isInteger(value.pitch) && value.pitch! >= 0 && value.pitch! <= 127
+      && Number.isInteger(value.occurrence) && value.occurrence! >= 0
+      && offset && offset.compareTo(ZERO) >= 0
+      ? { measure: value.measure!, offset: offset.toString(), pitch: value.pitch!, occurrence: value.occurrence! } : null;
+  };
+  return raw.flatMap((item): ExplicitNoteTie[] => {
+    if (!item || typeof item !== 'object') return [];
+    const value = item as Partial<ExplicitNoteTie>;
+    const from = endpoint(value.from); const to = endpoint(value.to);
+    return Number.isInteger(value.part) && value.part! >= 0 && from && to && from.pitch === to.pitch
+      && (to.measure > from.measure || to.measure === from.measure
+        && Fraction.fromString(to.offset).compareTo(Fraction.fromString(from.offset)) > 0)
+      ? [{ part: value.part!, from, to }] : [];
+  });
+}
+
+interface CrossArpeggioMembers {
+  mark: CrossPartArpeggio;
+  members: Array<{ part: number; note: Note; start: Fraction }>;
+}
+function captureCrossArpeggioMembers(score: Score): CrossArpeggioMembers[] {
+  return score.crossPartArpeggios.map(mark => {
+    const chords = new Map(mark.parts.map(part => [part,
+      score.parts[part]?.measures[mark.measure]?.entries.find((entry): entry is Chord =>
+        entry instanceof Chord && entry.position.equals(mark.offset))]));
+    const requested = mark.pitches.length ? mark.pitches : [...chords].flatMap(([part, chord]) =>
+      chord?.notes.filter(note => !note.rest).map(note => ({ part, pitch: note.pitch })) ?? []);
+    const used = new Set<Note>();
+    const members = requested.flatMap(item => {
+      const note = chords.get(item.part)?.notes.find(candidate => !candidate.rest
+        && candidate.pitch === item.pitch && !used.has(candidate));
+      if (!note) return [];
+      used.add(note);
+      return [{ part: item.part, note, start: note.absoluteTick }];
+    });
+    return { mark, members };
+  });
+}
+
+/** Moving part of a rolled chord can leave valid rolls at two positions.
+ * Reclassify each surviving group from its real members; no mark may remain
+ * attached to the now-empty old attack position. */
+function restoreMovedCrossArpeggios(score: Score, captures: readonly CrossArpeggioMembers[]): void {
+  for (const { mark, members } of captures) {
+    if (!members.some(member => !member.note.absoluteTick.equals(member.start))) continue;
+    const groups = new Map<string, CrossArpeggioMembers['members']>();
+    for (const member of members) {
+      if (!member.note.chord.notes.includes(member.note)) continue;
+      const chord = member.note.chord;
+      const key = `${chord.measure.index}/${chord.position}`;
+      const group = groups.get(key) ?? [];
+      group.push(member); groups.set(key, group);
+    }
+    score.crossPartArpeggios = score.crossPartArpeggios.filter(candidate => candidate !== mark);
+    let reused = false;
+    for (const group of groups.values()) {
+      if (group.length < 2) continue;
+      const parts = [...new Set(group.map(member => member.part))];
+      if (parts.length === 1) {
+        const chord = group[0].note.chord;
+        setChordArpeggioPitchGroups(chord, [...chordArpeggioPitchGroups(chord), group.map(member => member.note.pitch)]);
+      } else {
+        const next = reused ? new CrossPartArpeggio() : mark;
+        reused = true;
+        next.measure = group[0].note.chord.measure.index;
+        next.offset = group[0].note.chord.position;
+        next.parts = parts;
+        next.pitches = group.map(member => ({ part: member.part, pitch: member.note.pitch }));
+        next.direction = mark.direction;
+        score.crossPartArpeggios.push(next);
+      }
+    }
+  }
 }
